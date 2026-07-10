@@ -3,17 +3,16 @@ from telebot import types
 from datetime import datetime
 
 
-# Вставь сюда свой токен от BotFather
+# Вставь сюда новый токен от BotFather
 TOKEN = "8854265598:AAGPVTMw3zJ_QCOaQIP5cP8Gpnh-bM07ilI"
 
 
 bot = telebot.TeleBot(TOKEN)
 
 
-# Старт
+# Стартовое меню
 @bot.message_handler(commands=["start"])
 def start(message):
-
     markup = types.ReplyKeyboardMarkup(
         resize_keyboard=True
     )
@@ -35,11 +34,9 @@ def start(message):
 # Новая заявка
 @bot.message_handler(func=lambda message: message.text == "🆕 Новая заявка")
 def new_order(message):
-
     bot.send_message(
         message.chat.id,
-        "Введите заявку по шаблону:\n\n"
-        "Дата:\n"
+        "Введите заявку:\n\n"
         "Имя:\n"
         "Организация:\n"
         "Телефон:\n"
@@ -63,7 +60,7 @@ def get_order(message):
         "✅ Проверьте заявку:\n\n"
         f"Дата: {date}\n\n"
         f"{message.text}\n\n"
-        "Сохранить?"
+        "Сохранить заявку?"
     )
 
     markup = types.InlineKeyboardMarkup()
@@ -87,7 +84,7 @@ def get_order(message):
     )
 
 
-# Сохранение
+# Сохранение заявки
 @bot.callback_query_handler(func=lambda call: call.data == "save")
 def save_order(call):
 
@@ -95,12 +92,11 @@ def save_order(call):
 
     bot.send_message(
         call.message.chat.id,
-        "✅ Заявка сохранена.\n"
-        "Следующий этап — подключение CRM."
+        "✅ Заявка сохранена."
     )
 
 
-# Отмена
+# Отмена заявки
 @bot.callback_query_handler(func=lambda call: call.data == "cancel")
 def cancel_order(call):
 
