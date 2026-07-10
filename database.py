@@ -1,17 +1,19 @@
 import sqlite3
-from datetime import datetime
 
+from datetime import datetime
 
 DB_NAME = "profiworker24.db"
 
+# Создание базы
 
-# Создание базы и таблицы
 def create_database():
 
     conn = sqlite3.connect(DB_NAME)
+
     cursor = conn.cursor()
 
     cursor.execute("""
+
     CREATE TABLE IF NOT EXISTS orders (
 
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,148 +35,224 @@ def create_database():
         comment TEXT
 
     )
+
     """)
 
     conn.commit()
+
     conn.close()
 
-
-
 # Сохранение заявки
+
 def save_order(
+
         name,
+
         organization,
+
         phone,
+
         service,
+
         status,
+
         income,
+
         comment
+
 ):
 
+    print("========== SAVE ORDER ==========")
+
+    print("Имя:", name)
+
+    print("Организация:", organization)
+
+    print("Телефон:", phone)
+
+    print("Услуга:", service)
+
+    print("Статус:", status)
+
+    print("Доход:", income)
+
+    print("Комментарий:", comment)
+
     conn = sqlite3.connect(DB_NAME)
+
     cursor = conn.cursor()
 
-
     cursor.execute("""
+
     INSERT INTO orders
+
     (
+
         date,
+
         name,
+
         organization,
+
         phone,
+
         service,
+
         status,
+
         income,
+
         comment
+
     )
 
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 
     """,
-    (
-        datetime.now().strftime("%d.%m.%Y"),
-        name or "-",
-        organization or "-",
-        phone or "-",
-        service or "-",
-        status or "Новая",
-        income or 0,
-        comment or "-"
-    ))
 
+    (
+
+        datetime.now().strftime("%d.%m.%Y"),
+
+        name or "-",
+
+        organization or "-",
+
+        phone or "-",
+
+        service or "-",
+
+        status or "Новая",
+
+        income or 0,
+
+        comment or "-"
+
+    ))
 
     conn.commit()
+
     conn.close()
 
+    print("Заявка успешно записана в SQLite")
 
+# Поиск телефона
 
-# Поиск по телефону
 def search_by_phone(phone):
 
+    print("Поиск телефона:", phone)
+
     conn = sqlite3.connect(DB_NAME)
+
     cursor = conn.cursor()
 
-
     cursor.execute("""
+
     SELECT *
+
     FROM orders
+
     WHERE phone = ?
+
     ORDER BY id DESC
+
     """,
+
     (phone,))
 
-
     result = cursor.fetchall()
 
     conn.close()
 
+    print("Найдено:", len(result))
+
     return result
 
+# Поиск по имени
 
-
-# Поиск по имени или организации
 def search_text(text):
 
+    print("Поиск текста:", text)
+
     conn = sqlite3.connect(DB_NAME)
+
     cursor = conn.cursor()
 
-
     cursor.execute("""
-    SELECT *
-    FROM orders
-    WHERE name LIKE ?
-    OR organization LIKE ?
-    ORDER BY id DESC
-    """,
-    (
-        f"%{text}%",
-        f"%{text}%"
-    ))
 
+    SELECT *
+
+    FROM orders
+
+    WHERE name LIKE ?
+
+       OR organization LIKE ?
+
+    ORDER BY id DESC
+
+    """,
+
+    (
+
+        f"%{text}%",
+
+        f"%{text}%"
+
+    ))
 
     result = cursor.fetchall()
 
     conn.close()
 
+    print("Найдено:", len(result))
+
     return result
 
-
-
 # Изменение статуса
+
 def update_status(order_id, status):
 
     conn = sqlite3.connect(DB_NAME)
+
     cursor = conn.cursor()
 
-
     cursor.execute("""
+
     UPDATE orders
+
     SET status = ?
+
     WHERE id = ?
+
     """,
+
     (
+
         status,
+
         order_id
+
     ))
 
-
     conn.commit()
+
     conn.close()
 
-
-
 # Статистика
+
 def get_statistics():
 
     conn = sqlite3.connect(DB_NAME)
+
     cursor = conn.cursor()
 
-
     cursor.execute("""
-    SELECT COUNT(*), SUM(income)
-    FROM orders
-    """)
 
+    SELECT COUNT(*), SUM(income)
+
+    FROM orders
+
+    """)
 
     result = cursor.fetchone()
 
