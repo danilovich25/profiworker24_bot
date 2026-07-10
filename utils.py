@@ -16,25 +16,39 @@ def normalize_phone(phone):
 
         return "-"
 
-    # оставляем только цифры
+    # Оставляем только цифры
 
     digits = re.sub(r"\D", "", phone)
 
     # +7XXXXXXXXXX → 8XXXXXXXXXX
 
-    if digits.startswith("7") and len(digits) == 11:
+    if len(digits) == 11:
 
-        digits = "8" + digits[1:]
+        if digits.startswith("7"):
 
-    # 10 цифр без 8 или 7
+            digits = "8" + digits[1:]
+
+        elif digits.startswith("8"):
+
+            pass
+
+        else:
+
+            return "-"
+
+    # Если ввели только 10 цифр
 
     elif len(digits) == 10:
 
         digits = "8" + digits
 
+    else:
+
+        return "-"
+
     return digits
 
-# Если поле пустое
+# Проверка пустого текста
 
 def clean_text(text):
 
@@ -50,7 +64,7 @@ def clean_text(text):
 
     return text
 
-# Поиск телефона внутри текста заявки
+# Поиск телефона внутри текста
 
 def extract_phone(text):
 
@@ -58,16 +72,16 @@ def extract_phone(text):
 
         return "-"
 
-    numbers = re.findall(
+    phones = re.findall(
 
-        r"(?:\+7|8|7)?[\s\-]?\d{3}[\s\-]?\d{2,3}[\s\-]?\d{2,3}",
+        r"(?:\+7|8|7)?[\s\-()]?\d{3}[\s\-()]?\d{3}[\s\-()]?\d{2}[\s\-()]?\d{2}",
 
         text
 
     )
 
-    if numbers:
+    if not phones:
 
-        return normalize_phone(numbers[0])
+        return "-"
 
-    return "-"
+    return normalize_phone(phones[0])
