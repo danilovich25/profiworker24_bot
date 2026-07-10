@@ -1,1 +1,3 @@
+TOKEN = "8854265598:AAF6UdGwdxDMUfn8Ciq8joyp9YCXuVLK4aA"
 
+BOT_NAME = "ProfiWorker24 Manager"
