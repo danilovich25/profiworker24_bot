@@ -1,94 +1,161 @@
-import telebot from telebot import types from datetime import datetime
+import telebot
 
-TOKEN = "8854265598:AAFqwVOT_EHCqtV7XnzsTKbw-v93qm-WX1k"
+from telebot import types
 
-bot = telebot.TeleBot (TOKEN)
+from datetime import datetime
 
-Стартовое меню
+# Вставь сюда НОВЫЙ токен от BotFather
 
-@bot.message_handler(commands=['start']) def start(message): markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+TOKEN = 8854265598:AAGPVTMw3zJ_QCOaQIP5cP8Gpnh-bM07ilI
 
-btn1 = types.KeyboardButton("🆕 Новая заявка")
-btn2 = types.KeyboardButton("🔎 Найти заявку")
-btn3 = types.KeyboardButton("✏️ Изменить статус")
+bot = telebot.TeleBot(TOKEN)
 
-markup.add(btn1, btn2, btn3)
+# Стартовое меню
 
-bot.send_message(
-    message.chat.id,
-    "👷 ProfiWorker24 Manager запущен.\n\n"
-    "Выберите действие:",
-    reply_markup=markup
-)
-Новая заявка
+@bot.message_handler(commands=["start"])
 
-@bot.message_handler(func=lambda message: message.text == "🆕 Новая заявка") def new_order(message):
+def start(message):
 
-bot.send_message(
-    message.chat.id,
-    "Введите заявку по шаблону:\n\n"
-    "Клиент:\n"
-    "Телефон:\n"
-    "Услуга:\n"
-    "Доход:\n"
-    "Комментарий:"
-)
-Приём заявки
+    markup = types.ReplyKeyboardMarkup(
 
-@bot.message_handler(func=lambda message: True) def get_order(message):
+        resize_keyboard=True
 
-if message.text.startswith("/"):
-    return
+    )
 
-date = datetime.now().strftime("%d.%m.%Y")
+    btn1 = types.KeyboardButton("🆕 Новая заявка")
 
-answer = (
-    "✅ Проверьте заявку:\n\n"
-    f"Дата: {date}\n\n"
-    f"{message.text}\n\n"
-    "Сохранить заявку?"
-)
+    btn2 = types.KeyboardButton("🔎 Найти заявку")
 
-markup = types.InlineKeyboardMarkup()
+    btn3 = types.KeyboardButton("✏️ Изменить статус")
 
-yes = types.InlineKeyboardButton(
-    "✅ Сохранить",
-    callback_data="save"
-)
+    markup.add(btn1, btn2, btn3)
 
-no = types.InlineKeyboardButton(
-    "❌ Отмена",
-    callback_data="cancel"
-)
+    bot.send_message(
 
-markup.add(yes, no)
+        message.chat.id,
 
-bot.send_message(
-    message.chat.id,
-    answer,
-    reply_markup=markup
-)
-Кнопка сохранить
+        "👷 ProfiWorker24 Manager запущен.\n\n"
 
-@bot.callback_query_handler(func=lambda call: call.data == "save") def save_order(call):
+        "Выберите действие:",
 
-bot.answer_callback_query(call.id)
+        reply_markup=markup
 
-bot.send_message(
-    call.message.chat.id,
-    "✅ Заявка сохранена.\n"
-    "Следующий этап — подключение базы CRM."
-)
-Кнопка отмена
+    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "cancel") def cancel_order(call):
+# Создание новой заявки
 
-bot.answer_callback_query(call.id)
+@bot.message_handler(func=lambda message: message.text == "🆕 Новая заявка")
 
-bot.send_message(
-    call.message.chat.id,
-    "❌ Заявка отменена."
-)
+def new_order(message):
+
+    bot.send_message(
+
+        message.chat.id,
+
+        "Введите заявку:\n\n"
+
+        "Дата:\n"
+
+        "Имя:\n"
+
+        "Телефон:\n"
+
+        "Услуга:\n"
+
+        "Статус:\n"
+
+        "Доход:\n"
+
+        "Комментарий:"
+
+    )
+
+# Приём информации от пользователя
+
+@bot.message_handler(func=lambda message: True)
+
+def get_order(message):
+
+    if message.text.startswith("/"):
+
+        return
+
+    date = datetime.now().strftime("%d.%m.%Y")
+
+    text = (
+
+        "✅ Проверь заявку:\n\n"
+
+        f"Дата: {date}\n\n"
+
+        f"{message.text}"
+
+    )
+
+    markup = types.InlineKeyboardMarkup()
+
+    btn_yes = types.InlineKeyboardButton(
+
+        "✅ Подтвердить",
+
+        callback_data="save"
+
+    )
+
+    btn_no = types.InlineKeyboardButton(
+
+        "❌ Отмена",
+
+        callback_data="cancel"
+
+    )
+
+    markup.add(btn_yes, btn_no)
+
+    bot.send_message(
+
+        message.chat.id,
+
+        text,
+
+        reply_markup=markup
+
+    )
+
+# Подтверждение заявки
+
+@bot.callback_query_handler(func=lambda call: call.data == "save")
+
+def save_order(call):
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+
+        call.message.chat.id,
+
+        "✅ Заявка сохранена.\n"
+
+        "Следующий этап — подключение CRM."
+
+    )
+
+# Отмена заявки
+
+@bot.callback_query_handler(func=lambda call: call.data == "cancel")
+
+def cancel_order(call):
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+
+        call.message.chat.id,
+
+        "❌ Заявка отменена."
+
+    )
+
 print("ProfiWorker24 Bot запущен")
 
 bot.infinity_polling()
