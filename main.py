@@ -1,22 +1,31 @@
 import telebot
 from telebot import types
+
 import database
+import orders
 
+from config import TOKEN
 
-TOKEN = "8854265598:AAGPVTMw3zJ_QCOaQIP5cP8Gpnh-bM07ilI"
 
 bot = telebot.TeleBot(TOKEN)
 
 
-# создаём базу при запуске
+# Создание базы при запуске
 database.create_database()
 
 
-# временное хранение заявки до подтверждения
-user_orders = {}
+# Временное хранение заявок до подтверждения
+waiting_orders = {}
+
+# Режим поиска
+search_mode = {}
 
 
-# Главное меню
+
+# =========================
+# СТАРТ
+# =========================
+
 @bot.message_handler(commands=["start"])
 def start(message):
 
@@ -26,25 +35,33 @@ def start(message):
 
     btn1 = types.KeyboardButton("🆕 Новая заявка")
     btn2 = types.KeyboardButton("🔎 Найти заявку")
+    btn3 = types.KeyboardButton("📋 Последние заявки")
 
-    markup.add(btn1, btn2)
+    markup.add(btn1, btn2, btn3)
+
 
     bot.send_message(
         message.chat.id,
-        "👷 ProfiWorker24 Manager запущен.\n\nВыберите действие:",
+        "👷 ProfiWorker24 Manager v1.0 запущен.\n\n"
+        "Выберите действие:",
         reply_markup=markup
     )
 
 
-# Новая заявка
-@bot.message_handler(func=lambda m: m.text == "🆕 Новая заявка")
-def new_order(message):
 
-    user_orders[message.chat.id] = True
+# =========================
+# НОВАЯ ЗАЯВКА
+# =========================
+
+@bot.message_handler(
+    func=lambda m: m.text == "🆕 Новая заявка"
+)
+def new_order(message):
 
     bot.send_message(
         message.chat.id,
-        "Введите заявку по шаблону:\n\n"
+        "Введите заявку:\n\n"
+
         "Имя:\n"
         "Организация:\n"
         "Телефон:\n"
@@ -55,89 +72,98 @@ def new_order(message):
     )
 
 
-# Получение текста заявки
+    waiting_orders[message.chat.id] = True
+
+
+
+# Получение заявки
+
 @bot.message_handler(
-    func=lambda m: m.chat.id in user_orders
+    func=lambda m: waiting_orders.get(m.chat.id) == True
 )
-def get_order(message):
+def receive_order(message):
 
-    if message.text == "🆕 Новая заявка":
-        return
+    waiting_orders[message.chat.id] = message.text
 
 
-    user_orders[message.chat.id] = message.text
+    parsed = orders.parse_order(message.text)
+
+
+    preview = orders.format_order(parsed)
 
 
     markup = types.InlineKeyboardMarkup()
 
+
     yes = types.InlineKeyboardButton(
         "✅ Сохранить",
-        callback_data="save"
+        callback_data="save_order"
     )
+
 
     no = types.InlineKeyboardButton(
         "❌ Отмена",
-        callback_data="cancel"
+        callback_data="cancel_order"
     )
 
+
     markup.add(yes, no)
+
 
 
     bot.send_message(
         message.chat.id,
         "Проверьте заявку:\n\n"
-        f"{message.text}\n\n"
-        "Сохранить?",
+        + preview,
+
         reply_markup=markup
     )
 
 
-# Сохранение заявки
+
+# =========================
+# СОХРАНЕНИЕ
+# =========================
+
 @bot.callback_query_handler(
-    func=lambda call: call.data == "save"
+    func=lambda c: c.data == "save_order"
 )
 def save_order(call):
 
-    text = user_orders.get(call.message.chat.id)
-
-
-    if not text:
-        return
-
-
-    # пока сохраняем весь текст как услугу
-    # дальше сделаем автоматическое разделение полей
-
-    database.save_order(
-        name="-",
-        organization="-",
-        phone="-",
-        service=text,
-        status="Новая",
-        income="-",
-        comment="-"
+    text = waiting_orders.get(
+        call.message.chat.id
     )
 
 
-    bot.answer_callback_query(call.id)
+    if text:
 
-    bot.send_message(
-        call.message.chat.id,
-        "✅ Заявка сохранена в базе."
-    )
+        orders.create_order(text)
 
 
-    del user_orders[call.message.chat.id]
+        bot.answer_callback_query(call.id)
+
+
+        bot.send_message(
+            call.message.chat.id,
+            "✅ Заявка сохранена."
+        )
+
+
+        del waiting_orders[
+            call.message.chat.id
+        ]
 
 
 
 # Отмена
+
 @bot.callback_query_handler(
-    func=lambda call: call.data == "cancel"
+    func=lambda c: c.data == "cancel_order"
 )
 def cancel_order(call):
 
     bot.answer_callback_query(call.id)
+
 
     bot.send_message(
         call.message.chat.id,
@@ -145,66 +171,110 @@ def cancel_order(call):
     )
 
 
-    if call.message.chat.id in user_orders:
-        del user_orders[call.message.chat.id]
+    if call.message.chat.id in waiting_orders:
+
+        del waiting_orders[
+            call.message.chat.id
+        ]
 
 
 
-# Поиск заявки
+# =========================
+# ПОИСК
+# =========================
+
 @bot.message_handler(
     func=lambda m: m.text == "🔎 Найти заявку"
 )
-def search_start(message):
+def start_search(message):
+
+    search_mode[message.chat.id] = True
+
 
     bot.send_message(
         message.chat.id,
-        "Введите телефон клиента:"
+        "Введите телефон, имя или организацию:"
     )
 
 
-# Получение телефона для поиска
+
 @bot.message_handler(
-    func=lambda m: m.text.isdigit()
+    func=lambda m: search_mode.get(m.chat.id) == True
 )
-def search_phone(message):
+def search_order(message):
 
-    orders = database.find_order(
-        message.text
-    )
+    search_mode[message.chat.id] = False
 
 
-    if not orders:
+    query = message.text
+
+
+    result = database.search_text(query)
+
+
+
+    if not result:
 
         bot.send_message(
             message.chat.id,
-            "❌ Заявок с таким номером нет."
+            "❌ Ничего не найдено."
         )
 
         return
 
 
-    result = "🔎 Найдена заявка:\n\n"
+
+    answer = "🔎 Найдено:\n\n"
 
 
-    for order in orders:
 
-        result += (
-            f"№{order[0]}\n"
-            f"Дата: {order[1]}\n"
-            f"Телефон: {order[4]}\n"
-            f"Услуга: {order[5]}\n"
-            f"Статус: {order[6]}\n"
-            f"Доход: {order[7]}\n\n"
+    for item in result:
+
+        answer += (
+
+            f"№{item[0]}\n"
+            f"Дата: {item[1]}\n"
+            f"Имя: {item[2]}\n"
+            f"Организация: {item[3]}\n"
+            f"Телефон: {item[4]}\n"
+            f"Услуга: {item[5]}\n"
+            f"Статус: {item[6]}\n"
+            f"Доход: {item[7]}\n"
+            f"Комментарий: {item[8]}\n\n"
+
         )
 
 
     bot.send_message(
         message.chat.id,
-        result
+        answer
     )
 
 
 
-print("ProfiWorker24 Bot запущен")
+# =========================
+# ПОСЛЕДНИЕ ЗАЯВКИ
+# =========================
+
+@bot.message_handler(
+    func=lambda m: m.text == "📋 Последние заявки"
+)
+def last_orders(message):
+
+    data = database.get_statistics()
+
+
+    bot.send_message(
+        message.chat.id,
+
+        "📊 Статистика:\n\n"
+        f"Всего заявок: {data[0]}\n"
+        f"Общий доход: {data[1] or 0}"
+    )
+
+
+
+print("ProfiWorker24 Manager v1.0 запущен")
+
 
 bot.infinity_polling()
