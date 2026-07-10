@@ -5,8 +5,9 @@ from datetime import datetime
 DB_NAME = "profiworker24.db"
 
 
-# Создание базы
+# Создание базы данных
 def create_database():
+
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
@@ -19,7 +20,7 @@ def create_database():
         phone TEXT,
         service TEXT,
         status TEXT,
-        income REAL,
+        income TEXT,
         comment TEXT
     )
     """)
@@ -28,17 +29,45 @@ def create_database():
     conn.close()
 
 
+
 # Сохранение заявки
-def save_order(name, organization, phone, service, status, income, comment):
+def save_order(
+        name,
+        organization,
+        phone,
+        service,
+        status,
+        income,
+        comment
+):
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
     date = datetime.now().strftime("%d.%m.%Y")
 
+    # Если поле пустое — ставим прочерк
+    name = name or "-"
+    organization = organization or "-"
+    phone = phone or "-"
+    service = service or "-"
+    status = status or "-"
+    income = income or "-"
+    comment = comment or "-"
+
+
     cursor.execute("""
     INSERT INTO orders
-    (date, name, organization, phone, service, status, income, comment)
+    (
+    date,
+    name,
+    organization,
+    phone,
+    service,
+    status,
+    income,
+    comment
+    )
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """,
     (
@@ -52,21 +81,27 @@ def save_order(name, organization, phone, service, status, income, comment):
         comment
     ))
 
+
     conn.commit()
     conn.close()
 
 
-# Поиск заявки по телефону
+
+# Поиск по телефону
 def find_order(phone):
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
+
     cursor.execute("""
-    SELECT * FROM orders
+    SELECT *
+    FROM orders
     WHERE phone = ?
     ORDER BY id DESC
-    """, (phone,))
+    """,
+    (phone,))
+
 
     result = cursor.fetchall()
 
@@ -75,19 +110,46 @@ def find_order(phone):
     return result
 
 
-# Получение всех заявок
+
+# Получить все заявки
 def get_all_orders():
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
+
     cursor.execute("""
-    SELECT * FROM orders
+    SELECT *
+    FROM orders
     ORDER BY id DESC
     """)
+
 
     result = cursor.fetchall()
 
     conn.close()
 
     return result
+
+
+
+# Обновление статуса
+def update_status(phone, status):
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+
+    cursor.execute("""
+    UPDATE orders
+    SET status = ?
+    WHERE phone = ?
+    """,
+    (
+        status,
+        phone
+    ))
+
+
+    conn.commit()
+    conn.close()
