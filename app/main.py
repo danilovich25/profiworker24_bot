@@ -17,6 +17,7 @@ from app.middlewares.rate_limit import RateLimitMiddleware
 from app.middlewares.whitelist import WhitelistMiddleware
 from app.sentry_setup import _scrub_string, init_sentry
 from app.services.bitrix import ensure_sources, ensure_uf_fields, get_bitrix
+from app.services.tasks import reminder_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -179,6 +180,9 @@ async def main() -> None:
     if sentry_active:
         sentry_sdk.capture_message("bot startup", level="info")
     asyncio.create_task(healthcheck_loop(db))
+    # Telegram-напоминания: очередь в SQLite, поэтому цикл спокойно
+    # переживает рестарт контейнера — неотправленное уйдёт после подъёма.
+    asyncio.create_task(reminder_loop(bot, db))
     logger.info("Запускаю polling")
     await dp.start_polling(bot)
 

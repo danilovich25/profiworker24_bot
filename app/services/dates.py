@@ -261,6 +261,11 @@ def format_bitrix_datetime(raw: object) -> str:
     return parsed.strftime("%d.%m.%Y %H:%M")
 
 
+def epoch_to_iso(ts: int) -> str:
+    """Unix-момент → ISO в часовом поясе приложения (для полей Bitrix)."""
+    return datetime.fromtimestamp(ts, local_tz()).isoformat()
+
+
 def reminder_epoch(deadline_iso: str | None) -> int | None:
     """Unix-момент Telegram-напоминания по сроку заявки.
 

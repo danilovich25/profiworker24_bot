@@ -110,9 +110,12 @@ class FakeBitrix(SemanticBitrixFake):
         self.contacts: list[dict] = []
         self.deals: list[dict] = []
         self.tasks: list[dict] = []
+        self.activities: list[dict] = []
+        self.activity_updates: list[dict] = []
         self.fail_deal_lists = 0
         self.fail_task_adds = 0
         self.fail_task_lists = 0
+        self.fail_todo_adds = 0
         self.refuse_deal_adds = 0
         self.refuse_task_adds = 0
 
@@ -150,6 +153,15 @@ class FakeBitrix(SemanticBitrixFake):
             return 154
         if method == "crm.timeline.comment.add":
             return 1
+        if method == "crm.activity.todo.add":
+            if self.fail_todo_adds > 0:
+                self.fail_todo_adds -= 1
+                raise RuntimeError("Bitrix24 недоступен")
+            self.activities.append(dict(params))
+            return {"activity": {"id": 500 + len(self.activities) - 1}}
+        if method == "crm.activity.todo.update":
+            self.activity_updates.append(dict(params))
+            return True
         if method == "tasks.task.add":
             if self.fail_task_adds > 0:
                 self.fail_task_adds -= 1
@@ -424,6 +436,98 @@ async def test_relative_deadline_in_text_overrides_llm(flow, monkeypatch):
 
     await press_card(flow, "create", card)
     assert "Срок: 24.07.2026 10:00" in flow.bx.deals[0]["COMMENTS"]
+
+
+# ---------------------------------------------------------------------------
+# Напоминания о сроке заявки: дело CRM + Telegram-очередь
+# ---------------------------------------------------------------------------
+
+FAR_FUTURE_TS = 4102444800  # 2100 год: «все напоминания уже наступили»
+
+VVO = ZoneInfo("Asia/Vladivostok")
+
+
+async def test_deal_with_deadline_gets_todo_and_tg_reminder(flow, monkeypatch):
+    """Создание сделки со сроком ставит дело в CRM и Telegram-напоминание."""
+    freeze_now(monkeypatch)
+    parse_order_mock(
+        monkeypatch, FULL_ORDER.model_copy(update={"deadline": "2026-07-24T10:00:00"})
+    )
+
+    await send(flow, "Иван, 89141234567, сантехника, замена крана")
+    await press_card(flow, "create")
+    assert any("Заявка №154 создана" in t for t in flow.session.sent_texts)
+
+    todo = flow.bx.activities[0]
+    assert todo["ownerTypeId"] == 2
+    assert todo["ownerId"] == 154
+    assert todo["responsibleId"] == 1  # пользователь заказчика, не бот
+    assert todo["pingOffsets"] == [0]  # push ровно в срок
+    assert todo["deadline"] == "2026-07-24T10:00:00+10:00"
+    assert "Заявка №154" in todo["title"]
+
+    rows = await flow.db.due_reminders(FAR_FUTURE_TS)
+    assert len(rows) == 1
+    reminder = rows[0]
+    assert reminder["kind"] == "deal"
+    assert reminder["entity_id"] == 154
+    assert reminder["activity_id"] == 500
+    assert reminder["due_ts"] == int(datetime(2026, 7, 24, 10, 0, tzinfo=VVO).timestamp())
+    assert "24.07.2026 10:00" in reminder["text"]
+
+
+async def test_deal_without_deadline_schedules_nothing(flow, monkeypatch):
+    parse_order_mock(monkeypatch)
+
+    await send(flow, "Иван, 89141234567, сантехника, замена крана")
+    await press_card(flow, "create")
+
+    assert flow.bx.activities == []
+    assert await flow.db.due_reminders(FAR_FUTURE_TS) == []
+
+
+async def test_todo_failure_keeps_deal_and_tg_reminder(flow, monkeypatch):
+    """Сбой создания дела не трогает сделку и не отменяет Telegram-канал."""
+    freeze_now(monkeypatch)
+    parse_order_mock(
+        monkeypatch, FULL_ORDER.model_copy(update={"deadline": "2026-07-24T10:00:00"})
+    )
+    flow.bx.fail_todo_adds = 1
+
+    await send(flow, "Иван, 89141234567, сантехника, замена крана")
+    await press_card(flow, "create")
+
+    assert any("Заявка №154 создана" in t for t in flow.session.sent_texts)
+    assert flow.bx.activities == []
+    rows = await flow.db.due_reminders(FAR_FUTURE_TS)
+    assert len(rows) == 1
+    assert rows[0]["activity_id"] is None  # дело не создано, Telegram остался
+
+
+async def test_reminder_intent_gets_tg_reminder(flow, monkeypatch):
+    """Задача-напоминание дублируется Telegram-напоминанием в момент срока."""
+    freeze_now(monkeypatch)
+    reminder = FULL_ORDER.model_copy(
+        update={
+            "intent": Intent.reminder,
+            "problem": "позвонить Ивану",
+            "deadline": "2026-07-20T10:00:00",
+        }
+    )
+    parse_order_mock(monkeypatch, reminder)
+
+    await send(flow, "напомни позвонить Ивану завтра")
+
+    rows = await flow.db.due_reminders(FAR_FUTURE_TS)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "task"
+    assert rows[0]["entity_id"] == 77
+    assert rows[0]["due_ts"] == int(datetime(2026, 7, 20, 10, 0, tzinfo=VVO).timestamp())
+    assert "позвонить Ивану" in rows[0]["text"]
+    assert "20.07.2026 10:00" in rows[0]["text"]
+
+    # повторная доставка того же сообщения не плодит второе напоминание
+    assert len(await flow.db.due_reminders(FAR_FUTURE_TS)) == 1
 
 
 # ---------------------------------------------------------------------------

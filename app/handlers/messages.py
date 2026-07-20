@@ -57,6 +57,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from app.config import settings
 from app.db import DRAFT_DONE, DRAFT_UNKNOWN, Database
 from app.middlewares.dedup import content_hash
 from app.schemas import Category, Intent, ParsedOrder, Source
@@ -70,6 +71,7 @@ from app.services.bitrix import (
     BitrixClient,
     add_contact_timeline_comment,
     create_deal,
+    create_deal_todo,
     extract_bare_phone,
     find_contact_by_draft_id,
     find_deal_by_key,
@@ -232,6 +234,84 @@ async def _reconcile(finder: Callable[[], Awaitable[int | None]]) -> int | None:
 async def _reconcile_deal(bitrix: BitrixClient, key: str) -> int | None:
     """Ищет сделку, которую CRM могла создать до таймаута ответа deal.add."""
     return await _reconcile(lambda: find_deal_by_key(bitrix, key))
+
+
+# Дедлайн best-effort шагов ПОСЛЕ созданной сделки (дело CRM + запись
+# Telegram-напоминания): сделка уже зафиксирована, эти шаги не должны
+# блокировать ответ и не имеют права уронить обработчик.
+POST_DEAL_DEADLINE = 15
+
+
+async def _schedule_deal_reminder(
+    message: Message,
+    db: Database,
+    bitrix: BitrixClient | None,
+    order: ParsedOrder,
+    deal_id: int,
+) -> None:
+    """Напоминания о сроке созданной заявки: дело CRM + Telegram.
+
+    Вызывается после фиксации сделки, поэтому любой сбой здесь только
+    логируется. Дело (crm.activity.todo) даёт родной mobile-push Bitrix;
+    Telegram-напоминание — гарантированный канал, он не зависит от дела.
+    Срок без времени напоминает утром (dates.DEFAULT_REMINDER_HOUR).
+    """
+    due_ts = dates.reminder_epoch(order.deadline)
+    if due_ts is None or due_ts <= int(dates.now_local().timestamp()):
+        # Срока нет или он уже в прошлом: напоминать не о чем.
+        return
+    try:
+        if await db.pending_deal_reminder(deal_id) is not None:
+            # Напоминание уже стоит: сделку зафиксировал параллельный путь.
+            return
+    except Exception:
+        log.exception("Проверка существующего напоминания сделки %s не удалась", deal_id)
+    activity_id = None
+    if bitrix is not None:
+        try:
+            async with asyncio.timeout(POST_DEAL_DEADLINE):
+                activity_id = await create_deal_todo(
+                    bitrix,
+                    deal_id,
+                    title=f"Заявка №{deal_id}: {order.problem}",
+                    deadline_iso=dates.epoch_to_iso(due_ts),
+                    responsible_id=settings.bitrix_responsible_id,
+                )
+        except Exception:
+            log.exception("Дело-напоминание для сделки %s не создано", deal_id)
+    try:
+        await db.add_reminder(
+            message.chat.id,
+            text=(
+                f"заявка №{deal_id} — {order.problem}. "
+                f"Срок: {dates.format_deadline(order.deadline)}"
+            ),
+            due_ts=due_ts,
+            kind="deal",
+            entity_id=deal_id,
+            activity_id=activity_id,
+        )
+    except Exception:
+        log.exception("Telegram-напоминание для сделки %s не записано", deal_id)
+
+
+async def _schedule_task_reminder(
+    message: Message, db: Database, order: ParsedOrder, task_id: int
+) -> None:
+    """Telegram-напоминание к задаче-напоминанию (intent=reminder)."""
+    due_ts = dates.reminder_epoch(order.deadline)
+    if due_ts is None or due_ts <= int(dates.now_local().timestamp()):
+        return
+    try:
+        await db.add_reminder(
+            message.chat.id,
+            text=f"{order.problem}. Срок: {dates.format_deadline(order.deadline)}",
+            due_ts=due_ts,
+            kind="task",
+            entity_id=task_id,
+        )
+    except Exception:
+        log.exception("Telegram-напоминание для задачи %s не записано", task_id)
 
 
 async def _freeze_draft_unknown(db: Database, draft_id: str, token: str, key: str) -> bool:
@@ -905,6 +985,9 @@ async def _create_reminder(
     # Первая буква — заглавная: заголовок задачи читается как фраза.
     title = title[:1].upper() + title[1:] if title else "Напоминание"
     add_sent = False
+    # True только когда задача создана ИМЕННО этим вызовом: найденная сверкой
+    # или предпроверкой задача своё Telegram-напоминание уже получила.
+    task_created = False
     try:
         async with asyncio.timeout(CRM_DEADLINE):
             fence = await db.get_or_create_task_fence(key)
@@ -940,6 +1023,7 @@ async def _create_reminder(
                             task_id = await create_reminder_task(
                                 bitrix, title, deadline=order.deadline, key=key
                             )
+                            task_created = True
                         except Exception as exc:
                             if is_server_refusal(exc):
                                 # Сбрасывается только граница именно этого
@@ -987,6 +1071,9 @@ async def _create_reminder(
     if on_task_settled is not None:
         on_task_settled()
     await asyncio.shield(db.complete_task_fence(key, task_id))
+    if task_created:
+        # Гарантированный канал: бот сам напишет в Telegram в момент срока.
+        await _schedule_task_reminder(message, db, order, task_id)
     try:
         await message.answer(REMINDER_CREATED.format(task_id=task_id))
     except Exception:
@@ -1402,6 +1489,7 @@ async def _resolve_unknown_draft(
     order = ParsedOrder.model_validate_json(draft["parsed_json"])
     name = order.client_name or "Клиент"
     await callback.message.answer(f"Заявка №{deal_id} создана, клиент {name}.")
+    await _schedule_deal_reminder(callback.message, db, bitrix, order, deal_id)
 
 
 @router.callback_query(F.data.startswith("order:create"))
@@ -1785,6 +1873,9 @@ async def on_create(
         if data.get("draft_id") == draft_id:
             await state.clear()
         await callback.message.answer(f"Заявка №{deal_id} создана, клиент {name}.")
+        # Напоминания о сроке — после фиксации и подтверждения: их сбой уже
+        # не может повлиять на саму заявку.
+        await _schedule_deal_reminder(callback.message, db, bitrix, order, deal_id)
     finally:
         stop.set()
         # Страховка инварианта: после отправленного deal.add черновик не

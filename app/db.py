@@ -136,7 +136,25 @@ CREATE TABLE IF NOT EXISTS task_fences (
     task_id         INTEGER,
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS reminders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    due_ts      INTEGER NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'deal',
+    entity_id   INTEGER,
+    activity_id INTEGER,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, due_ts);
 """
+
+# Статусы Telegram-напоминаний (reminders.status).
+REMINDER_PENDING = "pending"
+REMINDER_SENT = "sent"
+REMINDER_FAILED = "failed"
 
 
 class Database:
@@ -842,6 +860,112 @@ class Database:
                 (key, task_id),
             )
             await conn.commit()
+
+    # -- Telegram-напоминания (переживают рестарт) ---------------------------
+
+    async def add_reminder(
+        self,
+        chat_id: int,
+        text: str,
+        due_ts: int,
+        kind: str = "deal",
+        entity_id: int | None = None,
+        activity_id: int | None = None,
+    ) -> int:
+        """Ставит напоминание в очередь: бот напишет в chat_id в момент due_ts.
+
+        Очередь живёт в SQLite и переживает рестарт контейнера: планировщик
+        (services/tasks.reminder_loop) перечитывает её из базы, а не из памяти.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "INSERT INTO reminders (chat_id, text, due_ts, kind, entity_id, activity_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, text, due_ts, kind, entity_id, activity_id),
+            )
+            await conn.commit()
+            return cur.lastrowid
+
+    async def due_reminders(self, now_ts: int, limit: int = 50) -> list[dict[str, Any]]:
+        """Напоминания, чей срок наступил (status=pending, due_ts <= сейчас)."""
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, kind, entity_id, activity_id, attempts "
+                "FROM reminders WHERE status = ? AND due_ts <= ? ORDER BY due_ts LIMIT ?",
+                (REMINDER_PENDING, now_ts, limit),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "chat_id": row[1],
+                "text": row[2],
+                "due_ts": row[3],
+                "kind": row[4],
+                "entity_id": row[5],
+                "activity_id": row[6],
+                "attempts": row[7],
+            }
+            for row in rows
+        ]
+
+    async def mark_reminder_sent(self, reminder_id: int) -> bool:
+        """Терминальная отметка «отправлено» (CAS по pending)."""
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "UPDATE reminders SET status = ? WHERE id = ? AND status = ?",
+                (REMINDER_SENT, reminder_id, REMINDER_PENDING),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+
+    async def record_reminder_attempt(self, reminder_id: int, max_attempts: int) -> None:
+        """Считает неудачную отправку; после max_attempts напоминание сдаётся.
+
+        Без предела зависший chat_id (бот заблокирован) заставлял бы
+        планировщик пытаться вечно на каждом проходе.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE reminders SET attempts = attempts + 1 WHERE id = ?",
+                (reminder_id,),
+            )
+            await conn.execute(
+                "UPDATE reminders SET status = ? WHERE id = ? AND attempts >= ?",
+                (REMINDER_FAILED, reminder_id, max_attempts),
+            )
+            await conn.commit()
+
+    async def pending_deal_reminder(self, deal_id: int) -> dict[str, Any] | None:
+        """Неотправленное напоминание сделки (для переноса срока при правке)."""
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, activity_id FROM reminders "
+                "WHERE kind = 'deal' AND entity_id = ? AND status = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (deal_id, REMINDER_PENDING),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "chat_id": row[1],
+            "text": row[2],
+            "due_ts": row[3],
+            "activity_id": row[4],
+        }
+
+    async def drop_pending_deal_reminders(self, deal_id: int) -> int:
+        """Снимает неотправленные напоминания сделки (срок изменился)."""
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "DELETE FROM reminders WHERE kind = 'deal' AND entity_id = ? "
+                "AND status = ?",
+                (deal_id, REMINDER_PENDING),
+            )
+            await conn.commit()
+            return cur.rowcount
 
     # -- Черновики заявок (карточки-превью) --------------------------------
 

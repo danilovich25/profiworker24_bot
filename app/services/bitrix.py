@@ -859,6 +859,74 @@ async def stage_names(bx: BitrixClient) -> dict[str, str]:
     }
 
 
+# Тип владельца «сделка» в новом REST-API дел (crm.activity.todo.*).
+TODO_OWNER_TYPE_DEAL = 2
+
+
+def _extract_todo_id(result: Any) -> int:
+    """ID дела из ответа crm.activity.todo.add (форма ответа плавает).
+
+    Портал отвечает объектом дела; клиент может отдать его как есть, снять
+    одноключевую обёртку («activity») или завернуть в служебный батч-ключ —
+    все формы сводятся к полю id.
+    """
+    value = _unwrap_batch_label(result)
+    if isinstance(value, dict) and len(value) == 1:
+        value = next(iter(value.values()))
+    if isinstance(value, dict):
+        value = value.get("id", value.get("ID"))
+    return require_positive_id(value, "crm.activity.todo.add")
+
+
+async def create_deal_todo(
+    bx: BitrixClient,
+    deal_id: int,
+    title: str,
+    deadline_iso: str,
+    responsible_id: int,
+    description: str | None = None,
+) -> int:
+    """Создаёт в сделке ДЕЛО с напоминанием в момент срока.
+
+    Именно дела (crm.activity.todo) мобильное приложение Bitrix24 показывает
+    push-уведомлением с напоминанием; обычная задача приходит тихим
+    колокольчиком. Ответственным обязан быть пользователь заказчика
+    (settings.bitrix_responsible_id): push уходит ответственному, а не
+    владельцу вебхука. pingOffsets=[0] — напоминание ровно в срок.
+    """
+    fields: dict[str, Any] = {
+        "ownerTypeId": TODO_OWNER_TYPE_DEAL,
+        "ownerId": deal_id,
+        "title": title[:255],
+        "deadline": deadline_iso,
+        "responsibleId": responsible_id,
+        "pingOffsets": [0],
+    }
+    if description:
+        fields["description"] = description
+    result = await call_once(bx, "crm.activity.todo.add", fields)
+    todo_id = _extract_todo_id(result)
+    log.info("В сделке id=%s создано дело-напоминание id=%s", deal_id, todo_id)
+    return todo_id
+
+
+async def update_deal_todo_deadline(
+    bx: BitrixClient, todo_id: int, deal_id: int, deadline_iso: str
+) -> None:
+    """Переносит срок существующего дела-напоминания (правка заявки)."""
+    await bx.call(
+        "crm.activity.todo.update",
+        {
+            "id": todo_id,
+            "ownerTypeId": TODO_OWNER_TYPE_DEAL,
+            "ownerId": deal_id,
+            "deadline": deadline_iso,
+            "pingOffsets": [0],
+        },
+    )
+    log.info("Срок дела id=%s перенесён", todo_id)
+
+
 async def ensure_sources(bx: BitrixClient) -> None:
     """Идемпотентно доводит справочник источников до значений заказчика.
 

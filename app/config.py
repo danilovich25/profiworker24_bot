@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # ALLOWED_TG_IDS означает «не пускать никого» (fail-closed на проде).
     allow_all_users: bool = False
     tz: str = "Asia/Vladivostok"
+    # Ответственный за задачи и дела-напоминания в Bitrix24. Должен быть
+    # пользователем ЗАКАЗЧИКА (mobile-push уходит ответственному), на портале
+    # заказчика это пользователь id=1 — он же владелец вебхука.
+    bitrix_responsible_id: int = 1
 
     @property
     def allowed_ids(self) -> set[int]:
