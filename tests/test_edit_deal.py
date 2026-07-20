@@ -196,6 +196,30 @@ async def test_edit_deadline_moves_reminders(flow, monkeypatch):
     assert "24.07.2026 10:00" in rows[0]["text"]
 
 
+async def test_edit_deadline_hint_format_keeps_time(flow, monkeypatch):
+    """Формат из подсказки бота «24.07.2026 10:00» не теряет время.
+
+    Дело CRM и Telegram-напоминание уходят на 10:00 Владивостока, а не на
+    утренний дефолт для «даты без времени».
+    """
+    freeze_now(monkeypatch)
+
+    await press(flow, "deal:edit:154")
+    await press(flow, "dedit:f:deadline")
+    await send(flow, "24.07.2026 10:00")
+    await press(flow, "dedit:save")
+
+    assert "Срок: 24.07.2026 10:00" in flow.bx.deal_updates[0]["fields"]["COMMENTS"]
+    # напоминания раньше не было — создано новое дело с точным временем
+    todo = flow.bx.activities[0]
+    assert todo["ownerId"] == 154
+    assert todo["deadline"] == "2026-07-24T10:00:00+10:00"
+    rows = await flow.db.due_reminders(FAR_FUTURE_TS)
+    assert len(rows) == 1
+    assert rows[0]["due_ts"] == int(datetime(2026, 7, 24, 10, 0, tzinfo=VVO).timestamp())
+    assert "24.07.2026 10:00" in rows[0]["text"]
+
+
 async def test_edit_cancel_discards_changes(flow):
     await press(flow, "deal:edit:154")
     await press(flow, "dedit:f:income")

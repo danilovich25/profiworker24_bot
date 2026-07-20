@@ -720,6 +720,24 @@ async def test_form_question_send_failure_keeps_step(flow, monkeypatch):
     assert "Срок: 20.07.2026" in card.text
 
 
+async def test_form_deadline_hint_format_keeps_time(flow, monkeypatch):
+    """Вопрос 6: срок в формате подсказки «24.07.2026 10:00» сохраняет время."""
+    parse_order_unavailable(monkeypatch)
+    freeze_now(monkeypatch)
+
+    await send(flow, "заявка")
+    await send(flow, "Иван")
+    await send(flow, "89141234567")
+    await send(flow, "сантехника")
+    await send(flow, "-")  # источник
+    await send(flow, "прочистить трубы")
+    await send(flow, "24.07.2026 10:00")
+
+    card = flow.session.sent_messages[-1]
+    assert "Проверьте заявку" in card.text
+    assert "Срок: 24.07.2026 10:00" in card.text
+
+
 async def test_chat_updates_wait_for_previous_fsm_transition(flow, monkeypatch):
     """Быстрый следующий ответ ждёт завершения предыдущего шага этого чата."""
     parse_order_unavailable(monkeypatch)

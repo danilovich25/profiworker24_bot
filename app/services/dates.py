@@ -78,6 +78,12 @@ _TIME_RE = re.compile(
     r"|(?::(\d{2}))?\s*(?:час(?:а|ов|ам)?\s*)?(утра|вечера|дня|ночи)\b)"
 )
 
+# Голое «чч:мм» без предлога. Допускается ТОЛЬКО рядом с распознанным днём
+# («24.07.2026 10:00», «завтра 15:30» — формат из подсказок бота): двоеточие
+# отличает время от цен («12.99») и телефонов, но без дня одинокое «10:00»
+# сроком не считается — угадывать день не по чему.
+_BARE_TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+
 
 def local_tz() -> ZoneInfo:
     """Часовой пояс приложения (одна настройка TZ, без «+10» по коду)."""
@@ -103,6 +109,17 @@ def _extract_time(text: str) -> tuple[int, int] | None:
     qualifier = match.group(4) or match.group(6)
     if qualifier in ("вечера", "дня") and hour < 12:
         hour += 12
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def _extract_bare_time(text: str) -> tuple[int, int] | None:
+    """Голое «чч:мм» без предлога — только как дополнение к названному дню."""
+    match = _BARE_TIME_RE.search(text)
+    if match is None:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
     if hour > 23 or minute > 59:
         return None
     return hour, minute
@@ -173,6 +190,10 @@ def parse_human_date(text: str | None, now: datetime) -> str | None:
 
     day = _extract_date(lowered, now)
     time_part = _extract_time(lowered)
+    if day is not None and time_part is None:
+        # День назван — рядом с ним время принимается и без предлога:
+        # «24.07.2026 10:00» (формат из подсказки бота), «завтра 15:30».
+        time_part = _extract_bare_time(lowered)
     if day is None and time_part is None:
         return None
     if time_part is None:
