@@ -447,6 +447,60 @@ async def test_ensure_uf_fields_new_and_existing(bx, respx_mock):
     assert org_field["EDIT_FORM_LABEL"] == {"ru": "Организация"}
 
 
+async def test_ensure_sources_adds_missing_and_renames_other(bx, respx_mock):
+    """Справочник источников доводится до значений заказчика идемпотентно.
+
+    «Авито» уже есть — не трогается; «Форпост» и «Сарафанное радио»
+    добавляются; штатный OTHER («Другое») переименовывается в «Прочее».
+    """
+    respx_mock.post(method_url("crm.status.list")).mock(
+        return_value=_ok(
+            [
+                {"ID": "1", "ENTITY_ID": "SOURCE", "STATUS_ID": "CALL", "NAME": "Звонок"},
+                {"ID": "8", "ENTITY_ID": "SOURCE", "STATUS_ID": "OTHER", "NAME": "Другое"},
+                {"ID": "20", "ENTITY_ID": "SOURCE", "STATUS_ID": "AVITO", "NAME": "Авито"},
+            ]
+        )
+    )
+    add = respx_mock.post(method_url("crm.status.add")).mock(return_value=_ok(21))
+    update = respx_mock.post(method_url("crm.status.update")).mock(return_value=_ok(True))
+
+    await bitrix.ensure_sources(bx)
+
+    added = [call_json(call)["fields"] for call in add.calls]
+    assert [f["STATUS_ID"] for f in added] == ["FORPOST", "SARAFAN"]
+    assert all(f["ENTITY_ID"] == "SOURCE" for f in added)
+    assert [f["NAME"] for f in added] == ["Форпост", "Сарафанное радио"]
+    renamed = call_json(update.calls.last)
+    assert renamed["id"] == "8"
+    assert renamed["fields"]["NAME"] == "Прочее"
+
+
+async def test_ensure_sources_noop_when_directory_is_ready(bx, respx_mock):
+    respx_mock.post(method_url("crm.status.list")).mock(
+        return_value=_ok(
+            [
+                {"ID": "8", "ENTITY_ID": "SOURCE", "STATUS_ID": "OTHER", "NAME": "Прочее"},
+                {"ID": "20", "ENTITY_ID": "SOURCE", "STATUS_ID": "AVITO", "NAME": "Авито"},
+                {"ID": "21", "ENTITY_ID": "SOURCE", "STATUS_ID": "FORPOST", "NAME": "Форпост"},
+                {
+                    "ID": "22",
+                    "ENTITY_ID": "SOURCE",
+                    "STATUS_ID": "SARAFAN",
+                    "NAME": "Сарафанное радио",
+                },
+            ]
+        )
+    )
+    add = respx_mock.post(method_url("crm.status.add")).mock(return_value=_ok(30))
+    update = respx_mock.post(method_url("crm.status.update")).mock(return_value=_ok(True))
+
+    await bitrix.ensure_sources(bx)
+
+    assert add.call_count == 0
+    assert update.call_count == 0
+
+
 async def test_ensure_uf_fields_unexpected_error_raises(bx, respx_mock):
     respx_mock.post(method_url("crm.deal.userfield.add")).mock(
         return_value=_error("ACCESS_DENIED", "Access denied")

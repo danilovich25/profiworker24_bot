@@ -38,6 +38,7 @@ from app.handlers.messages import (
     form_name_step,
     form_phone_step,
     form_problem_step,
+    form_source_text_step,
     handle_order_text,
 )
 from app.handlers.search import SearchFlow, handle_search_query
@@ -118,6 +119,9 @@ async def _route_by_state(
         return
     if current == OrderFlow.form_category.state:
         await form_category_text_step(message, state, text)
+        return
+    if current == OrderFlow.form_source.state:
+        await form_source_text_step(message, state, text)
         return
     if current == OrderFlow.form_problem.state:
         await form_problem_step(message, state, text)

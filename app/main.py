@@ -16,7 +16,7 @@ from app.middlewares.pruning_isolation import PruningEventIsolation
 from app.middlewares.rate_limit import RateLimitMiddleware
 from app.middlewares.whitelist import WhitelistMiddleware
 from app.sentry_setup import _scrub_string, init_sentry
-from app.services.bitrix import ensure_uf_fields, get_bitrix
+from app.services.bitrix import ensure_sources, ensure_uf_fields, get_bitrix
 
 logging.basicConfig(
     level=logging.INFO,
@@ -96,6 +96,12 @@ async def init_bitrix(webhook: str, sentry_active: bool = False):
                 "CRM отключена: поля Bitrix24 не готовы", level="warning"
             )
         return None
+    try:
+        # Справочник источников не критичен: сделка запишется и без него,
+        # поэтому сбой только логируется и CRM не отключает.
+        await ensure_sources(bx)
+    except Exception:
+        logger.exception("Справочник источников Bitrix24 не обновлён — продолжаю без него")
     return bx
 
 

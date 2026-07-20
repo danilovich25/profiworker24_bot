@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.schemas import Category, Intent, LlmParsedOrder, LlmParsedOrders, ParsedOrder
+from app.schemas import Category, Intent, LlmParsedOrder, LlmParsedOrders, ParsedOrder, Source
 from app.services import llm
 
 
@@ -44,6 +44,7 @@ def _reply(**fields) -> str:
         "org": None,
         "address": None,
         "category": None,
+        "source": None,
         "problem": "работа",
         "deadline": None,
         "income_rub": None,
@@ -299,6 +300,43 @@ def test_system_prompt_defines_three_intents():
     assert "Bitrix24" in prompt
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Авито", Source.avito),
+        ("Форпост", Source.forpost),
+        ("Сарафанное радио", Source.sarafan),
+        ("Прочее", Source.other),
+        (None, None),
+    ],
+)
+async def test_source_is_parsed(use_model, raw, expected):
+    use_model(_reply(source=raw, problem="замена крана"))
+
+    order = await llm.parse_order("клиент по авито, замена крана")
+
+    assert order is not None
+    assert order.source is expected
+
+
+def test_system_prompt_lists_sources():
+    prompt = llm._system_prompt()
+
+    assert "Авито" in prompt
+    assert "Форпост" in prompt
+    assert "Сарафанное радио" in prompt
+    assert "сарафан" in prompt  # разговорное «по сарафану» тоже распознаётся
+    assert "рекоменд" in prompt
+
+
+def test_system_prompt_teaches_no_comma_parsing():
+    """Фраза без единой запятой — штатный вход, промпт учит её раскладывать."""
+    prompt = llm._system_prompt()
+
+    assert "без запятых" in prompt
+    assert "Иван 89141234567 сантехника замена крана завтра доход 5000" in prompt
+
+
 def test_system_prompt_disambiguates_categories():
     prompt = llm._system_prompt()
 
@@ -373,6 +411,7 @@ def test_llm_order_converts_to_parsed_order():
         org=None,
         address=None,
         category=Category.electrics,
+        source=None,
         problem="установка люстры",
         deadline=None,
         income_rub=3500,

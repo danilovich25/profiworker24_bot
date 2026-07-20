@@ -24,6 +24,20 @@ class Category(str, Enum):
     other = "прочее"
 
 
+class Source(str, Enum):
+    """Источник заявки: откуда пришёл клиент.
+
+    Значения совпадают с человекочитаемыми названиями в справочнике
+    «Источники» Bitrix24 (см. services/bitrix.py: DEAL_SOURCES). None в
+    заявке означает «не назван» — при записи сделки подставляется «Прочее».
+    """
+
+    avito = "Авито"
+    forpost = "Форпост"
+    sarafan = "Сарафанное радио"
+    other = "Прочее"
+
+
 class ParsedOrder(BaseModel):
     """Разобранная заявка из свободного текста или голосового сообщения."""
 
@@ -33,6 +47,8 @@ class ParsedOrder(BaseModel):
     address: str | None = None
     # None = категория из текста не понятна, бот задаст уточняющий вопрос
     category: Category | None = None
+    # None = источник не назван, при записи в CRM станет «Прочее»
+    source: Source | None = None
     problem: str
     deadline: str | None = None  # ISO-дата или None
     income_rub: float | None = None
@@ -67,6 +83,7 @@ class LlmParsedOrder(BaseModel):
     org: str | None
     address: str | None
     category: Category | None
+    source: Source | None
     problem: str
     deadline: str | None
     income_rub: float | None

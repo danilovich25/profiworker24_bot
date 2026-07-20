@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 from pydantic import ValidationError
 
 from app.config import settings
-from app.schemas import Category, LlmParsedOrder, LlmParsedOrders, ParsedOrder
+from app.schemas import Category, LlmParsedOrder, LlmParsedOrders, ParsedOrder, Source
 
 log = logging.getLogger("bot.llm")
 
@@ -62,9 +62,17 @@ def _strip_json_fences(raw: str) -> str:
 def _system_prompt() -> str:
     now = datetime.now(ZoneInfo(settings.tz)).strftime("%Y-%m-%d %H:%M")
     categories = ", ".join(c.value for c in Category)
+    sources = ", ".join(s.value for s in Source)
     return (
         "Ты разбираешь сообщения сотрудников компании бытовых услуг в заявки.\n"
         f"Текущая дата и время: {now} ({settings.tz}, Владивосток).\n"
+        "Сообщение — живая речь: запятые и порядок слов не важны, данных\n"
+        "может не быть вовсе. Даже сплошную строку без запятых и знаков\n"
+        "препинания раскладывай по полям. Пример: сообщение\n"
+        "«Иван 89141234567 сантехника замена крана завтра доход 5000»\n"
+        'разбирается так: client_name «Иван», phone «89141234567»,\n'
+        'category «сантехника», problem «замена крана», deadline — завтра\n'
+        "от текущей даты, income_rub 5000.\n"
         'Верни JSON-объект с полем "orders" — списком заявок. Если в сообщении\n'
         "одна заявка, список содержит один объект. Если явно перечислены несколько\n"
         "клиентов или разных работ, раздели их на отдельные объекты, сохранив поля\n"
@@ -103,6 +111,12 @@ def _system_prompt() -> str:
         "  «установить». «перевозки» — переезд, доставка, вынос или подъём вещей.\n"
         "  «прочее» — что не подходит выше, например разнорабочие, уборка,\n"
         "  вынос мусора;\n"
+        f"- source: откуда пришла заявка, одно из [{sources}] или null, если\n"
+        "  источник не назван. «по авито», «с авито», «авито» — «Авито»;\n"
+        "  «форпост» — «Форпост»; «сарафан», «по сарафану», «по рекомендации»,\n"
+        "  «посоветовали», «от знакомых» — «Сарафанное радио»; иной явно\n"
+        "  названный источник — «Прочее». Ничего не угадывай: нет в тексте —\n"
+        "  null;\n"
         "- problem: краткая суть работ; для intent=other — краткая суть сообщения\n"
         "  (обязательное поле);\n"
         "- deadline: срок в формате ISO 8601 или null; относительные сроки\n"

@@ -257,14 +257,14 @@ async def test_voice_in_form_answers_current_question(flow, monkeypatch):
     recognize_mock(monkeypatch, text="Иван")
 
     await send_text(flow, "Иван, замена крана")
-    assert "Вопрос 1 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 1 из 6" in flow.session.sent_texts[-1]
 
     await send_voice(flow)  # голосом: «Иван»
-    assert "Вопрос 2 из 5" in flow.session.sent_texts[-1]  # опрос идёт дальше
-    assert sum("Вопрос 1 из 5" in t for t in flow.session.sent_texts) == 1
+    assert "Вопрос 2 из 6" in flow.session.sent_texts[-1]  # опрос идёт дальше
+    assert sum("Вопрос 1 из 6" in t for t in flow.session.sent_texts) == 1
 
     await send_text(flow, "89141234567")
-    assert "Вопрос 3 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 3 из 6" in flow.session.sent_texts[-1]
 
 
 async def test_voice_in_form_problem_fills_description(flow, monkeypatch):
@@ -275,15 +275,18 @@ async def test_voice_in_form_problem_fills_description(flow, monkeypatch):
     await send_text(flow, "Иван")
     await send_text(flow, "нет")
     await send_text(flow, "сантехника")  # категорию можно и напечатать
-    assert "Вопрос 4 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 4 из 6" in flow.session.sent_texts[-1]  # источник
+    await send_text(flow, "авито")  # источник можно и напечатать
+    assert "Вопрос 5 из 6" in flow.session.sent_texts[-1]
 
     await send_voice(flow)  # голосом: описание
-    assert "Вопрос 5 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 6 из 6" in flow.session.sent_texts[-1]
 
     await send_text(flow, "завтра")
     card = flow.session.sent_messages[-1]
     assert "Проверьте заявку" in card.text
     assert "заменить кран на кухне" in card.text
+    assert "Источник: Авито" in card.text
 
 
 async def test_voice_bare_number_answers_phone_question(flow, monkeypatch):
@@ -344,7 +347,8 @@ async def test_voice_and_following_text_are_serialized(flow, monkeypatch):
     await send_text(flow, "Иван")
     await send_text(flow, "нет")
     await send_text(flow, "сантехника")
-    assert "Вопрос 4 из 5" in flow.session.sent_texts[-1]  # ждём описание работ
+    await send_text(flow, "-")  # источник пропущен
+    assert "Вопрос 5 из 6" in flow.session.sent_texts[-1]  # ждём описание работ
 
     voice = asyncio.create_task(
         flow.dp.feed_update(flow.bot, make_voice_update(flow.bot))

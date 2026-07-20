@@ -19,7 +19,8 @@ DedupMiddleware до хендлеров.
 а телефон спрашивается максимум один раз — при повторном отсутствии номера
 карточка показывается без него.
 Если модель недоступна (LLMUnavailable), заявка собирается пошаговым
-опросником из 5 вопросов. Промежуточный черновик живёт в FSM (in-memory),
+опросником из 6 вопросов (имя, телефон, категория, источник, описание,
+срок). Промежуточный черновик живёт в FSM (in-memory),
 а каждая показанная карточка-превью сохраняется в SQLite (таблица drafts)
 и её кнопки несут draft_id: нажатие применяется именно к той карточке,
 на которой нажали, даже если после неё показаны новые. Просроченная
@@ -58,9 +59,11 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.db import DRAFT_DONE, DRAFT_UNKNOWN, Database
 from app.middlewares.dedup import content_hash
-from app.schemas import Category, Intent, ParsedOrder
+from app.schemas import Category, Intent, ParsedOrder, Source
 from app.services import dates, llm
 from app.services.bitrix import (
+    DEFAULT_SOURCE_ID,
+    SOURCE_ID_BY_NAME,
     UF_EXPENSE,
     UF_PROFIT,
     UF_SERVICE_CATEGORY,
@@ -321,6 +324,7 @@ class OrderFlow(StatesGroup):
     form_name = State()
     form_phone = State()
     form_category = State()
+    form_source = State()
     form_problem = State()
     form_deadline = State()
 
@@ -360,6 +364,15 @@ def category_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def source_keyboard() -> InlineKeyboardMarkup:
+    """4 кнопки источника заявки (Авито, Форпост, Сарафанное радио, Прочее)."""
+    rows = [
+        [InlineKeyboardButton(text=src.value, callback_data=f"src:{src.value}")]
+        for src in Source
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def preview_text(order: ParsedOrder) -> str:
     lines = [
         "Проверьте заявку:",
@@ -371,6 +384,9 @@ def preview_text(order: ParsedOrder) -> str:
     if order.address:
         lines.append(f"Адрес: {order.address}")
     lines.append(f"Категория: {order.category.value if order.category else 'не указана'}")
+    # Источник показывается всегда: если он не назван, при записи в CRM
+    # подставится «Прочее» — карточка честно предупреждает об этом.
+    lines.append(f"Источник: {order.source.value if order.source else Source.other.value}")
     lines.append(f"Описание: {order.problem}")
     if order.deadline:
         lines.append(f"Срок: {dates.format_deadline(order.deadline)}")
@@ -395,6 +411,13 @@ def build_deal_fields(order: ParsedOrder) -> dict[str, Any]:
         # Категория дублируется в отдельное поле сделки: по нему в CRM
         # работают фильтры и отчёты, а TITLE остаётся человекочитаемым.
         fields[UF_SERVICE_CATEGORY] = order.category.value
+    # Источник — родное поле SOURCE_ID (отдельная колонка в CRM). Не назван —
+    # «Прочее»: значения справочника готовит ensure_sources при старте.
+    fields["SOURCE_ID"] = (
+        SOURCE_ID_BY_NAME.get(order.source.value, DEFAULT_SOURCE_ID)
+        if order.source
+        else DEFAULT_SOURCE_ID
+    )
     if order.income_rub is not None:
         fields["OPPORTUNITY"] = order.income_rub
     if order.expense_rub is not None:
@@ -596,7 +619,7 @@ async def _process_order_text(
             # молча «именем клиента»), а захват хэша снимется в finally.
             await message.answer(
                 "Не получилось разобрать сообщение автоматически, соберу заявку "
-                "по шагам.\nВопрос 1 из 5. Как зовут клиента?"
+                "по шагам.\nВопрос 1 из 6. Как зовут клиента?"
             )
             await state.set_state(OrderFlow.form_name)
             data: dict[str, Any] = {"order": {}, "dedup_key": dedup_key, "user_id": user_id}
@@ -1740,7 +1763,7 @@ async def on_edit(callback: CallbackQuery, state: FSMContext, db: Database) -> N
         # точки вопрос считается возможно доставленным и требует компенсации.
         prompt_sent = True
         await callback.message.answer(
-            f"Вопрос 1 из 5. Имя клиента (сейчас: {current}). "
+            f"Вопрос 1 из 6. Имя клиента (сейчас: {current}). "
             "Пришлите новое или «-», чтобы оставить."
         )
 
@@ -1846,7 +1869,14 @@ async def _set_field(state: FSMContext, field: str, raw: str) -> None:
     await state.update_data(order=order_data)
 
 
-ASK_CATEGORY_TEXT = "Вопрос 3 из 5. Категория услуги:"
+ASK_CATEGORY_TEXT = "Вопрос 3 из 6. Категория услуги:"
+
+ASK_SOURCE_TEXT = (
+    "Вопрос 4 из 6. Источник заявки? Выберите кнопкой или пришлите «-», "
+    "чтобы пропустить (запишется «Прочее»)."
+)
+
+ASK_PROBLEM_TEXT = "Вопрос 5 из 6. Опишите, что нужно сделать."
 
 # Во всех шагах опросника следующий вопрос отправляется ДО перевода FSM:
 # если отправка упала, состояние осталось на текущем шаге, и повторённый
@@ -1865,7 +1895,7 @@ async def form_name_step(message: Message, state: FSMContext, text: str) -> None
         await state.set_state(OrderFlow.form_category)
         return
     await message.answer(
-        "Вопрос 2 из 5. Телефон клиента? Пришлите номер, «нет» если "
+        "Вопрос 2 из 6. Телефон клиента? Пришлите номер, «нет» если "
         "телефона нет, или «-», чтобы оставить как есть."
     )
     await state.set_state(OrderFlow.form_phone)
@@ -1909,8 +1939,8 @@ async def on_form_category(callback: CallbackQuery, state: FSMContext) -> None:
     order_data["category"] = callback.data.split(":", 1)[1]
     await state.update_data(order=order_data)
     await callback.answer()
-    await callback.message.answer("Вопрос 4 из 5. Опишите, что нужно сделать.")
-    await state.set_state(OrderFlow.form_problem)
+    await callback.message.answer(ASK_SOURCE_TEXT, reply_markup=source_keyboard())
+    await state.set_state(OrderFlow.form_source)
 
 
 async def form_category_text_step(message: Message, state: FSMContext, text: str) -> None:
@@ -1927,13 +1957,51 @@ async def form_category_text_step(message: Message, state: FSMContext, text: str
     if matched is not None:
         order_data["category"] = matched
         await state.update_data(order=order_data)
-    await message.answer("Вопрос 4 из 5. Опишите, что нужно сделать.")
-    await state.set_state(OrderFlow.form_problem)
+    await message.answer(ASK_SOURCE_TEXT, reply_markup=source_keyboard())
+    await state.set_state(OrderFlow.form_source)
 
 
 @router.message(OrderFlow.form_category, F.text)
 async def on_form_category_text(message: Message, state: FSMContext) -> None:
     await form_category_text_step(message, state, message.text or "")
+
+
+@router.callback_query(OrderFlow.form_source, F.data.startswith("src:"))
+async def on_form_source(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    order_data = data["order"]
+    order_data["source"] = callback.data.split(":", 1)[1]
+    await state.update_data(order=order_data)
+    await callback.answer()
+    await callback.message.answer(ASK_PROBLEM_TEXT)
+    await state.set_state(OrderFlow.form_problem)
+
+
+async def form_source_text_step(message: Message, state: FSMContext, text: str) -> None:
+    """Источник можно напечатать или наговорить; «-» пропускает вопрос.
+
+    Пропущенный источник остаётся пустым — при записи сделки подставится
+    «Прочее» (см. build_deal_fields), переспрашивать не нужно.
+    """
+    cleaned = (text or "").strip().lower()
+    matched = next((src.value for src in Source if src.value.lower() == cleaned), None)
+    if matched is None and cleaned != KEEP_WORD:
+        await message.answer(
+            "Выберите источник кнопкой ниже:", reply_markup=source_keyboard()
+        )
+        return
+    if matched is not None:
+        data = await state.get_data()
+        order_data = data["order"]
+        order_data["source"] = matched
+        await state.update_data(order=order_data)
+    await message.answer(ASK_PROBLEM_TEXT)
+    await state.set_state(OrderFlow.form_problem)
+
+
+@router.message(OrderFlow.form_source, F.text)
+async def on_form_source_text(message: Message, state: FSMContext) -> None:
+    await form_source_text_step(message, state, message.text or "")
 
 
 async def form_problem_step(message: Message, state: FSMContext, text: str) -> None:
@@ -1943,7 +2011,7 @@ async def form_problem_step(message: Message, state: FSMContext, text: str) -> N
         await message.answer("Без описания заявку не завести. Опишите, что нужно сделать.")
         return
     await message.answer(
-        "Вопрос 5 из 5. Срок выполнения? Например «завтра до 18:00», "
+        "Вопрос 6 из 6. Срок выполнения? Например «завтра до 18:00», "
         "«нет» если срок не важен, «-» чтобы оставить как есть."
     )
     await state.set_state(OrderFlow.form_deadline)

@@ -98,6 +98,21 @@ _CONTACT_UF_FIELDS: tuple[dict[str, Any], ...] = (
 # Признаки ответа "такое поле уже существует" (текст зависит от языка портала)
 _EXISTS_MARKERS = ("уже существует", "already exists", "already exist")
 
+# Справочник источников сделки (crm.status, ENTITY_ID=SOURCE): STATUS_ID →
+# человекочитаемое название, совпадающее со значениями Source в app/schemas.py.
+# «Прочее» — это штатный OTHER (ensure_sources переименовывает его), остальные
+# значения бот добавляет в справочник при старте.
+DEAL_SOURCES: tuple[tuple[str, str], ...] = (
+    ("AVITO", "Авито"),
+    ("FORPOST", "Форпост"),
+    ("SARAFAN", "Сарафанное радио"),
+    ("OTHER", "Прочее"),
+)
+SOURCE_ID_BY_NAME = {name: status_id for status_id, name in DEAL_SOURCES}
+SOURCE_NAME_BY_ID = {status_id: name for status_id, name in DEAL_SOURCES}
+# Источник, который пишется в сделку, если сотрудник его не назвал.
+DEFAULT_SOURCE_ID = "OTHER"
+
 # Обязательные UF-поля и их ожидаемые типы: поле с чужим USER_TYPE_ID так же
 # непригодно, как отсутствующее (например, TG_MSG_ID типа double молча
 # исказил бы строковый ключ идемпотентности).
@@ -842,6 +857,52 @@ async def stage_names(bx: BitrixClient) -> dict[str, str]:
         and row.get("STATUS_ID")
         and str(row.get("ENTITY_ID") or "").startswith("DEAL_STAGE")
     }
+
+
+async def ensure_sources(bx: BitrixClient) -> None:
+    """Идемпотентно доводит справочник источников до значений заказчика.
+
+    Недостающие источники (Авито, Форпост, Сарафанное радио) добавляются в
+    справочник crm.status (ENTITY_ID=SOURCE), а штатный OTHER («Другое»)
+    переименовывается в «Прочее». Повторный запуск ничего не меняет.
+
+    В отличие от ensure_uf_fields сбой здесь не отключает CRM: SOURCE_ID —
+    не критичное поле, сделка запишется и без готового справочника (значение
+    просто не будет подписано в карточке), поэтому вызывающий только логирует
+    ошибку.
+    """
+    response = _checked_raw_response(
+        await bx.call(
+            "crm.status.list", {"filter": {"ENTITY_ID": "SOURCE"}}, raw=True
+        )
+    )
+    rows = response.get("result")
+    if not isinstance(rows, list):
+        raise MalformedBitrixResponse("Bitrix вернул неверный result для crm.status.list")
+    existing: dict[str, dict[str, Any]] = {
+        str(row.get("STATUS_ID")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("STATUS_ID")
+    }
+    for status_id, name in DEAL_SOURCES:
+        row = existing.get(status_id)
+        if row is None:
+            await bx.call(
+                "crm.status.add",
+                {
+                    "fields": {
+                        "ENTITY_ID": "SOURCE",
+                        "STATUS_ID": status_id,
+                        "NAME": name,
+                    }
+                },
+            )
+            log.info("В справочник источников добавлен %s", status_id)
+        elif str(row.get("NAME") or "") != name:
+            await bx.call(
+                "crm.status.update", {"id": row.get("ID"), "fields": {"NAME": name}}
+            )
+            log.info("Источник %s переименован в «%s»", status_id, name)
 
 
 async def ensure_uf_fields(bx: BitrixClient) -> None:

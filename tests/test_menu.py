@@ -176,11 +176,11 @@ async def test_start_keeps_unfinished_form(flow, monkeypatch):
     monkeypatch.setattr(llm, "parse_order", unavailable)
 
     await send(flow, "Иван, замена крана")
-    assert "Вопрос 1 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 1 из 6" in flow.session.sent_texts[-1]
 
     await send(flow, "/start")  # приветствие посреди опросника
     await send(flow, "Иван")  # ответ на вопрос 1 по-прежнему принимается
-    assert "Вопрос 2 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 2 из 6" in flow.session.sent_texts[-1]
 
 
 async def test_menu_button_inside_form_preserves_current_question(flow, monkeypatch):
@@ -192,17 +192,17 @@ async def test_menu_button_inside_form_preserves_current_question(flow, monkeypa
     monkeypatch.setattr(llm, "parse_order", unavailable)
 
     await send(flow, "Иван, замена крана")  # модель недоступна -> опросник
-    assert "Вопрос 1 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 1 из 6" in flow.session.sent_texts[-1]
 
     await send(flow, BTN_FIND)
     assert flow.session.sent_texts[-1] == ACTIVE_ORDER_WARNING
     assert ASK_QUERY not in flow.session.sent_texts
 
     await send(flow, "Иван")  # прежний вопрос всё ещё активен
-    assert "Вопрос 2 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 2 из 6" in flow.session.sent_texts[-1]
 
     await send(flow, "нет")
-    assert "Вопрос 3 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 3 из 6" in flow.session.sent_texts[-1]
 
 
 async def test_setup_bot_commands(bot, session):

@@ -242,6 +242,7 @@ ACTIVE_ORDER_STATES = StateFilter(
     OrderFlow.form_name,
     OrderFlow.form_phone,
     OrderFlow.form_category,
+    OrderFlow.form_source,
     OrderFlow.form_problem,
     OrderFlow.form_deadline,
 )

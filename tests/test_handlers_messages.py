@@ -40,7 +40,7 @@ from app.handlers.messages import (
     OrderFlow,
 )
 from app.main import create_dispatcher
-from app.schemas import Category, Intent, ParsedOrder
+from app.schemas import Category, Intent, ParsedOrder, Source
 from app.services import bitrix, dates, llm
 from tests.conftest import (
     SemanticBitrixFake,
@@ -239,6 +239,24 @@ def test_deal_fields_without_category_skip_service_field():
     assert bitrix.UF_SERVICE_CATEGORY not in fields
 
 
+def test_deal_fields_source_default_is_other():
+    """Источник не назван — сделка получает «Прочее» (родной SOURCE_ID)."""
+    fields = messages.build_deal_fields(FULL_ORDER)
+    assert fields["SOURCE_ID"] == "OTHER"
+
+
+def test_deal_fields_source_goes_to_native_source_id():
+    fields = messages.build_deal_fields(
+        FULL_ORDER.model_copy(update={"source": Source.avito})
+    )
+    assert fields["SOURCE_ID"] == "AVITO"
+
+    sarafan = messages.build_deal_fields(
+        FULL_ORDER.model_copy(update={"source": Source.sarafan})
+    )
+    assert sarafan["SOURCE_ID"] == "SARAFAN"
+
+
 def test_deal_fields_put_org_into_comments():
     """Организация пишется в комментарий сделки: по нему ищет /find <организация>."""
     fields = messages.build_deal_fields(
@@ -337,24 +355,44 @@ async def test_edit_button_walks_all_fields(flow, monkeypatch):
 
     await send(flow, "заявка")
     await press_card(flow, "edit")
-    assert "Вопрос 1 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 1 из 6" in flow.session.sent_texts[-1]
 
     await send(flow, "Мария")  # новое имя
     await send(flow, "-")  # телефон оставить
-    assert "Вопрос 3 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 3 из 6" in flow.session.sent_texts[-1]
     await press(flow, "cat:электрика")
+    await press(flow, "src:Форпост")  # источник
     await send(flow, "-")  # описание оставить
     await send(flow, "послезавтра")
 
     card = flow.session.sent_messages[-1]
     assert "Мария" in card.text
     assert "электрика" in card.text
+    assert "Источник: Форпост" in card.text
     assert "замена крана" in card.text  # описание не тронуто
     # «послезавтра» разобрано в дату и показано в формате дд.мм.гггг
     assert "Срок: 21.07.2026" in card.text
 
     await press_card(flow, "create", card)
     assert flow.bx.deals[0]["TITLE"] == "электрика: замена крана"
+
+
+async def test_card_shows_source_from_text(flow, monkeypatch):
+    """«По авито» из текста попадает в карточку отдельной строкой."""
+    parse_order_mock(monkeypatch, FULL_ORDER.model_copy(update={"source": Source.avito}))
+
+    await send(flow, "Иван, 89141234567, по авито, сантехника, замена крана")
+
+    assert "Источник: Авито" in flow.session.sent_messages[-1].text
+
+
+async def test_card_shows_default_source(flow, monkeypatch):
+    """Источник не назван — карточка честно показывает дефолт «Прочее»."""
+    parse_order_mock(monkeypatch)
+
+    await send(flow, "Иван, 89141234567, сантехника, замена крана")
+
+    assert "Источник: Прочее" in flow.session.sent_messages[-1].text
 
 
 async def test_card_shows_deadline_in_local_format(flow, monkeypatch):
@@ -395,6 +433,7 @@ async def test_relative_deadline_in_text_overrides_llm(flow, monkeypatch):
 
 async def test_llm_unavailable_falls_back_to_form(flow, monkeypatch):
     parse_order_unavailable(monkeypatch)
+    freeze_now(monkeypatch)
 
     await send(flow, "Иван, замена крана")
     assert "Как зовут клиента" in flow.session.sent_texts[-1]
@@ -409,6 +448,18 @@ async def test_llm_unavailable_falls_back_to_form(flow, monkeypatch):
     assert "cat:сантехника" in cat_buttons
 
     await press(flow, "cat:сантехника")
+    # после категории — вопрос об источнике с 4 кнопками
+    source_question = flow.session.sent_messages[-1]
+    assert "Источник" in source_question.text
+    src_buttons = [
+        b.callback_data
+        for row in source_question.reply_markup.inline_keyboard
+        for b in row
+    ]
+    for wanted in ("src:Авито", "src:Форпост", "src:Сарафанное радио", "src:Прочее"):
+        assert wanted in src_buttons
+
+    await press(flow, "src:Авито")
     assert "что нужно сделать" in flow.session.sent_texts[-1]
 
     await send(flow, "замена крана")
@@ -417,10 +468,12 @@ async def test_llm_unavailable_falls_back_to_form(flow, monkeypatch):
     await send(flow, "завтра")
     card = flow.session.sent_messages[-1]
     assert "Проверьте заявку" in card.text
+    assert "Источник: Авито" in card.text
 
     await press_card(flow, "create", card)
     assert len(flow.bx.deals) == 1
     assert flow.bx.deals[0]["TITLE"] == "сантехника: замена крана"
+    assert flow.bx.deals[0]["SOURCE_ID"] == "AVITO"
     assert "Заявка №154 создана" in flow.session.sent_texts[-1]
 
 
@@ -452,14 +505,16 @@ async def test_form_question_send_failure_keeps_step(flow, monkeypatch):
     await send(flow, "Иван")
     await send(flow, "нет")
     await send(flow, "сантехника")
-    assert "Вопрос 4 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 4 из 6" in flow.session.sent_texts[-1]  # источник
+    await send(flow, "-")  # источник пропущен («Прочее» подставится при записи)
+    assert "Вопрос 5 из 6" in flow.session.sent_texts[-1]
 
-    _fail_send_once(flow, monkeypatch, "Вопрос 5 из 5")
+    _fail_send_once(flow, monkeypatch, "Вопрос 6 из 6")
     with contextlib.suppress(RuntimeError):
         await send(flow, "заменить кран")  # вопрос о сроке не ушёл
 
     await send(flow, "заменить кран на кухне")  # повтор ответа — это описание
-    assert "Вопрос 5 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 6 из 6" in flow.session.sent_texts[-1]
 
     await send(flow, "завтра")
     card = flow.session.sent_messages[-1]
@@ -478,7 +533,7 @@ async def test_chat_updates_wait_for_previous_fsm_transition(flow, monkeypatch):
     original_request = flow.session.make_request
 
     async def delayed_question(bot, method, timeout=None):
-        if isinstance(method, SendMessage) and "Вопрос 2 из 5" in method.text:
+        if isinstance(method, SendMessage) and "Вопрос 2 из 6" in method.text:
             entered.set()
             await release.wait()
         return await original_request(bot, method, timeout)
@@ -505,22 +560,22 @@ async def test_chat_updates_wait_for_previous_fsm_transition(flow, monkeypatch):
 
 
 async def test_form_intro_send_failure_leaves_clean_state(flow, monkeypatch):
-    """Сбой отправки «Вопрос 1 из 5» не запирает чат в невидимом опроснике.
+    """Сбой отправки «Вопрос 1 из 6» не запирает чат в невидимом опроснике.
 
     Раньше состояние form_name выставлялось до отправки вступления: если оно
     не ушло, следующий текст молча записывался как имя клиента. Теперь
     состояние не тронуто, захват снят — повтор текста начинает заново.
     """
     parse_order_unavailable(monkeypatch)
-    _fail_send_once(flow, monkeypatch, "Вопрос 1 из 5")
+    _fail_send_once(flow, monkeypatch, "Вопрос 1 из 6")
 
     with contextlib.suppress(RuntimeError):
         await send(flow, "заявка")
 
     await send(flow, "заявка")  # повтор проходит с чистого листа
-    assert "Вопрос 1 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 1 из 6" in flow.session.sent_texts[-1]
     await send(flow, "Иван")
-    assert "Вопрос 2 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 2 из 6" in flow.session.sent_texts[-1]
 
 
 @pytest.mark.parametrize(
@@ -785,11 +840,11 @@ async def test_phone_asked_survives_llm_fallback(flow, monkeypatch):
     assert "Не указан телефон клиента" in flow.session.sent_texts[-1]
 
     await send(flow, "новая свободная фраза без номера")  # упала в опросник
-    assert "Вопрос 1 из 5" in flow.session.sent_texts[-1]
+    assert "Вопрос 1 из 6" in flow.session.sent_texts[-1]
 
     await send(flow, "Мария")  # имя; вопрос о телефоне пропускается
-    assert "Вопрос 3 из 5" in flow.session.sent_texts[-1]
-    assert all("Вопрос 2 из 5" not in t for t in flow.session.sent_texts)
+    assert "Вопрос 3 из 6" in flow.session.sent_texts[-1]
+    assert all("Вопрос 2 из 6" not in t for t in flow.session.sent_texts)
     assert sum("Не указан телефон" in t for t in flow.session.sent_texts) == 1
 
 
@@ -1380,8 +1435,8 @@ async def test_fsm_answer_duplicate_processed_once(flow, monkeypatch):
     await flow.dp.feed_update(flow.bot, update)
 
     texts = flow.session.sent_texts
-    assert sum("Вопрос 2 из 5" in t for t in texts) == 1  # обработан один раз
-    assert all("Вопрос 3 из 5" not in t for t in texts)  # опрос не уехал дальше
+    assert sum("Вопрос 2 из 6" in t for t in texts) == 1  # обработан один раз
+    assert all("Вопрос 3 из 6" not in t for t in texts)  # опрос не уехал дальше
     assert texts[-1] == "Похоже, это сообщение я уже обрабатывал."
 
 
@@ -1561,6 +1616,7 @@ async def test_reserved_fence_allows_create_after_edit(flow, monkeypatch):
     await send(flow, "Мария")
     await send(flow, "-")
     await press(flow, "cat:электрика")
+    await send(flow, "-")  # источник
     await send(flow, "-")
     await send(flow, "-")
     second_card = flow.session.sent_messages[-1]
@@ -1585,6 +1641,7 @@ async def test_edit_after_deal_refusal_does_not_reuse_old_crm_phase(flow, monkey
     await send(flow, "Мария")
     await send(flow, "+7 914 765-43-21")
     await press(flow, "cat:электрика")
+    await send(flow, "-")  # источник
     await send(flow, "заменить розетку")
     await send(flow, "-")
     second_card = flow.session.sent_messages[-1]
@@ -2556,7 +2613,7 @@ async def test_cancel_and_edit_rejected_while_create_in_flight(flow, monkeypatch
     answers = [r for r in flow.session.requests if isinstance(r, AnswerCallbackQuery)]
     assert sum(a.text == "Заявка №154 уже создана." for a in answers) == 2
     assert "Отменено." not in flow.session.sent_texts
-    assert all("Вопрос 1 из 5" not in t for t in flow.session.sent_texts)
+    assert all("Вопрос 1 из 6" not in t for t in flow.session.sent_texts)
 
 
 async def test_answer_failure_releases_claim(flow, monkeypatch):
@@ -2702,7 +2759,7 @@ async def test_edit_loses_race_to_concurrent_claim(flow, monkeypatch):
     assert winner["claim"] is not None  # захват победил
     answer = [r for r in flow.session.requests if isinstance(r, AnswerCallbackQuery)][-1]
     assert answer.text == DRAFT_BUSY  # редактирование отклонено
-    assert all("Вопрос 1 из 5" not in t for t in flow.session.sent_texts)  # FSM не тронут
+    assert all("Вопрос 1 из 6" not in t for t in flow.session.sent_texts)  # FSM не тронут
 
 
 async def test_edit_question_failure_keeps_draft_and_fsm(flow, monkeypatch):
@@ -2714,7 +2771,7 @@ async def test_edit_question_failure_keeps_draft_and_fsm(flow, monkeypatch):
     orig_request = flow.session.make_request
 
     async def fail_question(bot, method, timeout=None):
-        if isinstance(method, SendMessage) and method.text.startswith("Вопрос 1 из 5"):
+        if isinstance(method, SendMessage) and method.text.startswith("Вопрос 1 из 6"):
             raise RuntimeError("Telegram недоступен")
         return await orig_request(bot, method, timeout)
 
@@ -2737,7 +2794,7 @@ async def test_edit_prompt_lost_response_is_compensated(flow, monkeypatch):
 
     async def accepted_without_reply(bot, method, timeout=None):
         result = await original_request(bot, method, timeout)
-        if isinstance(method, SendMessage) and method.text.startswith("Вопрос 1 из 5"):
+        if isinstance(method, SendMessage) and method.text.startswith("Вопрос 1 из 6"):
             raise RuntimeError("ответ Telegram потерян")
         return result
 
@@ -2745,7 +2802,7 @@ async def test_edit_prompt_lost_response_is_compensated(flow, monkeypatch):
     with pytest.raises(RuntimeError, match="ответ Telegram потерян"):
         await press_card(flow, "edit", card)
 
-    assert flow.session.sent_texts[-2].startswith("Вопрос 1 из 5")
+    assert flow.session.sent_texts[-2].startswith("Вопрос 1 из 6")
     assert flow.session.sent_texts[-1] == messages.EDIT_ROLLBACK_TEXT
 
 
@@ -2759,7 +2816,7 @@ async def test_edit_rollback_notification_failure_is_not_suppressed(flow, monkey
     async def fail_prompt_and_rollback(bot, method, timeout=None):
         if isinstance(method, SendMessage) and method.text == messages.EDIT_ROLLBACK_TEXT:
             raise RuntimeError("компенсация не доставлена")
-        if isinstance(method, SendMessage) and method.text.startswith("Вопрос 1 из 5"):
+        if isinstance(method, SendMessage) and method.text.startswith("Вопрос 1 из 6"):
             await original_request(bot, method, timeout)
             raise RuntimeError("ответ Telegram потерян")
         return await original_request(bot, method, timeout)
@@ -3116,7 +3173,7 @@ async def test_force_create_stale_takeover_single_draft_and_deal(flow, monkeypat
     [
         ("phoneless", "Не указан телефон"),  # ветка ask_phone
         ("categoryless", "Не понял категорию"),  # ветка ask_category
-        ("unavailable", "Вопрос 1 из 5"),  # LLMUnavailable, FSM-опросник
+        ("unavailable", "Вопрос 1 из 6"),  # LLMUnavailable, FSM-опросник
     ],
 )
 async def test_force_branches_finish_before_queued_click(
