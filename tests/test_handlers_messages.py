@@ -504,6 +504,30 @@ async def test_todo_failure_keeps_deal_and_tg_reminder(flow, monkeypatch):
     assert rows[0]["activity_id"] is None  # дело не создано, Telegram остался
 
 
+async def test_deal_for_existing_client_marked_returning(flow, monkeypatch):
+    """Вторая заявка того же клиента помечается повторной для аналитики.
+
+    Bitrix сам флаг через REST не ставит (подтверждено живым прогоном 21.07):
+    IS_RETURN_CUSTOMER выставляет бот, когда контакт уже был в базе.
+    """
+    parse_order_mock(monkeypatch)
+    await send(flow, "Иван, 89141234567, сантехника, замена крана")
+    await press_card(flow, "create")
+    assert "IS_RETURN_CUSTOMER" not in flow.bx.deals[0]  # клиент новый
+
+    parse_order_mock(
+        monkeypatch,
+        FULL_ORDER.model_copy(
+            update={"problem": "перевезти диван", "category": Category.transport}
+        ),
+    )
+    await send(flow, "Иван, 89141234567, перевозки, перевезти диван")
+    await press_card(flow, "create")
+
+    assert len(flow.bx.contacts) == 1  # контакт не задублирован
+    assert flow.bx.deals[1]["IS_RETURN_CUSTOMER"] == "Y"
+
+
 async def test_reminder_intent_gets_tg_reminder(flow, monkeypatch):
     """Задача-напоминание дублируется Telegram-напоминанием в момент срока."""
     freeze_now(monkeypatch)

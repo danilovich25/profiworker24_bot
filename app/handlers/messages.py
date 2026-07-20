@@ -1553,6 +1553,10 @@ async def on_create(
     draft_done = False
     key = draft["dedup_key"] or f"cb:{callback.id}"
     fence_owned = False
+    # Клиент уже был в CRM до этой заявки: сделка помечается повторной
+    # (IS_RETURN_CUSTOMER) для аналитики Bitrix24. REST сам флаг не ставит —
+    # подтверждено живым порталом.
+    returning_client = False
     # Каждая неоднозначная contact/comment-запись имеет собственную фазу.
     # Флаг снимается только после постоянного settle этой же операции.
     contact_unknown = False
@@ -1715,6 +1719,7 @@ async def on_create(
                                     await callback.message.answer(CRM_UNKNOWN_TEXT)
                                 return
                             contact_unknown = False
+                            returning_client = not created
                             phase = "comment_done" if created else "contact_ready"
                             if settle_cancelled:
                                 raise asyncio.CancelledError
@@ -1792,9 +1797,12 @@ async def on_create(
                             await callback.message.answer(CRM_UNKNOWN_TEXT)
                             return
                     else:
+                        deal_fields = build_deal_fields(order)
+                        if returning_client:
+                            deal_fields["IS_RETURN_CUSTOMER"] = "Y"
                         try:
                             deal_id = await create_deal(
-                                bitrix, contact_id, build_deal_fields(order), key
+                                bitrix, contact_id, deal_fields, key
                             )
                         except Exception as exc:
                             if is_server_refusal(exc):
