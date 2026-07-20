@@ -536,8 +536,20 @@ async def handle_search_query(
     await _run_search(message, bitrix, query)
 
 
-@router.message(SearchFlow.query, F.text)
+SEARCH_CLOSED = "Поиск закрыт. Пришлите новую заявку или нажмите «Найти»."
+
+
+@router.message(SearchFlow.query, Command("cancel"))
+async def on_search_cancel(message: Message, state: FSMContext) -> None:
+    """/cancel закрывает липкий режим поиска, а не ищет слово «cancel»."""
+    await state.clear()
+    await message.answer(SEARCH_CLOSED)
+
+
+@router.message(SearchFlow.query, F.text, ~F.text.startswith("/"))
 async def on_search_query(
     message: Message, state: FSMContext, bitrix: BitrixClient | None = None
 ) -> None:
+    # Команды поисковыми запросами не считаются: /cancel обработан выше,
+    # прочие уходят своим хендлерам или в общий fallback.
     await handle_search_query(message, state, bitrix, message.text or "")

@@ -272,6 +272,16 @@ async def test_last_results_offer_open_buttons(flow):
     assert "deal:open:154" in callbacks
 
 
+async def test_cancel_command_closes_search(flow):
+    """/cancel в липком режиме поиска закрывает поиск, а не ищет «cancel»."""
+    await send(flow, "Найти")
+    await send(flow, "/cancel")
+
+    assert flow.session.sent_texts[-1] == search_handlers.SEARCH_CLOSED
+    context = flow.dp.fsm.get_context(bot=flow.bot, chat_id=1, user_id=1)
+    assert await context.get_state() is None
+
+
 async def test_find_prompt_opens_input_field(flow):
     """«Найти» сразу открывает поле ввода (ForceReply), без лишнего нажатия."""
     await send(flow, "Найти")
