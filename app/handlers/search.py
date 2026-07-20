@@ -34,6 +34,7 @@ from aiogram.types import Message
 
 from app.handlers.messages import OrderFlow
 from app.handlers.start import BTN_FIND, BTN_LAST
+from app.services import dates
 from app.services.bitrix import (
     BitrixClient,
     contact_names,
@@ -246,17 +247,8 @@ ACTIVE_ORDER_STATES = StateFilter(
 )
 
 
-def _format_date(raw: object) -> str:
-    """DATE_CREATE Bitrix («2026-07-18T10:00:00+10:00») -> «18.07.2026»."""
-    date_part = str(raw or "").split("T", 1)[0]
-    parts = date_part.split("-")
-    if len(parts) == 3:
-        return f"{parts[2]}.{parts[1]}.{parts[0]}"
-    return date_part or "—"
-
-
 def _deal_line(deal: dict, names: dict[int, str], stages: dict[str, str]) -> str:
-    """Одна строка списка: №, клиент, название, стадия, дата."""
+    """Одна строка списка: №, клиент, название, стадия, дата (дд.мм.гггг чч:мм)."""
     try:
         contact_key = int(deal.get("CONTACT_ID") or 0)
     except (TypeError, ValueError):
@@ -267,7 +259,7 @@ def _deal_line(deal: dict, names: dict[int, str], stages: dict[str, str]) -> str
     title = str(deal.get("TITLE") or "без названия")
     return (
         f"№{deal.get('ID')} · {client} · {title} · {stage} · "
-        f"{_format_date(deal.get('DATE_CREATE'))}"
+        f"{dates.format_bitrix_datetime(deal.get('DATE_CREATE'))}"
     )
 
 

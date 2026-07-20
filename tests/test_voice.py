@@ -17,7 +17,7 @@ from app.handlers.voice import VOICE_NOT_RECOGNIZED, VOICE_STATE_CHANGED, VOICE_
 from app.main import create_dispatcher
 from app.services import llm, speech
 from tests.conftest import make_message_update, make_voice_update
-from tests.test_handlers_messages import FULL_ORDER, FakeBitrix, press_card
+from tests.test_handlers_messages import FULL_ORDER, FakeBitrix, freeze_now, press_card
 from tests.test_search import FakeSearchBitrix
 
 RECOGNIZED = "Иван, 89141234567, сантехника, замена крана"
@@ -328,6 +328,7 @@ async def test_voice_phrase_on_phone_question_reparses_once(flow, monkeypatch):
 async def test_voice_and_following_text_are_serialized(flow, monkeypatch):
     """Текст после долгого STT ждёт голос и попадает уже в следующий шаг."""
     parse_order_unavailable(monkeypatch)
+    freeze_now(monkeypatch)
 
     gate = asyncio.Event()
     entered = asyncio.Event()
@@ -361,7 +362,7 @@ async def test_voice_and_following_text_are_serialized(flow, monkeypatch):
     card = flow.session.sent_messages[-1]
     assert "Проверьте заявку" in card.text
     assert "Описание: заменить кран на кухне" in card.text
-    assert "Срок: завтра" in card.text
+    assert "Срок: 20.07.2026" in card.text
     assert VOICE_STATE_CHANGED not in flow.session.sent_texts
 
 

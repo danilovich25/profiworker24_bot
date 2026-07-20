@@ -9,7 +9,9 @@ import asyncio
 import contextlib
 import re
 import time
+from datetime import datetime
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 import pytest
@@ -39,7 +41,7 @@ from app.handlers.messages import (
 )
 from app.main import create_dispatcher
 from app.schemas import Category, Intent, ParsedOrder
-from app.services import bitrix, llm
+from app.services import bitrix, dates, llm
 from tests.conftest import (
     SemanticBitrixFake,
     make_callback_update,
@@ -63,6 +65,14 @@ FULL_ORDER = ParsedOrder(
     problem="замена крана",
     income_rub=5000,
 )
+
+# Замороженное «сейчас» для относительных сроков: 19.07.2026, воскресенье,
+# 15:00 по Владивостоку — тесты не зависят от момента запуска.
+FROZEN_NOW = datetime(2026, 7, 19, 15, 0, tzinfo=ZoneInfo("Asia/Vladivostok"))
+
+
+def freeze_now(monkeypatch):
+    monkeypatch.setattr(dates, "now_local", lambda: FROZEN_NOW)
 
 
 @pytest.fixture
@@ -323,6 +333,7 @@ async def test_cancel_button_drops_draft(flow, monkeypatch):
 
 async def test_edit_button_walks_all_fields(flow, monkeypatch):
     parse_order_mock(monkeypatch)
+    freeze_now(monkeypatch)
 
     await send(flow, "заявка")
     await press_card(flow, "edit")
@@ -339,10 +350,42 @@ async def test_edit_button_walks_all_fields(flow, monkeypatch):
     assert "Мария" in card.text
     assert "электрика" in card.text
     assert "замена крана" in card.text  # описание не тронуто
-    assert "послезавтра" in card.text
+    # «послезавтра» разобрано в дату и показано в формате дд.мм.гггг
+    assert "Срок: 21.07.2026" in card.text
 
     await press_card(flow, "create", card)
     assert flow.bx.deals[0]["TITLE"] == "электрика: замена крана"
+
+
+async def test_card_shows_deadline_in_local_format(flow, monkeypatch):
+    """Срок в карточке — дд.мм.гггг чч:мм, а не сырой ISO."""
+    freeze_now(monkeypatch)
+    parse_order_mock(
+        monkeypatch, FULL_ORDER.model_copy(update={"deadline": "2026-07-24T10:00:00"})
+    )
+
+    await send(flow, "Иван, 89141234567, сантехника, замена крана")
+
+    assert "Срок: 24.07.2026 10:00" in flow.session.sent_messages[-1].text
+
+
+async def test_relative_deadline_in_text_overrides_llm(flow, monkeypatch):
+    """«Через 5 дней в 10:00» пересчитывается кодом, даже если модель ошиблась.
+
+    Сегодня (заморожено) 19.07.2026: правильный срок 24.07, модель вернула 23.07.
+    В комментарий сделки срок тоже уходит в читаемом формате.
+    """
+    freeze_now(monkeypatch)
+    parse_order_mock(
+        monkeypatch, FULL_ORDER.model_copy(update={"deadline": "2026-07-23T10:00:00"})
+    )
+
+    await send(flow, "Иван 89141234567 сантехника замена крана через 5 дней в 10:00")
+    card = flow.session.sent_messages[-1]
+    assert "Срок: 24.07.2026 10:00" in card.text
+
+    await press_card(flow, "create", card)
+    assert "Срок: 24.07.2026 10:00" in flow.bx.deals[0]["COMMENTS"]
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +447,7 @@ async def test_form_question_send_failure_keeps_step(flow, monkeypatch):
     Теперь FSM переводится только после доставленного вопроса.
     """
     parse_order_unavailable(monkeypatch)
+    freeze_now(monkeypatch)
     await send(flow, "заявка")
     await send(flow, "Иван")
     await send(flow, "нет")
@@ -421,7 +465,7 @@ async def test_form_question_send_failure_keeps_step(flow, monkeypatch):
     card = flow.session.sent_messages[-1]
     assert "Проверьте заявку" in card.text
     assert "Описание: заменить кран на кухне" in card.text  # не уехало в срок
-    assert "Срок: завтра" in card.text
+    assert "Срок: 20.07.2026" in card.text
 
 
 async def test_chat_updates_wait_for_previous_fsm_transition(flow, monkeypatch):
@@ -906,6 +950,7 @@ async def test_reminder_creates_task_not_deal(flow, monkeypatch):
         }
     )
     parse_order_mock(monkeypatch, reminder)
+    freeze_now(monkeypatch)
 
     await send(flow, "напомни позвонить Ивану завтра")
 
@@ -913,7 +958,8 @@ async def test_reminder_creates_task_not_deal(flow, monkeypatch):
     assert flow.bx.deals == [] and flow.bx.contacts == []  # сделок и контактов нет
     task = flow.bx.tasks[0]
     assert task["TITLE"] == "Позвонить Ивану завтра"
-    assert task["DEADLINE"] == "2026-07-19T10:00:00"
+    # «завтра» пересчитано кодом (19.07 → 20.07), время от модели сохранено
+    assert task["DEADLINE"] == "2026-07-20T10:00:00+10:00"
     assert task["RESPONSIBLE_ID"] == 1
     assert all("Проверьте заявку" not in t for t in flow.session.sent_texts)
 

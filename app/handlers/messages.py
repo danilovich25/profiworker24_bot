@@ -59,7 +59,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.db import DRAFT_DONE, DRAFT_UNKNOWN, Database
 from app.middlewares.dedup import content_hash
 from app.schemas import Category, Intent, ParsedOrder
-from app.services import llm
+from app.services import dates, llm
 from app.services.bitrix import (
     UF_EXPENSE,
     UF_PROFIT,
@@ -373,7 +373,7 @@ def preview_text(order: ParsedOrder) -> str:
     lines.append(f"Категория: {order.category.value if order.category else 'не указана'}")
     lines.append(f"Описание: {order.problem}")
     if order.deadline:
-        lines.append(f"Срок: {order.deadline}")
+        lines.append(f"Срок: {dates.format_deadline(order.deadline)}")
     if order.income_rub is not None:
         lines.append(f"Доход: {order.income_rub:g} руб.")
     if order.expense_rub is not None:
@@ -410,7 +410,8 @@ def build_deal_fields(order: ParsedOrder) -> dict[str, Any]:
     if order.address:
         comments.append(f"Адрес: {order.address}")
     if order.deadline:
-        comments.append(f"Срок: {order.deadline}")
+        # В комментарии сделки срок хранится в читаемом виде дд.мм.гггг чч:мм.
+        comments.append(f"Срок: {dates.format_deadline(order.deadline)}")
     if order.urgency:
         comments.append(f"Срочность: {order.urgency}")
     if order.comment:
@@ -618,6 +619,21 @@ async def _process_order_text(
                 "«Иван, 89141234567, сантехника, замена крана, завтра, 5000 руб»."
             )
             return True
+
+        # Срок нормализуется детерминированно: относительные обороты в самом
+        # сообщении пересчитываются кодом от текущего времени (settings.tz),
+        # арифметика модели им не доверяется. Для нескольких заявок в одном
+        # сообщении общий текст не используется: у каждой свой срок от модели.
+        now = dates.now_local()
+        deadline_text = text if len(orders) == 1 else ""
+        orders = [
+            parsed.model_copy(
+                update={
+                    "deadline": dates.resolve_deadline(parsed.deadline, deadline_text, now)
+                }
+            )
+            for parsed in orders
+        ]
 
         key = dedup_key or f"msg:{uuid4().hex}"
         order = orders[0]
@@ -1948,7 +1964,11 @@ async def form_deadline_step(
         order_data["deadline"] = None
         await state.update_data(order=order_data)
     elif text != KEEP_WORD:
-        order_data["deadline"] = text
+        # Ответ опросника разбирается так же, как срок из свободного текста:
+        # «завтра до 18:00» становится датой, непонятное сохраняется как есть.
+        order_data["deadline"] = (
+            dates.parse_human_date(text, dates.now_local()) or text
+        )
         await state.update_data(order=order_data)
     await _continue_flow(message, state, db)
 

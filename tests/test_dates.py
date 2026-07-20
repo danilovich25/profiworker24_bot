@@ -1,0 +1,197 @@
+"""Сроки заявок: детерминированный разбор относительных дат и формат вывода.
+
+«Сейчас» во всех тестах заморожено (передаётся параметром), поэтому результат
+не зависит от момента запуска: пример заказчика «сегодня 19 июля, „через
+5 дней в 10:00“ → 24.07.2026 10:00» проверяется буквально.
+"""
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from app.services import dates
+
+VVO = ZoneInfo("Asia/Vladivostok")
+
+# Суббота? Нет: 19.07.2026 — воскресенье, 15:00 по Владивостоку.
+NOW = datetime(2026, 7, 19, 15, 0, tzinfo=VVO)
+
+
+# ---------------------------------------------------------------------------
+# parse_human_date: относительные и явные сроки из текста
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # пример заказчика
+        ("через 5 дней в 10:00", "2026-07-24T10:00:00+10:00"),
+        ("завтра", "2026-07-20"),
+        ("послезавтра", "2026-07-21"),
+        ("послезавтра к 14:00", "2026-07-21T14:00:00+10:00"),
+        ("через 3 дня", "2026-07-22"),
+        ("через день", "2026-07-20"),
+        ("через неделю", "2026-07-26"),
+        ("через 2 недели", "2026-08-02"),
+        ("через два дня", "2026-07-21"),
+        ("через пару дней", "2026-07-21"),
+        ("сегодня в 18:00", "2026-07-19T18:00:00+10:00"),
+        ("завтра в 9 утра", "2026-07-20T09:00:00+10:00"),
+        ("завтра в 7 вечера", "2026-07-20T19:00:00+10:00"),
+        # только время: до конца дня — сегодня, прошедшее — завтра
+        ("к 18:00", "2026-07-19T18:00:00+10:00"),
+        ("до 10:00", "2026-07-20T10:00:00+10:00"),
+        # ближайший день недели (19.07.2026 — воскресенье)
+        ("в пятницу", "2026-07-24"),
+        ("во вторник", "2026-07-21"),
+        # явная дата, в том числе без года (прошедшая — на следующий год)
+        ("24.07 в 10:00", "2026-07-24T10:00:00+10:00"),
+        ("до 24.07.2026", "2026-07-24"),
+        ("15.01", "2027-01-15"),
+        # срок внутри полной фразы заявки без единой запятой
+        (
+            "Иван 89141234567 сантехника замена крана завтра доход 5000",
+            "2026-07-20",
+        ),
+        ("через час", "2026-07-19T16:00:00+10:00"),
+        ("через 2 часа", "2026-07-19T17:00:00+10:00"),
+        ("через 30 минут", "2026-07-19T15:30:00+10:00"),
+        ("через полчаса", "2026-07-19T15:30:00+10:00"),
+    ],
+)
+def test_parse_human_date(text, expected):
+    assert dates.parse_human_date(text, NOW) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "замена крана",
+        "",
+        "Иван, 89141234567, сантехника",
+        # «в 10» без минут и уточнения — не время: «в 10 метрах», «в 3 комнаты»
+        "полка в 10 метрах",
+        "квартира в 3 комнаты",
+    ],
+)
+def test_parse_human_date_ignores_text_without_deadline(text):
+    assert dates.parse_human_date(text, NOW) is None
+
+
+def test_parse_human_date_next_weekday_is_strictly_in_future():
+    # Сегодня воскресенье: «в воскресенье» — следующее, а не сегодня.
+    assert dates.parse_human_date("в воскресенье", NOW) == "2026-07-26"
+
+
+# ---------------------------------------------------------------------------
+# resolve_deadline: приоритет детерминированного разбора над ответом модели
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_deadline_overrides_llm_arithmetic():
+    # Модель ошиблась в арифметике «через 5 дней» — код пересчитывает сам.
+    resolved = dates.resolve_deadline(
+        "2026-07-23T10:00:00", "перезвонить через 5 дней в 10:00", NOW
+    )
+    assert resolved == "2026-07-24T10:00:00+10:00"
+
+
+def test_resolve_deadline_combines_code_day_with_llm_time():
+    # «завтра в 10» — время без двоеточия код не берёт, но модель поняла.
+    # День считает код, время остаётся от модели.
+    resolved = dates.resolve_deadline(
+        "2026-07-20T10:00:00", "позвонить завтра в 10", NOW
+    )
+    assert resolved == "2026-07-20T10:00:00+10:00"
+
+
+def test_resolve_deadline_fixes_llm_day_keeping_its_time():
+    # Модель ошиблась днём, но вытащила время словами — день пересчитан.
+    resolved = dates.resolve_deadline("2026-07-23T15:00:00", "завтра", NOW)
+    assert resolved == "2026-07-20T15:00:00+10:00"
+
+
+def test_resolve_deadline_keeps_valid_llm_iso_without_relative_words():
+    resolved = dates.resolve_deadline("2026-07-25T12:00:00", "замена крана", NOW)
+    assert resolved == "2026-07-25T12:00:00"
+
+
+def test_resolve_deadline_parses_relative_llm_value():
+    # Модель вернула не ISO, а слово — оно разбирается детерминированно.
+    assert dates.resolve_deadline("завтра", "замена крана", NOW) == "2026-07-20"
+
+
+def test_resolve_deadline_from_text_when_llm_missed_it():
+    assert dates.resolve_deadline(None, "замена крана завтра", NOW) == "2026-07-20"
+
+
+def test_resolve_deadline_none_when_no_deadline_anywhere():
+    assert dates.resolve_deadline(None, "замена крана", NOW) is None
+
+
+def test_resolve_deadline_keeps_unparseable_llm_text():
+    # Непонятный срок не выбрасывается: он уйдёт в комментарий как есть.
+    assert dates.resolve_deadline("после обеда", "замена крана", NOW) == "после обеда"
+
+
+# ---------------------------------------------------------------------------
+# Формат отображения: дд.мм.гггг чч:мм
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-07-24T10:00:00+10:00", "24.07.2026 10:00"),
+        ("2026-07-24T10:00:00", "24.07.2026 10:00"),
+        ("2026-07-24", "24.07.2026"),
+        ("после обеда", "после обеда"),
+        (None, None),
+    ],
+)
+def test_format_deadline(raw, expected):
+    assert dates.format_deadline(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-07-18T10:00:00+10:00", "18.07.2026 10:00"),
+        # московское время портала переводится во Владивосток (+10)
+        ("2026-07-18T02:00:00+03:00", "18.07.2026 09:00"),
+        ("2026-07-18T10:00:00", "18.07.2026 10:00"),
+        ("", "—"),
+        (None, "—"),
+    ],
+)
+def test_format_bitrix_datetime(raw, expected):
+    assert dates.format_bitrix_datetime(raw) == expected
+
+
+# ---------------------------------------------------------------------------
+# Момент Telegram-напоминания
+# ---------------------------------------------------------------------------
+
+
+def test_reminder_epoch_uses_exact_time():
+    expected = int(datetime(2026, 7, 24, 10, 0, tzinfo=VVO).timestamp())
+    assert dates.reminder_epoch("2026-07-24T10:00:00+10:00") == expected
+
+
+def test_reminder_epoch_naive_iso_is_vladivostok():
+    expected = int(datetime(2026, 7, 24, 10, 0, tzinfo=VVO).timestamp())
+    assert dates.reminder_epoch("2026-07-24T10:00:00") == expected
+
+
+def test_reminder_epoch_date_only_defaults_to_morning():
+    expected = int(
+        datetime(2026, 7, 24, dates.DEFAULT_REMINDER_HOUR, 0, tzinfo=VVO).timestamp()
+    )
+    assert dates.reminder_epoch("2026-07-24") == expected
+
+
+def test_reminder_epoch_unparseable_is_none():
+    assert dates.reminder_epoch("после обеда") is None
+    assert dates.reminder_epoch(None) is None
