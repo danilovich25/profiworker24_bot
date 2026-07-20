@@ -32,6 +32,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ForceReply, Message
 
+from app.handlers.edit import open_deals_keyboard
 from app.handlers.messages import OrderFlow
 from app.handlers.start import BTN_FIND, BTN_LAST
 from app.services import dates
@@ -306,7 +307,11 @@ def _clip_reply(text: str, suffix: str = "") -> str:
 
 
 async def _answer_search_reply(
-    message: Message, reply: str, *, offer_next_search: bool = False
+    message: Message,
+    reply: str,
+    *,
+    offer_next_search: bool = False,
+    reply_markup=None,
 ) -> bool:
     """Отправляет итог поиска: длина в лимите, сбой отправки не роняет апдейт.
 
@@ -316,7 +321,7 @@ async def _answer_search_reply(
     """
     try:
         suffix = SEARCH_AGAIN_HINT if offer_next_search else ""
-        await message.answer(_clip_reply(reply, suffix))
+        await message.answer(_clip_reply(reply, suffix), reply_markup=reply_markup)
         return True
     except Exception:
         log.exception("Ответ поиска не отправлен")
@@ -397,6 +402,7 @@ async def _run_search(message: Message, bitrix: BitrixClient, query: str) -> boo
                             break
                     deals = found.deals
                     truncated = found.truncated
+            open_buttons = None
             if truncated:
                 # Любой усечённый результат неполон, даже если несколько
                 # старых сделок уже нашлись: показывать их как все совпадения
@@ -404,6 +410,10 @@ async def _run_search(message: Message, bitrix: BitrixClient, query: str) -> boo
                 reply = SEARCH_TOO_BROAD
             elif deals:
                 reply = await _format_deals(bitrix, deals, header=f"Нашёл заявок: {len(deals)}")
+                # Кнопки «Открыть №N» ведут к карточке и правке заявки.
+                open_buttons = open_deals_keyboard(
+                    [int(deal["ID"]) for deal in deals[:LIST_LIMIT]]
+                )
                 offer_next_search = True
             else:
                 reply = NOTHING_FOUND
@@ -411,8 +421,9 @@ async def _run_search(message: Message, bitrix: BitrixClient, query: str) -> boo
     except Exception:
         log.exception("Поиск по запросу не удался")
         reply = SEARCH_FAILED
+        open_buttons = None
     return await _answer_search_reply(
-        message, reply, offer_next_search=offer_next_search
+        message, reply, offer_next_search=offer_next_search, reply_markup=open_buttons
     )
 
 
@@ -477,17 +488,24 @@ async def on_last(
     if bitrix is None:
         await message.answer(NO_CRM)
         return
+    open_buttons = None
     try:
         async with asyncio.timeout(SEARCH_DEADLINE):
             deals = await recent_deals(bitrix, LIST_LIMIT)
             if deals:
                 reply = await _format_deals(bitrix, deals, header="Последние заявки:")
+                open_buttons = open_deals_keyboard(
+                    [int(deal["ID"]) for deal in deals[:LIST_LIMIT]]
+                )
             else:
                 reply = LAST_EMPTY
     except Exception:
         log.exception("Не удалось получить последние заявки")
         reply = SEARCH_FAILED
-    if await _answer_search_reply(message, reply, offer_next_search=True):
+        open_buttons = None
+    if await _answer_search_reply(
+        message, reply, offer_next_search=True, reply_markup=open_buttons
+    ):
         await state.set_state(SearchFlow.query)
 
 

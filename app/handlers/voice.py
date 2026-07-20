@@ -29,6 +29,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from app.db import Database
+from app.handlers.edit import EDIT_IN_PROGRESS, DealEditFlow, edit_value_step
 from app.handlers.messages import (
     OrderFlow,
     ask_category_text_step,
@@ -131,6 +132,14 @@ async def _route_by_state(
         return
     if current == SearchFlow.query.state:
         await handle_search_query(message, state, bitrix, text)
+        return
+    if current == DealEditFlow.typing.state:
+        # Голосом можно продиктовать и новое значение поля при правке.
+        await edit_value_step(message, state, text)
+        return
+    if current == DealEditFlow.choosing.state:
+        # Пока правка не сохранена, голос не должен начинать новую заявку.
+        await message.answer(EDIT_IN_PROGRESS)
         return
     user_id = message.from_user.id if message.from_user else message.chat.id
     await handle_order_text(

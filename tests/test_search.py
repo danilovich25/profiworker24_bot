@@ -90,11 +90,57 @@ class FakeSearchBitrix(SemanticBitrixFake):
         self.fail_all = False
         # Точечные сбои: методы из этого набора падают, остальные работают.
         self.fail_methods: set[str] = set()
+        # Журналы правок (crm.*.update) и дел для тестов редактирования.
+        self.deal_updates: list[dict] = []
+        self.contact_updates: list[dict] = []
+        self.activities: list[dict] = []
+        self.activity_updates: list[dict] = []
 
     async def _dispatch(self, method: str, params: dict):
         if self.fail_all or method in self.fail_methods:
             raise RuntimeError("Bitrix24 недоступен")
         flt = params.get("filter") or {}
+        if method == "crm.contact.get":
+            wanted_id = int(params.get("id", 0))
+            for contact in self.contacts:
+                if int(contact["ID"]) == wanted_id:
+                    # Полная форма ответа crm.contact.get: телефон — список
+                    # значений с ID (нужен правке для замены номера).
+                    full = dict(contact)
+                    phone = contact.get("PHONE")
+                    full["PHONE"] = (
+                        [{"ID": "501", "VALUE": phone, "VALUE_TYPE": "WORK"}]
+                        if phone
+                        else []
+                    )
+                    return full
+            raise RuntimeError("ERROR_NOT_FOUND: Контакт не найден")
+        if method == "crm.deal.update":
+            wanted_id = int(params.get("id", 0))
+            for deal in self.deals:
+                if int(deal["ID"]) == wanted_id:
+                    deal.update(params.get("fields") or {})
+                    self.deal_updates.append(dict(params))
+                    return True
+            raise RuntimeError("ERROR_NOT_FOUND: Не найдено")
+        if method == "crm.contact.update":
+            wanted_id = int(params.get("id", 0))
+            for contact in self.contacts:
+                if int(contact["ID"]) == wanted_id:
+                    self.contact_updates.append(dict(params))
+                    fields = dict(params.get("fields") or {})
+                    phones = fields.pop("PHONE", None)
+                    if phones:
+                        fields["PHONE"] = phones[0].get("VALUE")
+                    contact.update(fields)
+                    return True
+            raise RuntimeError("ERROR_NOT_FOUND: Контакт не найден")
+        if method == "crm.activity.todo.add":
+            self.activities.append(dict(params))
+            return {"activity": {"id": 500 + len(self.activities) - 1}}
+        if method == "crm.activity.todo.update":
+            self.activity_updates.append(dict(params))
+            return True
         if method == "crm.duplicate.findbycomm":
             wanted = {
                 re.sub(r"\D", "", str(v))[-10:] for v in params.get("values") or [] if v
@@ -204,6 +250,26 @@ async def test_find_asks_query_then_searches_by_phone(flow):
     assert reply.index("№155") < reply.index("№154")  # новые сверху
     context = flow.dp.fsm.get_context(bot=flow.bot, chat_id=1, user_id=1)
     assert await context.get_state() == SearchFlow.query.state
+
+
+async def test_search_results_offer_open_buttons(flow):
+    """Под списком результатов — кнопки «Открыть №N» для карточки и правки."""
+    await send(flow, "/find 89141234567")
+
+    markup = flow.session.sent_messages[-1].reply_markup
+    assert markup is not None
+    callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "deal:open:154" in callbacks
+    assert "deal:open:155" in callbacks
+
+
+async def test_last_results_offer_open_buttons(flow):
+    await send(flow, "/last")
+
+    markup = flow.session.sent_messages[-1].reply_markup
+    assert markup is not None
+    callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "deal:open:154" in callbacks
 
 
 async def test_find_prompt_opens_input_field(flow):

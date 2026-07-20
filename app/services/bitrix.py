@@ -859,6 +859,45 @@ async def stage_names(bx: BitrixClient) -> dict[str, str]:
     }
 
 
+# Признаки «контакт не найден» в тексте ошибки crm.contact.get.
+_CONTACT_NOT_FOUND_CODES = ("error_not_found", "not found", "не найден")
+
+
+async def get_contact(bx: BitrixClient, contact_id: int) -> dict[str, Any] | None:
+    """Контакт по ID; None — только «не найден», прочие ошибки пробрасываются."""
+    try:
+        contact = await bx.call("crm.contact.get", {"id": contact_id})
+    except Exception as exc:
+        if any(code in str(exc).lower() for code in _CONTACT_NOT_FOUND_CODES):
+            log.info("Контакт id=%s не найден", contact_id)
+            return None
+        raise
+    contact = _unwrap_batch_label(contact)
+    if not isinstance(contact, dict):
+        raise MalformedBitrixResponse("Bitrix вернул неверный result для crm.contact.get")
+    actual_id = require_positive_id(contact.get("ID"), "crm.contact.get")
+    if actual_id != contact_id:
+        raise MalformedBitrixResponse("Bitrix вернул чужой ID для crm.contact.get")
+    return contact
+
+
+async def update_deal(bx: BitrixClient, deal_id: int, fields: dict[str, Any]) -> None:
+    """Обновляет поля СУЩЕСТВУЮЩЕЙ сделки (crm.deal.update — идемпотентно).
+
+    Номер сделки не меняется, новая сделка не создаётся: это правка той же
+    заявки. Повтор с теми же полями безопасен, поэтому одиночной отправки
+    (call_once) не требуется.
+    """
+    await bx.call("crm.deal.update", {"id": deal_id, "fields": fields})
+    log.info("Сделка id=%s обновлена (%s)", deal_id, ", ".join(sorted(fields)))
+
+
+async def update_contact(bx: BitrixClient, contact_id: int, fields: dict[str, Any]) -> None:
+    """Обновляет поля контакта (crm.contact.update — идемпотентно)."""
+    await bx.call("crm.contact.update", {"id": contact_id, "fields": fields})
+    log.info("Контакт id=%s обновлён (%s)", contact_id, ", ".join(sorted(fields)))
+
+
 # Тип владельца «сделка» в новом REST-API дел (crm.activity.todo.*).
 TODO_OWNER_TYPE_DEAL = 2
 
