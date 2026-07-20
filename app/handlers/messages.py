@@ -52,7 +52,7 @@ from typing import Any
 from uuid import uuid4
 
 from aiogram import F, Router
-from aiogram.filters import StateFilter
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -373,6 +373,30 @@ def source_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+CANCEL_INPUT_CB = "flow:cancel"
+
+CANCELLED_TEXT = "Ввод отменён. Пришлите новую заявку текстом или голосом."
+
+NOTHING_TO_CANCEL = "Сейчас нечего отменять."
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    """Одна кнопка «Отмена»: оборвать уточнения или опросник на любом шаге."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=CANCEL_INPUT_CB)]
+        ]
+    )
+
+
+def with_cancel(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    """Дописывает кнопку «Отмена» последней строкой существующей клавиатуры."""
+    rows = list(markup.inline_keyboard) + [
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=CANCEL_INPUT_CB)]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def preview_text(order: ParsedOrder) -> str:
     lines = [
         "Проверьте заявку:",
@@ -619,10 +643,16 @@ async def _process_order_text(
             # молча «именем клиента»), а захват хэша снимется в finally.
             await message.answer(
                 "Не получилось разобрать сообщение автоматически, соберу заявку "
-                "по шагам.\nВопрос 1 из 6. Как зовут клиента?"
+                "по шагам.\nВопрос 1 из 6. Как зовут клиента?",
+                reply_markup=cancel_keyboard(),
             )
             await state.set_state(OrderFlow.form_name)
             data: dict[str, Any] = {"order": {}, "dedup_key": dedup_key, "user_id": user_id}
+            if content_claimed:
+                # Для кнопки «Отмена»: занятый контент-хэш освобождается, и
+                # тот же текст после отмены не считается дублем.
+                data["content_hash"] = content_hash(text)
+                data["content_claim_key"] = dedup_key
             if phone_asked:
                 # Телефон уже спрашивали до падения в опросник: шаг с
                 # вопросом о номере будет пропущен (см. form_name_step).
@@ -691,6 +721,11 @@ async def _process_order_text(
             "dedup_key": key,
             "user_id": user_id,
         }
+        if content_claimed:
+            # Ключ и хэш занятого контент-дедупа: кнопка «Отмена» на
+            # уточняющих вопросах освобождает захват (см. _cancel_flow).
+            data["content_hash"] = content_hash(text)
+            data["content_claim_key"] = dedup_key
         if phone_asked:
             data["phone_skipped"] = True
         await state.set_data(data)
@@ -1149,13 +1184,15 @@ async def _continue_flow(
     if not order_data.get("phone") and not data.get("phone_skipped"):
         await message.answer(
             "Не указан телефон клиента. Добавить сейчас? "
-            "Пришлите номер или напишите «нет»."
+            "Пришлите номер или напишите «нет».",
+            reply_markup=cancel_keyboard(),
         )
         await state.set_state(OrderFlow.ask_phone)
         return
     if not order_data.get("category"):
         await message.answer(
-            "Не понял категорию услуги. Выберите:", reply_markup=category_keyboard()
+            "Не понял категорию услуги. Выберите:",
+            reply_markup=with_cancel(category_keyboard()),
         )
         await state.set_state(OrderFlow.ask_category)
         return
@@ -1186,6 +1223,64 @@ async def _continue_flow(
     await message.answer(preview_text(order), reply_markup=preview_keyboard(draft_id))
     await state.set_state(OrderFlow.preview)
     await state.update_data(draft_id=draft_id)
+
+
+# ---------------------------------------------------------------------------
+# Отмена ввода: кнопка «Отмена» на каждом шаге и команда /cancel
+# ---------------------------------------------------------------------------
+
+CANCELABLE_STATES = StateFilter(
+    OrderFlow.preview,
+    OrderFlow.ask_phone,
+    OrderFlow.ask_category,
+    OrderFlow.form_name,
+    OrderFlow.form_phone,
+    OrderFlow.form_category,
+    OrderFlow.form_source,
+    OrderFlow.form_problem,
+    OrderFlow.form_deadline,
+)
+
+
+async def _cancel_flow(chat_id: int, state: FSMContext, db: Database) -> None:
+    """Сбрасывает текущий ввод; недособранная заявка перестаёт считаться дублем.
+
+    Контент-хэш освобождается, только пока карточки нет (черновик ещё не
+    записан): тот же текст после отмены можно продиктовать заново. Показанную
+    карточку отмена ввода не трогает — у карточки собственные кнопки.
+    """
+    data = await state.get_data()
+    await state.clear()
+    if not data.get("draft_id") and data.get("content_hash"):
+        await db.release_content(
+            chat_id, data["content_hash"], data.get("content_claim_key") or ""
+        )
+
+
+@router.callback_query(CANCELABLE_STATES, F.data == CANCEL_INPUT_CB)
+async def on_cancel_input(
+    callback: CallbackQuery, state: FSMContext, db: Database
+) -> None:
+    await _cancel_flow(callback.message.chat.id, state, db)
+    await callback.answer()
+    await callback.message.answer(CANCELLED_TEXT)
+
+
+@router.callback_query(F.data == CANCEL_INPUT_CB)
+async def on_cancel_input_idle(callback: CallbackQuery) -> None:
+    """Поздний клик по кнопке отмены: диалог уже свободен, ломать нечего."""
+    await callback.answer(NOTHING_TO_CANCEL)
+
+
+@router.message(CANCELABLE_STATES, Command("cancel"))
+async def on_cancel_command(message: Message, state: FSMContext, db: Database) -> None:
+    await _cancel_flow(message.chat.id, state, db)
+    await message.answer(CANCELLED_TEXT)
+
+
+@router.message(Command("cancel"))
+async def on_cancel_command_idle(message: Message) -> None:
+    await message.answer(NOTHING_TO_CANCEL)
 
 
 # ---------------------------------------------------------------------------
@@ -1764,7 +1859,8 @@ async def on_edit(callback: CallbackQuery, state: FSMContext, db: Database) -> N
         prompt_sent = True
         await callback.message.answer(
             f"Вопрос 1 из 6. Имя клиента (сейчас: {current}). "
-            "Пришлите новое или «-», чтобы оставить."
+            "Пришлите новое или «-», чтобы оставить.",
+            reply_markup=cancel_keyboard(),
         )
 
         async def commit_edit() -> bool:
@@ -1891,12 +1987,15 @@ async def form_name_step(message: Message, state: FSMContext, text: str) -> None
         # Телефон уже спрашивали до входа в опросник (переразбор из
         # ask_phone упал в LLMUnavailable): вопрос о номере не повторяется —
         # телефон запрашивается максимум один раз за заявку.
-        await message.answer(ASK_CATEGORY_TEXT, reply_markup=category_keyboard())
+        await message.answer(
+            ASK_CATEGORY_TEXT, reply_markup=with_cancel(category_keyboard())
+        )
         await state.set_state(OrderFlow.form_category)
         return
     await message.answer(
         "Вопрос 2 из 6. Телефон клиента? Пришлите номер, «нет» если "
-        "телефона нет, или «-», чтобы оставить как есть."
+        "телефона нет, или «-», чтобы оставить как есть.",
+        reply_markup=cancel_keyboard(),
     )
     await state.set_state(OrderFlow.form_phone)
 
@@ -1916,14 +2015,17 @@ async def form_phone_step(message: Message, state: FSMContext, text: str) -> Non
     elif text != KEEP_WORD:
         phone = extract_bare_phone(text)
         if phone is None:
-            await message.answer(NOT_A_PHONE + " «-» оставит номер как есть.")
+            await message.answer(
+                NOT_A_PHONE + " «-» оставит номер как есть.",
+                reply_markup=cancel_keyboard(),
+            )
             return
         order_data["phone"] = phone
         await state.update_data(order=order_data)
     elif not order_data.get("phone"):
         # оставить нечего: телефона в черновике нет
         await state.update_data(phone_skipped=True)
-    await message.answer(ASK_CATEGORY_TEXT, reply_markup=category_keyboard())
+    await message.answer(ASK_CATEGORY_TEXT, reply_markup=with_cancel(category_keyboard()))
     await state.set_state(OrderFlow.form_category)
 
 
@@ -1939,7 +2041,9 @@ async def on_form_category(callback: CallbackQuery, state: FSMContext) -> None:
     order_data["category"] = callback.data.split(":", 1)[1]
     await state.update_data(order=order_data)
     await callback.answer()
-    await callback.message.answer(ASK_SOURCE_TEXT, reply_markup=source_keyboard())
+    await callback.message.answer(
+        ASK_SOURCE_TEXT, reply_markup=with_cancel(source_keyboard())
+    )
     await state.set_state(OrderFlow.form_source)
 
 
@@ -1951,13 +2055,14 @@ async def form_category_text_step(message: Message, state: FSMContext, text: str
     matched = next((cat.value for cat in Category if cat.value == text), None)
     if matched is None and not (text == KEEP_WORD and order_data.get("category")):
         await message.answer(
-            "Выберите категорию кнопкой ниже:", reply_markup=category_keyboard()
+            "Выберите категорию кнопкой ниже:",
+            reply_markup=with_cancel(category_keyboard()),
         )
         return
     if matched is not None:
         order_data["category"] = matched
         await state.update_data(order=order_data)
-    await message.answer(ASK_SOURCE_TEXT, reply_markup=source_keyboard())
+    await message.answer(ASK_SOURCE_TEXT, reply_markup=with_cancel(source_keyboard()))
     await state.set_state(OrderFlow.form_source)
 
 
@@ -1973,7 +2078,7 @@ async def on_form_source(callback: CallbackQuery, state: FSMContext) -> None:
     order_data["source"] = callback.data.split(":", 1)[1]
     await state.update_data(order=order_data)
     await callback.answer()
-    await callback.message.answer(ASK_PROBLEM_TEXT)
+    await callback.message.answer(ASK_PROBLEM_TEXT, reply_markup=cancel_keyboard())
     await state.set_state(OrderFlow.form_problem)
 
 
@@ -1987,7 +2092,8 @@ async def form_source_text_step(message: Message, state: FSMContext, text: str) 
     matched = next((src.value for src in Source if src.value.lower() == cleaned), None)
     if matched is None and cleaned != KEEP_WORD:
         await message.answer(
-            "Выберите источник кнопкой ниже:", reply_markup=source_keyboard()
+            "Выберите источник кнопкой ниже:",
+            reply_markup=with_cancel(source_keyboard()),
         )
         return
     if matched is not None:
@@ -1995,7 +2101,7 @@ async def form_source_text_step(message: Message, state: FSMContext, text: str) 
         order_data = data["order"]
         order_data["source"] = matched
         await state.update_data(order=order_data)
-    await message.answer(ASK_PROBLEM_TEXT)
+    await message.answer(ASK_PROBLEM_TEXT, reply_markup=cancel_keyboard())
     await state.set_state(OrderFlow.form_problem)
 
 
@@ -2008,11 +2114,15 @@ async def form_problem_step(message: Message, state: FSMContext, text: str) -> N
     await _set_field(state, "problem", text)
     data = await state.get_data()
     if not data["order"].get("problem"):
-        await message.answer("Без описания заявку не завести. Опишите, что нужно сделать.")
+        await message.answer(
+            "Без описания заявку не завести. Опишите, что нужно сделать.",
+            reply_markup=cancel_keyboard(),
+        )
         return
     await message.answer(
         "Вопрос 6 из 6. Срок выполнения? Например «завтра до 18:00», "
-        "«нет» если срок не важен, «-» чтобы оставить как есть."
+        "«нет» если срок не важен, «-» чтобы оставить как есть.",
+        reply_markup=cancel_keyboard(),
     )
     await state.set_state(OrderFlow.form_deadline)
 
@@ -2060,7 +2170,8 @@ async def ask_category_text_step(
     )
     if matched is None:
         await message.answer(
-            "Выберите категорию кнопкой ниже:", reply_markup=category_keyboard()
+            "Выберите категорию кнопкой ниже:",
+            reply_markup=with_cancel(category_keyboard()),
         )
         return
     data = await state.get_data()

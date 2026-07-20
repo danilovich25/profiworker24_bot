@@ -427,6 +427,99 @@ async def test_relative_deadline_in_text_overrides_llm(flow, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Отмена ввода: кнопка «Отмена» на шагах и команда /cancel
+# ---------------------------------------------------------------------------
+
+
+def _has_cancel_button(message) -> bool:
+    markup = message.reply_markup
+    if markup is None:
+        return False
+    return any(
+        b.callback_data == "flow:cancel" for row in markup.inline_keyboard for b in row
+    )
+
+
+async def test_form_questions_carry_cancel_button(flow, monkeypatch):
+    """Каждый шаг опросника можно оборвать кнопкой, не дожидаясь конца."""
+    parse_order_unavailable(monkeypatch)
+
+    await send(flow, "заявка")
+    assert _has_cancel_button(flow.session.sent_messages[-1])  # вопрос 1
+    await send(flow, "Иван")
+    assert _has_cancel_button(flow.session.sent_messages[-1])  # вопрос 2
+    await send(flow, "нет")
+    assert _has_cancel_button(flow.session.sent_messages[-1])  # вопрос 3 (категория)
+    await send(flow, "сантехника")
+    assert _has_cancel_button(flow.session.sent_messages[-1])  # вопрос 4 (источник)
+    await send(flow, "-")
+    assert _has_cancel_button(flow.session.sent_messages[-1])  # вопрос 5 (описание)
+    await send(flow, "замена крана")
+    assert _has_cancel_button(flow.session.sent_messages[-1])  # вопрос 6 (срок)
+
+
+async def test_cancel_button_resets_form_and_frees_text(flow, monkeypatch):
+    """Отмена сбрасывает черновик опросника, тот же текст можно прислать заново."""
+    parse_order_unavailable(monkeypatch)
+
+    await send(flow, "Иван, замена крана")
+    await send(flow, "Иван")  # уже на вопросе 2
+
+    await press(flow, "flow:cancel")
+    assert messages.CANCELLED_TEXT in flow.session.sent_texts[-1]
+
+    # диалог свободен, и повтор того же текста не считается дублем
+    await send(flow, "Иван, замена крана")
+    assert "Как зовут клиента" in flow.session.sent_texts[-1]
+    assert all(DUP_NO_DEAL not in t for t in flow.session.sent_texts)
+
+
+async def test_cancel_command_resets_ask_phone(flow, monkeypatch):
+    """/cancel на уточняющем вопросе о телефоне освобождает диалог."""
+    parse_order_mock(monkeypatch, FULL_ORDER.model_copy(update={"phone": None}))
+
+    await send(flow, "Иван, сантехника, замена крана")
+    assert "Не указан телефон" in flow.session.sent_texts[-1]
+    assert _has_cancel_button(flow.session.sent_messages[-1])
+
+    await send(flow, "/cancel")
+    assert messages.CANCELLED_TEXT in flow.session.sent_texts[-1]
+
+    # тот же текст снова начинает заявку, а не отвечает старому вопросу
+    await send(flow, "Иван, сантехника, замена крана")
+    assert "Не указан телефон" in flow.session.sent_texts[-1]
+    assert all(DUP_NO_DEAL not in t for t in flow.session.sent_texts)
+
+
+async def test_cancel_command_outside_flow_answers_nothing_to_cancel(flow):
+    await send(flow, "/cancel")
+    assert flow.session.sent_texts[-1] == messages.NOTHING_TO_CANCEL
+
+
+async def test_stale_cancel_button_answers_quietly(flow):
+    """Поздний клик по кнопке отмены (диалог уже свободен) не падает."""
+    await press(flow, "flow:cancel")
+
+    answers = [r for r in flow.session.requests if isinstance(r, AnswerCallbackQuery)]
+    assert answers and answers[-1].text == messages.NOTHING_TO_CANCEL
+    assert all(messages.CANCELLED_TEXT not in t for t in flow.session.sent_texts)
+
+
+async def test_cancel_does_not_kill_preview_card(flow, monkeypatch):
+    """/cancel после карточки не трогает сам черновик: кнопки карточки живут."""
+    parse_order_mock(monkeypatch)
+
+    await send(flow, "Иван, 89141234567, сантехника, замена крана")
+    card = flow.session.sent_messages[-1]
+    assert "Проверьте заявку" in card.text
+
+    await send(flow, "/cancel")
+
+    await press_card(flow, "create", card)
+    assert len(flow.bx.deals) == 1  # карточка по-прежнему рабочая
+
+
+# ---------------------------------------------------------------------------
 # FSM-опросник при недоступной модели
 # ---------------------------------------------------------------------------
 

@@ -30,7 +30,7 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import ForceReply, Message
 
 from app.handlers.messages import OrderFlow
 from app.handlers.start import BTN_FIND, BTN_LAST
@@ -56,6 +56,21 @@ ASK_QUERY = (
     "Что ищем? Пришлите телефон клиента, номер заявки, имя или название "
     "организации."
 )
+
+SEARCH_INPUT_PLACEHOLDER = "Телефон, № заявки, имя или организация"
+
+
+def query_prompt_markup() -> ForceReply:
+    """ForceReply: телефон сразу открывает поле ввода, без лишнего нажатия.
+
+    С постоянной reply-клавиатурой мобильный Telegram после «Найти» держит
+    экран на кнопках меню — чтобы напечатать запрос, пришлось бы отдельно
+    тапнуть по значку клавиатуры. ForceReply раскрывает поле ввода сам.
+    """
+    return ForceReply(
+        force_reply=True, input_field_placeholder=SEARCH_INPUT_PLACEHOLDER
+    )
+
 
 SEARCH_AGAIN_HINT = (
     "Искать ещё? Пришлите телефон, номер или имя. Чтобы завести заявку, "
@@ -337,7 +352,7 @@ async def _run_search(message: Message, bitrix: BitrixClient, query: str) -> boo
     """
     raw_query = query.strip()
     if not raw_query:
-        await message.answer(ASK_QUERY)
+        await message.answer(ASK_QUERY, reply_markup=query_prompt_markup())
         return True
     offer_next_search = False
     try:
@@ -354,7 +369,7 @@ async def _run_search(message: Message, bitrix: BitrixClient, query: str) -> boo
             else:
                 query = clean_search_query(raw_query)
                 if not query:
-                    await message.answer(ASK_QUERY)
+                    await message.answer(ASK_QUERY, reply_markup=query_prompt_markup())
                     return True
                 # Фраза «найди по номеру 154» после очистки снова становится
                 # точным идентификатором и не проходит через поиск по основе.
@@ -451,7 +466,7 @@ async def on_find(
         if await _run_search(message, bitrix, args):
             await state.set_state(SearchFlow.query)
         return
-    await message.answer(ASK_QUERY)
+    await message.answer(ASK_QUERY, reply_markup=query_prompt_markup())
     await state.set_state(SearchFlow.query)
 
 

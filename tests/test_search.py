@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from aiogram.methods import SendMessage
+from aiogram.types import ForceReply
 
 import app.handlers.search as search_handlers
 from app.db import Database
@@ -203,6 +204,22 @@ async def test_find_asks_query_then_searches_by_phone(flow):
     assert reply.index("№155") < reply.index("№154")  # новые сверху
     context = flow.dp.fsm.get_context(bot=flow.bot, chat_id=1, user_id=1)
     assert await context.get_state() == SearchFlow.query.state
+
+
+async def test_find_prompt_opens_input_field(flow):
+    """«Найти» сразу открывает поле ввода (ForceReply), без лишнего нажатия."""
+    await send(flow, "Найти")
+
+    prompt = flow.session.sent_messages[-1]
+    assert prompt.text == ASK_QUERY
+    markup = prompt.reply_markup
+    assert isinstance(markup, ForceReply)
+    assert markup.force_reply is True
+    assert markup.input_field_placeholder == search_handlers.SEARCH_INPUT_PLACEHOLDER
+
+    # /find без аргументов ведёт себя так же
+    await send(flow, "/find")
+    assert isinstance(flow.session.sent_messages[-1].reply_markup, ForceReply)
 
 
 async def test_find_with_inline_deal_number(flow):
