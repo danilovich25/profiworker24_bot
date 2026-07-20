@@ -189,6 +189,9 @@ async def test_edit_deadline_moves_reminders(flow, monkeypatch):
     assert moved["id"] == 500
     assert moved["ownerId"] == 154
     assert moved["deadline"] == "2026-07-24T10:00:00+10:00"
+    # живой портал перезаписывает незаданные поля: без title в update
+    # у дела слетал заголовок (найдено живым прогоном 21.07)
+    assert moved["title"] == "Заявка №154: замена крана"
     # в очереди ровно одно (новое) напоминание с новым сроком
     rows = await flow.db.due_reminders(FAR_FUTURE_TS)
     assert len(rows) == 1

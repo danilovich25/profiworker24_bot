@@ -950,15 +950,21 @@ async def create_deal_todo(
 
 
 async def update_deal_todo_deadline(
-    bx: BitrixClient, todo_id: int, deal_id: int, deadline_iso: str
+    bx: BitrixClient, todo_id: int, deal_id: int, deadline_iso: str, title: str
 ) -> None:
-    """Переносит срок существующего дела-напоминания (правка заявки)."""
+    """Переносит срок существующего дела-напоминания (правка заявки).
+
+    Портал перезаписывает НЕзаданные поля todo.update пустыми (живой прогон
+    21.07: у перенесённого дела слетел заголовок), поэтому title передаётся
+    заново вместе со сроком.
+    """
     await bx.call(
         "crm.activity.todo.update",
         {
             "id": todo_id,
             "ownerTypeId": TODO_OWNER_TYPE_DEAL,
             "ownerId": deal_id,
+            "title": title[:255],
             "deadline": deadline_iso,
             "pingOffsets": [0],
         },

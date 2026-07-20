@@ -561,13 +561,17 @@ async def _reschedule_reminders(
     if due_ts is None or due_ts <= int(dates.now_local().timestamp()):
         return
     activity_id = pending["activity_id"] if pending else None
+    _, problem = split_title(deal.get("TITLE"))
     try:
         if activity_id:
             await update_deal_todo_deadline(
-                bitrix, activity_id, deal_id, dates.epoch_to_iso(due_ts)
+                bitrix,
+                activity_id,
+                deal_id,
+                dates.epoch_to_iso(due_ts),
+                title=f"Заявка №{deal_id}: {problem}",
             )
         else:
-            _, problem = split_title(deal.get("TITLE"))
             activity_id = await create_deal_todo(
                 bitrix,
                 deal_id,
@@ -577,7 +581,6 @@ async def _reschedule_reminders(
             )
     except Exception:
         log.exception("Дело-напоминание сделки %s не перенесено", deal_id)
-    _, problem = split_title(deal.get("TITLE"))
     await db.add_reminder(
         message.chat.id,
         text=(
