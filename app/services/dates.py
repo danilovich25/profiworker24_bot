@@ -215,6 +215,11 @@ def resolve_deadline(llm_deadline: str | None, text: str, now: datetime) -> str 
             return from_text
         if cleaned and "T" in cleaned and _valid_iso(cleaned):
             llm_moment = datetime.fromisoformat(cleaned)
+            if (llm_moment.hour, llm_moment.minute) == (now.hour, now.minute):
+                # Время «как сейчас» с точностью до минуты — не названный
+                # срок, а копия текущего времени из промпта (живая модель
+                # так отвечает на голое «завтра»): день без времени честнее.
+                return from_text
             day = date.fromisoformat(from_text)
             combined = llm_moment.replace(year=day.year, month=day.month, day=day.day)
             if combined.tzinfo is None:

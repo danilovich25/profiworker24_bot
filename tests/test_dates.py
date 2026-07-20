@@ -109,8 +109,15 @@ def test_resolve_deadline_combines_code_day_with_llm_time():
 
 def test_resolve_deadline_fixes_llm_day_keeping_its_time():
     # Модель ошиблась днём, но вытащила время словами — день пересчитан.
-    resolved = dates.resolve_deadline("2026-07-23T15:00:00", "завтра", NOW)
-    assert resolved == "2026-07-20T15:00:00+10:00"
+    resolved = dates.resolve_deadline("2026-07-23T15:30:00", "завтра", NOW)
+    assert resolved == "2026-07-20T15:30:00+10:00"
+
+
+def test_resolve_deadline_drops_llm_copy_of_current_time():
+    # Живая модель на голое «завтра» копирует текущее время из промпта
+    # (сейчас 15:00) — такое «время» не срок, остаётся день без времени.
+    resolved = dates.resolve_deadline("2026-07-20T15:00:00", "завтра", NOW)
+    assert resolved == "2026-07-20"
 
 
 def test_resolve_deadline_keeps_valid_llm_iso_without_relative_words():
