@@ -28,7 +28,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.config import settings
 from app.db import Database
-from app.handlers.messages import category_keyboard, source_keyboard
+from app.handlers.messages import OrderFlow, category_keyboard, source_keyboard
 from app.handlers.start import BTN_FIND, BTN_LAST
 from app.schemas import Category, Source
 from app.services import dates
@@ -73,6 +73,24 @@ EDIT_NO_CHANGES = "Пока ничего не изменено. Выберите
 EDIT_CANCELLED = "Правки отменены, заявка осталась прежней."
 
 EDIT_IN_PROGRESS = "Сначала сохраните или отмените правки заявки (кнопки выше)."
+
+ACTIVE_INPUT_WARNING = (
+    "Сначала завершите текущий ввод заявки или нажмите «Отмена» на вопросе."
+)
+
+# Состояния незаконченного ввода заявки: правка сделки не имеет права их
+# затирать — вместе с ними пропал бы и захваченный контент-хэш текста.
+# Карточка-превью сюда не входит: у неё собственные кнопки и черновик в SQLite.
+_ORDER_INPUT_STATES = {
+    OrderFlow.ask_phone.state,
+    OrderFlow.ask_category.state,
+    OrderFlow.form_name.state,
+    OrderFlow.form_phone.state,
+    OrderFlow.form_category.state,
+    OrderFlow.form_source.state,
+    OrderFlow.form_problem.state,
+    OrderFlow.form_deadline.state,
+}
 
 EDIT_STALE = "Правки уже не активны. Найдите заявку заново через «Найти»."
 
@@ -305,6 +323,11 @@ async def on_deal_edit(
     if bitrix is None:
         await callback.answer()
         await callback.message.answer(NO_CRM_EDIT)
+        return
+    if await state.get_state() in _ORDER_INPUT_STATES:
+        # Незаконченный опросник/уточнение: правка не затирает его данные.
+        await callback.answer()
+        await callback.message.answer(ACTIVE_INPUT_WARNING)
         return
     deal_id = int((callback.data or "").rsplit(":", 1)[-1])
     await callback.answer()

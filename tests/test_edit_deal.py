@@ -15,7 +15,7 @@ from app.db import Database
 from app.handlers import edit as edit_handlers
 from app.handlers import routers
 from app.main import create_dispatcher
-from app.services import dates
+from app.services import dates, llm
 from app.services.bitrix import UF_EXPENSE, UF_PROFIT, UF_SERVICE_CATEGORY
 from tests.conftest import make_callback_update, make_message_update
 from tests.test_search import FakeSearchBitrix
@@ -255,6 +255,28 @@ async def test_save_failure_keeps_changes_for_retry(flow):
     await press(flow, "dedit:save")  # повторное сохранение — те же правки
     assert flow.bx.deal_updates[0]["fields"]["OPPORTUNITY"] == 7000
     assert any("Заявка №154 обновлена" in t for t in flow.session.sent_texts)
+
+
+async def test_deal_edit_does_not_break_active_order_input(flow, monkeypatch):
+    """Кнопка «Изменить» не затирает незаконченный ввод заявки.
+
+    Иначе контент-хэш начатой заявки залипал бы на сутки, а ответы уезжали
+    бы не туда.
+    """
+
+    async def unavailable(text: str):
+        raise llm.LLMUnavailable("недоступна")
+
+    monkeypatch.setattr(llm, "parse_order", unavailable)
+    await send(flow, "новая заявка от Иванова")
+    assert "Как зовут клиента" in flow.session.sent_texts[-1]
+
+    await press(flow, "deal:edit:154")
+    assert flow.session.sent_texts[-1] == edit_handlers.ACTIVE_INPUT_WARNING
+
+    # опросник живой: следующий текст — по-прежнему ответ на вопрос 1
+    await send(flow, "Иван")
+    assert "Вопрос 2 из 6" in flow.session.sent_texts[-1]
 
 
 async def test_search_is_blocked_during_edit(flow):
