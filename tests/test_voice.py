@@ -12,11 +12,12 @@ import pytest
 
 from app.db import Database
 from app.handlers import routers
+from app.handlers.edit import EDIT_IN_PROGRESS
 from app.handlers.search import SEARCH_AGAIN_HINT, SearchFlow
 from app.handlers.voice import VOICE_NOT_RECOGNIZED, VOICE_STATE_CHANGED, VOICE_TOO_LONG
 from app.main import create_dispatcher
 from app.services import llm, speech
-from tests.conftest import make_message_update, make_voice_update
+from tests.conftest import make_callback_update, make_message_update, make_voice_update
 from tests.test_handlers_messages import FULL_ORDER, FakeBitrix, freeze_now, press_card
 from tests.test_search import FakeSearchBitrix
 
@@ -228,6 +229,45 @@ async def test_voice_in_search_is_cleaned_and_keeps_search(search_flow, monkeypa
     assert "№156" in reply and SEARCH_AGAIN_HINT in reply
     context = search_flow.dp.fsm.get_context(bot=search_flow.bot, chat_id=1, user_id=1)
     assert await context.get_state() == SearchFlow.query.state
+
+
+async def test_voice_edits_found_deal_field(search_flow, monkeypatch):
+    """Голосом можно продиктовать новое значение поля найденной заявки.
+
+    Правка при этом сохраняется в ТУ ЖЕ сделку (crm.deal.update по тому же
+    ID) — дубль не создаётся.
+    """
+    recognize_mock(monkeypatch, text="7000")
+
+    await search_flow.dp.feed_update(
+        search_flow.bot, make_callback_update(search_flow.bot, "deal:edit:154")
+    )
+    await search_flow.dp.feed_update(
+        search_flow.bot, make_callback_update(search_flow.bot, "dedit:f:income")
+    )
+    await send_voice(search_flow)
+
+    assert "Доход → 7000" in search_flow.session.sent_texts[-1]
+
+    await search_flow.dp.feed_update(
+        search_flow.bot, make_callback_update(search_flow.bot, "dedit:save")
+    )
+    update = search_flow.bx.deal_updates[0]
+    assert update["id"] == 154
+    assert update["fields"]["OPPORTUNITY"] == 7000
+
+
+async def test_voice_in_edit_choosing_does_not_start_new_order(search_flow, monkeypatch):
+    """Голос посреди незаконченной правки не начинает новую заявку."""
+    recognize_mock(monkeypatch, text="Иван, 89141234567, сантехника, замена крана")
+
+    await search_flow.dp.feed_update(
+        search_flow.bot, make_callback_update(search_flow.bot, "deal:edit:154")
+    )
+    await send_voice(search_flow)
+
+    assert search_flow.session.sent_texts[-1] == EDIT_IN_PROGRESS
+    assert search_flow.bx.deal_updates == []
 
 
 # ---------------------------------------------------------------------------
