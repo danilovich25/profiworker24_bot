@@ -1,4 +1,4 @@
-"""Напоминания: задачи Bitrix24 (tasks.task.add) и Telegram-планировщик.
+﻿"""Напоминания: задачи Bitrix24 (tasks.task.add) и Telegram-планировщик.
 
 Напоминание (intent=reminder) — не сделка: вместо карточки и записи в CRM
 создаётся задача с заголовком из текста и дедлайном из распознанного срока.
@@ -144,7 +144,7 @@ def _text_with_deadline(text: str, due_ts: int) -> str:
     return f"{text}. Срок: {pretty}" if text else f"Срок: {pretty}"
 
 
-def _nearest_todo(todos: list[dict[str, Any]]) -> tuple[int, int] | None:
+def nearest_todo(todos: list[dict[str, Any]]) -> tuple[int, int] | None:
     """(id дела, срок-epoch) ближайшего по времени дела или None.
 
     Ближайшее выбирается по РАЗОБРАННОМУ сроку, а не по строке: сравнение
@@ -176,7 +176,7 @@ async def apply_deal_todos(
       (срок, текст, привязка к делу), в том числе на более раннее время;
     - срок совпадает с точностью до SYNC_TOLERANCE_SECONDS — без изменений.
     """
-    best = _nearest_todo(todos)
+    best = nearest_todo(todos)
     if best is None:
         if await db.cancel_reminder(reminder["id"]):
             log.info(
@@ -223,6 +223,21 @@ async def sync_deal_reminder(
         )
         return reminder
     return await apply_deal_todos(db, reminder, todos)
+
+
+async def resync_deal_reminder(
+    db: Database, deal_id: int, todos: list[dict[str, Any]]
+) -> None:
+    """Сверяет напоминание сделки с УЖЕ прочитанными делами (без похода в CRM).
+
+    Вызывается при открытии карточки заявки: дела для неё только что
+    загружены, и очередь догоняет правки Bitrix24 сразу, не дожидаясь
+    периодической сверки.
+    """
+    reminder = await db.pending_deal_reminder(deal_id)
+    if reminder is None:
+        return
+    await apply_deal_todos(db, {**reminder, "entity_id": deal_id}, todos)
 
 
 async def reconcile_deal_reminders(bx: BitrixClient, db: Database) -> int:

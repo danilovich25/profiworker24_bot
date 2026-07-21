@@ -42,12 +42,14 @@ from app.services.bitrix import (
     create_deal_todo,
     get_contact,
     get_deal,
+    list_deal_todos,
     normalize_phone,
     stage_names,
     update_contact,
     update_deal,
     update_deal_todo_deadline,
 )
+from app.services.tasks import nearest_todo, resync_deal_reminder
 
 log = logging.getLogger("bot.edit")
 
@@ -216,9 +218,19 @@ def _deadline_from_comments(comments: object) -> str | None:
 
 
 def deal_card_text(
-    deal: dict[str, Any], contact: dict[str, Any] | None, stages: dict[str, str]
+    deal: dict[str, Any],
+    contact: dict[str, Any] | None,
+    stages: dict[str, str],
+    todos: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Читаемая карточка сделки для просмотра и правки."""
+    """Читаемая карточка сделки для просмотра и правки.
+
+    Срок берётся из ближайшего незавершённого ДЕЛА сделки (todos): именно там
+    живёт «назначенная дата», которую заказчик правит в Bitrix24, — карточка
+    обязана показывать свежее значение, а не копию из комментария. Строка
+    «Срок:» комментария — только запасной вариант, когда дела прочитать не
+    удалось или их нет.
+    """
     deal_id = deal.get("ID")
     category, problem = split_title(deal.get("TITLE"))
     category = deal.get(UF_SERVICE_CATEGORY) or category
@@ -247,7 +259,13 @@ def deal_card_text(
         lines.append(f"Расход: {expense}")
     if profit:
         lines.append(f"Прибыль: {profit}")
-    deadline = _deadline_from_comments(deal.get("COMMENTS"))
+    deadline = None
+    if todos:
+        best = nearest_todo(todos)
+        if best is not None:
+            deadline = dates.format_epoch(best[1])
+    if deadline is None:
+        deadline = _deadline_from_comments(deal.get("COMMENTS"))
     if deadline:
         lines.append(f"Срок: {deadline}")
     lines.append(f"Создана: {dates.format_bitrix_datetime(deal.get('DATE_CREATE'))}")
@@ -262,14 +280,29 @@ def _changes_summary(changes: dict[str, Any]) -> str:
         shown = value
         if code == "deadline":
             shown = dates.format_deadline(value)
+        elif isinstance(value, float):
+            # Суммы разбираются во float: без формата сотрудник видел бы
+            # «Доход → 7777.0» — хвост «.0» в сводке ни к чему.
+            shown = f"{value:g}"
         parts.append(f"{FIELD_TITLES[code]} → {shown}")
     return "Изменения: " + "; ".join(parts) + ".\nСохранить?"
 
 
-async def _load_deal_context(
-    bitrix: BitrixClient, deal_id: int
-) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, str]] | None:
-    """Сделка + контакт + имена стадий одним походом; None — сделки нет."""
+async def _load_deal_context(bitrix: BitrixClient, deal_id: int) -> (
+    tuple[
+        dict[str, Any],
+        dict[str, Any] | None,
+        dict[str, str],
+        list[dict[str, Any]] | None,
+    ]
+    | None
+):
+    """Сделка + контакт + имена стадий + дела одним походом; None — сделки нет.
+
+    Дела (срок заявки) — best-effort: их сбой не должен прятать карточку,
+    поэтому вместо списка может вернуться None, и срок возьмётся из
+    комментария сделки.
+    """
     deal = await get_deal(bitrix, deal_id)
     if deal is None:
         return None
@@ -281,7 +314,12 @@ async def _load_deal_context(
     if contact_id:
         contact = await get_contact(bitrix, contact_id)
     stages = await stage_names(bitrix)
-    return deal, contact, stages
+    try:
+        todos = await list_deal_todos(bitrix, deal_id)
+    except Exception:
+        log.warning("Дела заявки №%s не прочитаны — срок из комментария", deal_id)
+        todos = None
+    return deal, contact, stages, todos
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +329,10 @@ async def _load_deal_context(
 
 @router.callback_query(F.data.startswith("deal:open:"))
 async def on_deal_open(
-    callback: CallbackQuery, state: FSMContext, bitrix: BitrixClient | None = None
+    callback: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    bitrix: BitrixClient | None = None,
 ) -> None:
     if bitrix is None:
         await callback.answer()
@@ -309,10 +350,19 @@ async def on_deal_open(
     if context is None:
         await callback.message.answer(DEAL_GONE.format(deal_id=deal_id))
         return
-    deal, contact, stages = context
+    deal, contact, stages, todos = context
     await callback.message.answer(
-        deal_card_text(deal, contact, stages), reply_markup=deal_card_keyboard(deal_id)
+        deal_card_text(deal, contact, stages, todos),
+        reply_markup=deal_card_keyboard(deal_id),
     )
+    if todos is not None:
+        # Дела заявки только что прочитаны — очередь напоминаний догоняет
+        # правки CRM сразу, не дожидаясь периодической сверки. Best-effort:
+        # сбой сверки не мешает просмотру.
+        try:
+            await resync_deal_reminder(db, deal_id, todos)
+        except Exception:
+            log.exception("Напоминание заявки №%s не сверено с CRM", deal_id)
 
 
 @router.callback_query(F.data.startswith("deal:edit:"))
@@ -566,6 +616,13 @@ async def _reschedule_reminders(
     activity_id = pending["activity_id"] if pending else None
     _, problem = split_title(deal.get("TITLE"))
     try:
+        if not activity_id:
+            # Дело могло существовать и без записи в очереди (напоминание уже
+            # ушло, или его завели вручную в CRM): переносится ближайшее
+            # существующее, а не плодится второе дело в карточке.
+            best = nearest_todo(await list_deal_todos(bitrix, deal_id))
+            if best is not None:
+                activity_id = best[0]
         if activity_id:
             await update_deal_todo_deadline(
                 bitrix,
@@ -662,9 +719,9 @@ async def on_edit_save(
         log.exception("Карточка №%s после сохранения не показана", deal_id)
         return
     if context is not None:
-        deal, contact, stages = context
+        deal, contact, stages, todos = context
         await callback.message.answer(
-            deal_card_text(deal, contact, stages),
+            deal_card_text(deal, contact, stages, todos),
             reply_markup=deal_card_keyboard(deal_id),
         )
 

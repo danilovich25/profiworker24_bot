@@ -27,10 +27,19 @@ logger = logging.getLogger("bot")
 
 
 class _PiiFormatter(logging.Formatter):
-    """Форматер логов: маскирует телефоны и URL-секреты в message и traceback."""
+    """Форматер логов: маскирует телефоны и URL-секреты в message и traceback.
+
+    Штамп времени строки (asctime) не скрабится: PII в нём нет по построению,
+    а фильтр телефонов принимал 10+ цифр даты-времени за номер — каждая
+    строка лога начиналась с «[PHONE]:00:00,123», и читать их было нельзя.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         formatted = super().format(record)
+        if self.usesTime():
+            prefix = record.asctime + " "
+            if formatted.startswith(prefix):
+                return prefix + _scrub_string(formatted[len(prefix):])
         return _scrub_string(formatted)
 
 

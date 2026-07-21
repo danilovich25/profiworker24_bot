@@ -612,3 +612,25 @@ def test_scrub_very_long_digit_chain_no_digit_survives() -> None:
     spaced = "12345 67890 12345 67890"
     result = _scrub_string(spaced)
     assert not any(c.isdigit() for c in result), f"{spaced!r} -> {result!r}"
+
+
+def test_pii_formatter_keeps_asctime_readable() -> None:
+    """Штамп времени строки лога не превращается в [PHONE].
+
+    Фильтр телефонов принимает 10+ цифр за номер, а «2026-07-21 10:00:00,123»
+    — это как раз такой ран: без защиты префикса каждая строка лога
+    начиналась с «[PHONE]:00:00,123». Телефоны в самом сообщении при этом
+    обязаны маскироваться по-прежнему.
+    """
+    import logging as _logging
+
+    from app.main import _PiiFormatter
+
+    formatter = _PiiFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    record = _logging.LogRecord(
+        "bot", _logging.INFO, __file__, 1, "клиент +79141234567 ждёт звонка", None, None
+    )
+    line = formatter.format(record)
+    assert line.startswith(record.asctime)  # штамп времени цел
+    assert PHONE_MASK in line  # телефон из сообщения замаскирован
+    assert "+79141234567" not in line

@@ -95,6 +95,9 @@ class FakeSearchBitrix(SemanticBitrixFake):
         self.contact_updates: list[dict] = []
         self.activities: list[dict] = []
         self.activity_updates: list[dict] = []
+        # Незавершённые дела сделок (crm.activity.list) — источник срока
+        # заявки в синхронизации CRM → бот.
+        self.deal_todos: list[dict] = []
 
     async def _dispatch(self, method: str, params: dict):
         if self.fail_all or method in self.fail_methods:
@@ -159,6 +162,8 @@ class FakeSearchBitrix(SemanticBitrixFake):
             raise RuntimeError("ERROR_NOT_FOUND: Не найдено")
         if method == "crm.status.list":
             return list(self.stages)
+        if method == "crm.activity.list":
+            return [t for t in self.deal_todos if self._match(t, flt)]
         if method == "crm.contact.list":
             return [c for c in self.contacts if self._match(c, flt)]
         if method == "crm.deal.list":

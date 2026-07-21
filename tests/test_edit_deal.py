@@ -305,3 +305,95 @@ async def test_stale_edit_buttons_do_not_crash(flow):
     await press(flow, "dedit:save")
 
     assert flow.bx.deal_updates == []
+
+
+# ---------------------------------------------------------------------------
+# Синхронизация CRM → бот: карточка и очередь напоминаний при открытии
+# ---------------------------------------------------------------------------
+
+
+def deal_todo_row(todo_id: int, deal_id: int, deadline: str) -> dict:
+    """Дело сделки в форме ответа crm.activity.list."""
+    return {
+        "ID": str(todo_id),
+        "OWNER_ID": str(deal_id),
+        "OWNER_TYPE_ID": 2,
+        "SUBJECT": f"Заявка №{deal_id}: замена крана",
+        "DEADLINE": deadline,
+        "COMPLETED": "N",
+        "PROVIDER_TYPE_ID": "TODO",
+    }
+
+
+async def test_card_shows_fresh_deadline_from_crm_todo(flow):
+    """Срок в карточке — из ДЕЛА сделки, а не из копии в комментарии.
+
+    Заказчик перенёс «назначенную дату» в Bitrix24: комментарий сделки
+    остался со старым сроком, но карточка обязана показывать новый.
+    """
+    flow.bx.deals[0]["COMMENTS"] += "\nСрок: 25.07.2026 10:00"
+    # 26.07 05:00 в зоне портала (+03) = 26.07 12:00 во Владивостоке.
+    flow.bx.deal_todos.append(deal_todo_row(500, 154, "2026-07-26T05:00:00+03:00"))
+
+    await press(flow, "deal:open:154")
+
+    card = flow.session.sent_messages[-1]
+    assert "Срок: 26.07.2026 12:00" in card.text
+    assert "25.07.2026" not in card.text  # устаревшая копия не показана
+
+
+async def test_card_falls_back_to_comments_without_todos(flow):
+    """Дел у сделки нет — срок берётся из строки комментария, как раньше."""
+    flow.bx.deals[0]["COMMENTS"] += "\nСрок: 25.07.2026 10:00"
+
+    await press(flow, "deal:open:154")
+
+    assert "Срок: 25.07.2026 10:00" in flow.session.sent_messages[-1].text
+
+
+async def test_open_deal_resyncs_reminder_queue(flow):
+    """Открытие карточки сразу догоняет правку срока, сделанную в CRM."""
+    old_due = int(datetime(2026, 7, 25, 10, 0, tzinfo=VVO).timestamp())
+    await flow.db.add_reminder(
+        1, "заявка №154 — замена крана. Срок: 25.07.2026 10:00", old_due, "deal", 154, 500
+    )
+    moved = "2026-07-26T05:00:00+03:00"  # 26.07 12:00 Владивостока
+    flow.bx.deal_todos.append(deal_todo_row(500, 154, moved))
+
+    await press(flow, "deal:open:154")
+
+    pending = await flow.db.pending_deal_reminder(154)
+    assert pending is not None
+    assert pending["due_ts"] == int(datetime.fromisoformat(moved).timestamp())
+    assert "Срок: 26.07.2026 12:00" in pending["text"]
+
+
+async def test_edit_deadline_adopts_existing_crm_todo(flow, monkeypatch):
+    """Правка срока без записи в очереди переносит СУЩЕСТВУЮЩЕЕ дело CRM.
+
+    Напоминание могло уже уйти (записи pending нет), а дело в карточке
+    осталось: смена срока не должна плодить второе дело рядом с ним.
+    """
+    freeze_now(monkeypatch)
+    flow.bx.deal_todos.append(deal_todo_row(600, 154, "2026-07-22T03:00:00+03:00"))
+
+    await press(flow, "deal:edit:154")
+    await press(flow, "dedit:f:deadline")
+    await send(flow, "24.07.2026 10:00")
+    await press(flow, "dedit:save")
+
+    assert flow.bx.activities == []  # нового дела нет
+    moved = flow.bx.activity_updates[0]
+    assert moved["id"] == 600
+    assert moved["deadline"] == "2026-07-24T10:00:00+10:00"
+
+
+async def test_changes_summary_formats_money_without_float_tail(flow):
+    """Сводка правок показывает «Доход → 7777», а не «7777.0»."""
+    await press(flow, "deal:edit:154")
+    await press(flow, "dedit:f:income")
+    await send(flow, "7777")
+
+    summary = flow.session.sent_texts[-1]
+    assert "Доход → 7777" in summary
+    assert "7777.0" not in summary
