@@ -11,8 +11,21 @@ from aiogram.methods import SetMyCommands
 
 from app.db import Database
 from app.handlers import routers
-from app.handlers.search import ACTIVE_ORDER_WARNING, ASK_QUERY, SearchFlow
-from app.handlers.start import BTN_FIND, BTN_LAST, BTN_NEW, NEW_ORDER_HINT
+from app.handlers.search import (
+    ACTIVE_ORDER_WARNING,
+    ASK_QUERY,
+    MENU_REFRESHED,
+    SearchFlow,
+)
+from app.handlers.start import (
+    BTN_FIND,
+    BTN_LAST,
+    BTN_NEW,
+    LEGACY_BTN_FIND,
+    LEGACY_BTN_LAST,
+    LEGACY_BTN_NEW,
+    NEW_ORDER_HINT,
+)
 from app.main import create_dispatcher, setup_bot_commands
 from app.services import llm
 from tests.conftest import make_callback_update, make_message_update
@@ -210,3 +223,69 @@ async def test_setup_bot_commands(bot, session):
     request = [r for r in session.requests if isinstance(r, SetMyCommands)][-1]
     names = [c.command for c in request.commands]
     assert names == ["new", "find", "last", "help"]
+
+
+# ---------------------------------------------------------------------------
+# Кнопки клавиатуры СТАРОГО бота (legacy/telebot-mvp): у сотрудника, не
+# нажимавшего /start после обновления, в чате остались прежние кнопки —
+# они обязаны работать, а не уходить в разбор заявки с подсказкой
+# «нажмите „Найти“» (жалоба заказчика 21.07: «вылазит кнопка Найти»).
+# ---------------------------------------------------------------------------
+
+
+async def test_legacy_find_button_opens_search_immediately(flow, monkeypatch):
+    calls = {"count": 0}
+
+    async def counting_parse(text):
+        calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(llm, "parse_order", counting_parse)
+
+    await send(flow, LEGACY_BTN_FIND)
+
+    assert calls["count"] == 0  # старая кнопка не уходит в модель
+    assert flow.session.sent_texts[-1] == ASK_QUERY  # сразу поле запроса
+    refresh = flow.session.sent_messages[-2]
+    assert refresh.text == MENU_REFRESHED  # устаревшая клавиатура заменена
+    context = flow.dp.fsm.get_context(bot=flow.bot, chat_id=1, user_id=1)
+    assert await context.get_state() == SearchFlow.query.state
+
+    await send(flow, "154")  # запрос после старой кнопки работает как поиск
+    assert "№154" in flow.session.sent_texts[-1]
+
+
+async def test_legacy_last_button_lists_recent(flow):
+    await send(flow, LEGACY_BTN_LAST)
+    reply = flow.session.sent_texts[-1]
+    assert "№155" in reply and "№154" in reply
+    assert MENU_REFRESHED in flow.session.sent_texts
+    context = flow.dp.fsm.get_context(bot=flow.bot, chat_id=1, user_id=1)
+    assert await context.get_state() == SearchFlow.query.state
+
+
+async def test_legacy_new_button_hints_and_refreshes_keyboard(flow):
+    await send(flow, LEGACY_BTN_NEW)
+    msg = flow.session.sent_messages[-1]
+    assert msg.text == NEW_ORDER_HINT
+    buttons = [b.text for row in msg.reply_markup.keyboard for b in row]
+    assert buttons == [BTN_NEW, BTN_FIND, BTN_LAST]
+
+
+async def test_legacy_buttons_do_not_break_active_order(flow, monkeypatch):
+    """Старые кнопки посреди опросника не стирают заявку, как и новые."""
+
+    async def unavailable(text: str):
+        raise llm.LLMUnavailable("недоступна")
+
+    monkeypatch.setattr(llm, "parse_order", unavailable)
+
+    await send(flow, "Иван, замена крана")
+    assert "Вопрос 1 из 6" in flow.session.sent_texts[-1]
+
+    await send(flow, LEGACY_BTN_FIND)
+    assert flow.session.sent_texts[-1] == ACTIVE_ORDER_WARNING
+    assert ASK_QUERY not in flow.session.sent_texts
+
+    await send(flow, "Иван")  # прежний вопрос всё ещё активен
+    assert "Вопрос 2 из 6" in flow.session.sent_texts[-1]

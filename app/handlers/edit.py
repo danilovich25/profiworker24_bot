@@ -29,7 +29,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.config import settings
 from app.db import Database
 from app.handlers.messages import OrderFlow, category_keyboard, source_keyboard
-from app.handlers.start import BTN_FIND, BTN_LAST
+from app.handlers.start import BTN_FIND, BTN_LAST, LEGACY_BTN_FIND, LEGACY_BTN_LAST
 from app.schemas import Category, Source
 from app.services import dates
 from app.services.bitrix import (
@@ -476,8 +476,11 @@ async def on_edit_value(message: Message, state: FSMContext) -> None:
     await edit_value_step(message, state, message.text or "")
 
 
-@router.message(DealEditFlow.choosing, F.text.in_({BTN_FIND, BTN_LAST}))
-@router.message(DealEditFlow.typing, F.text.in_({BTN_FIND, BTN_LAST}))
+_MENU_BUTTON_TEXTS = {BTN_FIND, BTN_LAST, LEGACY_BTN_FIND, LEGACY_BTN_LAST}
+
+
+@router.message(DealEditFlow.choosing, F.text.in_(_MENU_BUTTON_TEXTS))
+@router.message(DealEditFlow.typing, F.text.in_(_MENU_BUTTON_TEXTS))
 @router.message(EDIT_STATES, Command("find", "last"))
 async def protect_edit_flow(message: Message) -> None:
     """Поиск не рвёт незаконченную правку — сначала сохранить или отменить."""

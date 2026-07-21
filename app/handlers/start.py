@@ -16,6 +16,15 @@ BTN_NEW = "Новая заявка"
 BTN_FIND = "Найти"
 BTN_LAST = "Последние"
 
+# Кнопки клавиатуры СТАРОГО бота (ветка legacy/telebot-mvp). Reply-клавиатура
+# живёт в чате, пока её не заменят: у сотрудника, не нажимавшего /start после
+# обновления, кнопки прежние. Их тексты обязаны работать как новые кнопки —
+# иначе «🔎 Найти заявку» уходит в разбор заявки и бот отвечает подсказкой
+# «нажмите „Найти“» вместо поиска.
+LEGACY_BTN_NEW = "🆕 Новая заявка"
+LEGACY_BTN_FIND = "🔎 Найти заявку"
+LEGACY_BTN_LAST = "📋 Последние заявки"
+
 WELCOME = (
     "Бот приёма заявок на связи.\n\n"
     "Пришлите заявку обычным текстом или голосовым сообщением, например:\n"
@@ -81,3 +90,10 @@ async def on_new(message: Message, state: FSMContext) -> None:
 @router.message(F.text == BTN_NEW)
 async def on_new_button(message: Message, state: FSMContext) -> None:
     await on_new(message, state)
+
+
+@router.message(F.text == LEGACY_BTN_NEW)
+async def on_legacy_new_button(message: Message, state: FSMContext) -> None:
+    """Кнопка старого бота: тот же сброс, плюс замена устаревшей клавиатуры."""
+    await state.clear()
+    await message.answer(NEW_ORDER_HINT, reply_markup=main_menu_keyboard())

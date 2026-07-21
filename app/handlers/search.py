@@ -34,7 +34,13 @@ from aiogram.types import ForceReply, Message
 
 from app.handlers.edit import open_deals_keyboard
 from app.handlers.messages import OrderFlow
-from app.handlers.start import BTN_FIND, BTN_LAST
+from app.handlers.start import (
+    BTN_FIND,
+    BTN_LAST,
+    LEGACY_BTN_FIND,
+    LEGACY_BTN_LAST,
+    main_menu_keyboard,
+)
 from app.services import dates
 from app.services.bitrix import (
     BitrixClient,
@@ -434,9 +440,12 @@ async def protect_active_order_command(message: Message) -> None:
     await message.answer(ACTIVE_ORDER_WARNING)
 
 
-@router.message(ACTIVE_ORDER_STATES, F.text.in_({BTN_FIND, BTN_LAST}))
+@router.message(
+    ACTIVE_ORDER_STATES,
+    F.text.in_({BTN_FIND, BTN_LAST, LEGACY_BTN_FIND, LEGACY_BTN_LAST}),
+)
 async def protect_active_order_button(message: Message) -> None:
-    """Reply-кнопки меню не становятся ответом на вопрос заявки."""
+    """Reply-кнопки меню (включая старую клавиатуру) не отвечают на вопрос заявки."""
     await message.answer(ACTIVE_ORDER_WARNING)
 
 
@@ -522,6 +531,32 @@ async def on_last_button(
     message: Message, state: FSMContext, bitrix: BitrixClient | None = None
 ) -> None:
     """Кнопка меню «Последние» — то же, что /last."""
+    await on_last(message, state, bitrix)
+
+
+# Кнопка «Найти» старой клавиатуры не должна требовать ещё одного нажатия
+# «Найти»: сразу открывается поле поискового запроса. Отдельным сообщением
+# отправляется актуальная клавиатура — она ЗАМЕНЯЕТ устаревшую в чате, и
+# следующие нажатия идут уже новыми кнопками (ForceReply своей reply-клавиатуры
+# не несёт, поэтому обновление меню — отдельное сообщение перед запросом).
+MENU_REFRESHED = "Кнопки меню обновились."
+
+
+@router.message(MENU_BUTTON_STATES, F.text == LEGACY_BTN_FIND)
+async def on_legacy_find_button(
+    message: Message, state: FSMContext, bitrix: BitrixClient | None = None
+) -> None:
+    """«🔎 Найти заявку» старого бота: обновить клавиатуру и открыть поиск."""
+    await message.answer(MENU_REFRESHED, reply_markup=main_menu_keyboard())
+    await on_find(message, state, bitrix)
+
+
+@router.message(MENU_BUTTON_STATES, F.text == LEGACY_BTN_LAST)
+async def on_legacy_last_button(
+    message: Message, state: FSMContext, bitrix: BitrixClient | None = None
+) -> None:
+    """«📋 Последние заявки» старого бота: обновить клавиатуру и показать список."""
+    await message.answer(MENU_REFRESHED, reply_markup=main_menu_keyboard())
     await on_last(message, state, bitrix)
 
 
