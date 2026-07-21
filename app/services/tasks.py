@@ -22,6 +22,9 @@ Telegram-напоминания (reminder_loop) — второй, гаранти
 сроку слепо: перед отправкой и раз в RECONCILE_INTERVAL (плюс при старте)
 каждое ожидающее напоминание сверяется с незавершёнными делами сделки —
 переносится за ними (в обе стороны), а когда дел не осталось, отменяется.
+Отменённое не хоронится навсегда: появившееся у сделки дело со сроком в
+будущем воскрешает напоминание (revive_from_todos) — иначе гонка «завершил
+дело бота, своё завёл через пару минут» оставляла бы Telegram немым.
 """
 
 import asyncio
@@ -127,9 +130,16 @@ async def find_reminder_task(bx: BitrixClient, key: str) -> int | None:
 # бы. Раз в интервал — один crm.activity.list на каждую ожидающую сделку.
 RECONCILE_INTERVAL = 300
 
-# Разница сроков, которую сверка считает совпадением: портал хранит дедлайн
-# с точностью до минуты, дёргать очередь из-за секундного дрейфа незачем.
+# Разница сроков МЕНЬШЕ этой границы — совпадение: портал хранит дедлайн с
+# точностью до минуты, дёргать очередь из-за секундного дрейфа незачем.
+# Ровно минута — уже перенос: «передвинул на минуту» не должен теряться.
 SYNC_TOLERANCE_SECONDS = 60
+
+# Дедлайн одного чтения дел CRM в сверке (секунды). Повисший портал не должен
+# останавливать проход планировщика: один зависший crm.activity.list без
+# дедлайна заморозил бы все отправки прохода (в хендлерах такое же чтение
+# ограничено своим таймаутом).
+SYNC_CRM_DEADLINE = 25
 
 # Хвост «Срок: …» в тексте напоминания (его пишут _schedule_deal_reminder и
 # _reschedule_reminders); при переносе срока сверкой хвост переписывается.
@@ -144,13 +154,25 @@ def _text_with_deadline(text: str, due_ts: int) -> str:
     return f"{text}. Срок: {pretty}" if text else f"Срок: {pretty}"
 
 
-def nearest_todo(todos: list[dict[str, Any]]) -> tuple[int, int] | None:
-    """(id дела, срок-epoch) ближайшего по времени дела или None.
+def nearest_todo(
+    todos: list[dict[str, Any]], now_ts: int | None = None
+) -> tuple[int, int] | None:
+    """(id дела, срок-epoch) актуального дела сделки или None.
 
-    Ближайшее выбирается по РАЗОБРАННОМУ сроку, а не по строке: сравнение
-    ISO-строк с разными зонами врёт. Дела без валидного срока пропускаются.
+    Срок сравнивается РАЗОБРАННЫМ, а не строкой: сравнение ISO-строк с
+    разными зонами врёт. Дела без валидного срока пропускаются.
+
+    Ненаступившие дела (с запасом SYNC_TOLERANCE_SECONDS) важнее просроченных:
+    бот не завершает свои дела после отправки, и рядом с актуальным делом в
+    сделке висят старые хвосты — перенос напоминания на такой хвост утащил бы
+    его в прошлое и выстрелил немедленно. Из ненаступивших берётся самое
+    раннее; если ненаступивших нет — самое позднее из просроченных
+    (fallback: опоздавшая отправка лучше потерянной).
     """
-    best: tuple[int, int] | None = None
+    if now_ts is None:
+        now_ts = int(time.time())
+    upcoming: tuple[int, int] | None = None
+    overdue: tuple[int, int] | None = None
     for todo in todos:
         due_ts = dates.bitrix_deadline_epoch(todo.get("DEADLINE"))
         if due_ts is None:
@@ -159,39 +181,56 @@ def nearest_todo(todos: list[dict[str, Any]]) -> tuple[int, int] | None:
             activity_id = require_positive_id(todo.get("ID"), "crm.activity.list")
         except MalformedBitrixResponse:
             continue
-        if best is None or due_ts < best[1]:
-            best = (activity_id, due_ts)
-    return best
+        if due_ts >= now_ts - SYNC_TOLERANCE_SECONDS:
+            if upcoming is None or due_ts < upcoming[1]:
+                upcoming = (activity_id, due_ts)
+        elif overdue is None or due_ts > overdue[1]:
+            overdue = (activity_id, due_ts)
+    return upcoming if upcoming is not None else overdue
 
 
 async def apply_deal_todos(
-    db: Database, reminder: dict[str, Any], todos: list[dict[str, Any]]
+    db: Database,
+    reminder: dict[str, Any],
+    todos: list[dict[str, Any]],
+    now_ts: int | None = None,
 ) -> dict[str, Any] | None:
     """Приводит напоминание к делам CRM; возвращает актуальную запись.
 
     Правила (источник правды — незавершённые дела сделки, list_deal_todos):
-    - дел со сроком не осталось (завершили или удалили в CRM) — напоминание
+    - дел не осталось СОВСЕМ (завершили или удалили в CRM) — напоминание
       отменяется, возвращается None: с датой разобрались без бота. Но только
       если дело у напоминания БЫЛО (activity_id): когда дело не создалось ещё
       при заведении заявки, пустой список — не «разобрались», а «сверять не с
       чем», и гарантированный Telegram-канал живёт по сохранённому сроку;
-    - ближайшее дело на другом сроке — напоминание переносится за ним
+    - дела есть, но ни один срок не разобрался — fail-open: это сбой чтения,
+      а не решение заказчика, напоминание живёт по сохранённому сроку;
+    - актуальное дело на другом сроке — напоминание переносится за ним
       (срок, текст, привязка к делу), в том числе на более раннее время;
-    - срок совпадает с точностью до SYNC_TOLERANCE_SECONDS — без изменений.
+    - разница сроков меньше SYNC_TOLERANCE_SECONDS — совпадение (точность
+      портала — минута), без изменений.
     """
-    best = nearest_todo(todos)
+    best = nearest_todo(todos, now_ts)
     if best is None:
+        if todos:
+            log.warning(
+                "У сделки %s есть дела, но их сроки не разобраны — напоминание "
+                "id=%s живёт по сохранённому сроку",
+                reminder.get("entity_id"),
+                reminder["id"],
+            )
+            return reminder
         if not reminder.get("activity_id"):
             return reminder
         if await db.cancel_reminder(reminder["id"]):
             log.info(
-                "Напоминание id=%s отменено: у сделки %s не осталось дел со сроком",
+                "Напоминание id=%s отменено: у сделки %s не осталось дел",
                 reminder["id"],
                 reminder.get("entity_id"),
             )
         return None
     activity_id, due_ts = best
-    if abs(due_ts - int(reminder["due_ts"])) <= SYNC_TOLERANCE_SECONDS:
+    if abs(due_ts - int(reminder["due_ts"])) < SYNC_TOLERANCE_SECONDS:
         return reminder
     text = _text_with_deadline(str(reminder["text"]), due_ts)
     if not await db.reschedule_reminder(reminder["id"], due_ts, text, activity_id):
@@ -206,47 +245,109 @@ async def apply_deal_todos(
     return {**reminder, "due_ts": due_ts, "text": text, "activity_id": activity_id}
 
 
+async def _read_deal_todos(
+    bx: BitrixClient, deal_id: int
+) -> list[dict[str, Any]] | None:
+    """Дела сделки под дедлайном SYNC_CRM_DEADLINE; None — прочитать не вышло.
+
+    Сбой и таймаут равнозначны: вызывающий работает fail-open, по
+    сохранённому сроку — молчание из-за недоступного портала хуже
+    напоминания по чуть устаревшей дате.
+    """
+    try:
+        async with asyncio.timeout(SYNC_CRM_DEADLINE):
+            return await list_deal_todos(bx, deal_id)
+    except Exception:
+        log.warning(
+            "Дела сделки %s не прочитаны — очередь живёт по сохранённым срокам",
+            deal_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def sync_deal_reminder(
-    bx: BitrixClient, db: Database, reminder: dict[str, Any]
+    bx: BitrixClient,
+    db: Database,
+    reminder: dict[str, Any],
+    now_ts: int | None = None,
 ) -> dict[str, Any] | None:
     """Сверяет напоминание сделки с CRM; None — напоминание отменено.
 
-    Сбой чтения CRM отпускает напоминание без изменений: очередь работает по
-    сохранённому сроку — молчание из-за недоступного портала хуже напоминания
-    по чуть устаревшей дате.
+    Сбой или таймаут чтения CRM отпускает напоминание без изменений:
+    очередь работает по сохранённому сроку (см. _read_deal_todos).
     """
     deal_id = reminder.get("entity_id")
     if not deal_id:
         return reminder
-    try:
-        todos = await list_deal_todos(bx, int(deal_id))
-    except Exception:
-        log.warning(
-            "Дела сделки %s не прочитаны — напоминание живёт по сохранённому сроку",
-            deal_id,
-            exc_info=True,
-        )
+    todos = await _read_deal_todos(bx, int(deal_id))
+    if todos is None:
         return reminder
-    return await apply_deal_todos(db, reminder, todos)
+    return await apply_deal_todos(db, reminder, todos, now_ts)
+
+
+async def revive_from_todos(
+    db: Database,
+    reminder: dict[str, Any],
+    todos: list[dict[str, Any]],
+    now_ts: int | None = None,
+) -> dict[str, Any] | None:
+    """Воскрешает отменённое напоминание, если у сделки снова есть дело.
+
+    Закрывает гонку отмены: заказчик завершил дело бота и через пару минут
+    завёл в карточке своё, а между этими действиями успела пройти сверка —
+    она увидела пустой список дел и отменила напоминание. Незавершённое дело
+    со сроком в БУДУЩЕМ возвращает запись в очередь (просроченное — нет:
+    срабатывание задним числом хуже тишины, с той датой уже разобрались).
+    От дублей защищает CAS в revive_reminder: запись не оживает, пока у
+    сделки есть другое ожидающее напоминание.
+    """
+    if now_ts is None:
+        now_ts = int(time.time())
+    best = nearest_todo(todos, now_ts)
+    if best is None:
+        return None
+    activity_id, due_ts = best
+    if due_ts <= now_ts:
+        return None
+    text = _text_with_deadline(str(reminder["text"]), due_ts)
+    if not await db.revive_reminder(reminder["id"], due_ts, text, activity_id):
+        return None
+    log.info(
+        "Напоминание id=%s воскрешено делом id=%s (сделка %s)",
+        reminder["id"],
+        activity_id,
+        reminder.get("entity_id"),
+    )
+    return {**reminder, "due_ts": due_ts, "text": text, "activity_id": activity_id}
 
 
 async def resync_deal_reminder(
-    db: Database, deal_id: int, todos: list[dict[str, Any]]
+    db: Database,
+    deal_id: int,
+    todos: list[dict[str, Any]],
+    now_ts: int | None = None,
 ) -> None:
     """Сверяет напоминание сделки с УЖЕ прочитанными делами (без похода в CRM).
 
     Вызывается при открытии карточки заявки: дела для неё только что
     загружены, и очередь догоняет правки Bitrix24 сразу, не дожидаясь
-    периодической сверки.
+    периодической сверки. Если ожидающего напоминания нет, а отменённое
+    есть — дело со сроком в будущем воскрешает его (revive_from_todos).
     """
     reminder = await db.pending_deal_reminder(deal_id)
-    if reminder is None:
+    if reminder is not None:
+        await apply_deal_todos(db, {**reminder, "entity_id": deal_id}, todos, now_ts)
         return
-    await apply_deal_todos(db, {**reminder, "entity_id": deal_id}, todos)
+    cancelled = await db.cancelled_deal_reminder(deal_id)
+    if cancelled is not None:
+        await revive_from_todos(db, {**cancelled, "entity_id": deal_id}, todos, now_ts)
 
 
-async def reconcile_deal_reminders(bx: BitrixClient, db: Database) -> int:
-    """Сверяет ВСЕ ожидающие напоминания сделок с CRM, возвращает счёт.
+async def reconcile_deal_reminders(
+    bx: BitrixClient, db: Database, now_ts: int | None = None
+) -> int:
+    """Сверяет ожидающие напоминания сделок с CRM, возвращает счёт сверенных.
 
     Работает по каждому ожидающему напоминанию, а не по фильтру DATE_MODIFY
     сделок: перенос «назначенной даты» правит ДЕЛО, и DATE_MODIFY самой
@@ -254,15 +355,33 @@ async def reconcile_deal_reminders(bx: BitrixClient, db: Database) -> int:
     Ожидающих записей единицы, поэтому цена сверки — один crm.activity.list
     на сделку. Заодно закрываются правки, сделанные пока бот был выключен
     (первый вызов — сразу при старте reminder_loop).
+
+    Вторым проходом проверяются недавно отменённые напоминания (окно и
+    защита от дублей — в db.cancelled_deal_reminders): появившееся у сделки
+    дело со сроком в будущем воскрешает запись. В счёт сверенных этот проход
+    не входит.
     """
     count = 0
     for reminder in await db.pending_deal_reminders():
         try:
-            await sync_deal_reminder(bx, db, reminder)
+            await sync_deal_reminder(bx, db, reminder, now_ts)
         except Exception:
             log.exception("Сверка напоминания id=%s не удалась", reminder["id"])
             continue
         count += 1
+    seen: set[int] = set()
+    for reminder in await db.cancelled_deal_reminders():
+        deal_id = reminder.get("entity_id")
+        if not deal_id or deal_id in seen:
+            continue
+        seen.add(deal_id)
+        try:
+            todos = await _read_deal_todos(bx, int(deal_id))
+            if todos is None:
+                continue
+            await revive_from_todos(db, reminder, todos, now_ts)
+        except Exception:
+            log.exception("Воскрешение напоминания id=%s не удалось", reminder["id"])
     return count
 
 
@@ -287,7 +406,7 @@ async def send_due_reminders(
     for reminder in await db.due_reminders(now_ts):
         if bitrix is not None and reminder.get("kind") == "deal":
             try:
-                synced = await sync_deal_reminder(bitrix, db, reminder)
+                synced = await sync_deal_reminder(bitrix, db, reminder, now_ts)
             except Exception:
                 log.exception(
                     "Сверка напоминания id=%s не удалась — шлю по сохранённому сроку",
@@ -308,7 +427,9 @@ async def send_due_reminders(
             log.exception("Напоминание id=%s не отправлено", reminder["id"])
             await db.record_reminder_attempt(reminder["id"], REMINDER_MAX_ATTEMPTS)
             continue
-        await db.mark_reminder_sent(reminder["id"])
+        # CAS и по сроку: если параллельная сверка успела перенести запись,
+        # отметка промахнётся и напоминание уйдёт по новой дате отдельно.
+        await db.mark_reminder_sent(reminder["id"], int(reminder["due_ts"]))
         sent += 1
     return sent
 

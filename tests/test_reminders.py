@@ -99,7 +99,7 @@ async def test_send_failure_then_success_delivers(db, bot, session, monkeypatch)
 async def test_drop_pending_deal_reminders_for_reschedule(db, bot, session):
     """Перенос срока: старое напоминание сделки снимается, отправленное — нет."""
     first = await db.add_reminder(1, "старый срок", 1000, "deal", 154, 500)
-    await db.mark_reminder_sent(first)
+    await db.mark_reminder_sent(first, 1000)
     await db.add_reminder(1, "ещё не отправлено", 3000, "deal", 154, 500)
     await db.add_reminder(1, "другая сделка", 3000, "deal", 155)
 
@@ -108,6 +108,24 @@ async def test_drop_pending_deal_reminders_for_reschedule(db, bot, session):
     assert dropped == 1
     left = await db.due_reminders(4102444800)  # «2100 год»: всё наступило
     assert [r["entity_id"] for r in left] == [155]
+
+
+async def test_mark_sent_misses_when_reschedule_won_the_race(db):
+    """Отметка «отправлено» не затирает параллельный перенос срока.
+
+    Отправка идёт по прочитанному due_ts; если между чтением и отметкой
+    сверка перенесла напоминание, отметка обязана промахнуться — иначе
+    напоминание по новой дате молча пропало бы.
+    """
+    rid = await db.add_reminder(1, "гонка", 1000, "deal", 154, 500)
+    assert await db.reschedule_reminder(rid, 2000, "гонка, новый срок", 500)
+
+    assert await db.mark_reminder_sent(rid, 1000) is False  # слали по 1000
+
+    pending = await db.pending_deal_reminder(154)
+    assert pending is not None
+    assert pending["due_ts"] == 2000  # перенос не потерян
+    assert await db.mark_reminder_sent(rid, 2000) is True
 
 
 async def test_pending_deal_reminder_returns_activity_id(db):

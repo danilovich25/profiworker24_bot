@@ -156,7 +156,16 @@ REMINDER_PENDING = "pending"
 REMINDER_SENT = "sent"
 REMINDER_FAILED = "failed"
 # Дело сделки завершили или удалили прямо в CRM: напоминать больше не о чем.
+# Не навсегда: появившееся у сделки дело со сроком в будущем воскрешает
+# запись (revive_reminder) — см. services/tasks.revive_from_todos.
 REMINDER_CANCELLED = "cancelled"
+
+# Окно, в котором периодическая сверка перепроверяет ОТМЕНЁННЫЕ напоминания
+# сделок (cancelled_deal_reminders): каждая такая запись стоит одного
+# crm.activity.list на проход, без окна давно закрытые сделки читались бы
+# вечно. Открытие карточки заявки воскрешает и без окна — дела к тому
+# моменту уже прочитаны.
+REVIVE_SCAN_WINDOW_SECONDS = 7 * 24 * 3600
 
 
 class Database:
@@ -911,12 +920,18 @@ class Database:
             for row in rows
         ]
 
-    async def mark_reminder_sent(self, reminder_id: int) -> bool:
-        """Терминальная отметка «отправлено» (CAS по pending)."""
+    async def mark_reminder_sent(self, reminder_id: int, due_ts: int) -> bool:
+        """Терминальная отметка «отправлено» (CAS по pending И сроку).
+
+        Сверка по due_ts закрывает гонку с параллельным переносом: отправка
+        шла по прочитанному сроку, и если запись успели перенести на новый,
+        отметка обязана промахнуться — напоминание уйдёт и по новой дате.
+        """
         async with aiosqlite.connect(self.path) as conn:
             cur = await conn.execute(
-                "UPDATE reminders SET status = ? WHERE id = ? AND status = ?",
-                (REMINDER_SENT, reminder_id, REMINDER_PENDING),
+                "UPDATE reminders SET status = ? "
+                "WHERE id = ? AND status = ? AND due_ts = ?",
+                (REMINDER_SENT, reminder_id, REMINDER_PENDING, due_ts),
             )
             await conn.commit()
             return cur.rowcount == 1
@@ -996,6 +1011,101 @@ class Database:
             }
             for row in rows
         ]
+
+    async def cancelled_deal_reminder(self, deal_id: int) -> dict[str, Any] | None:
+        """Последнее отменённое напоминание сделки — кандидат на воскрешение.
+
+        Читается при открытии карточки заявки (resync): дела сделки уже
+        загружены, окно REVIVE_SCAN_WINDOW_SECONDS здесь не действует.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, activity_id FROM reminders "
+                "WHERE kind = 'deal' AND entity_id = ? AND status = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (deal_id, REMINDER_CANCELLED),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "chat_id": row[1],
+            "text": row[2],
+            "due_ts": row[3],
+            "activity_id": row[4],
+        }
+
+    async def cancelled_deal_reminders(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Недавно отменённые напоминания сделок — кандидаты на воскрешение.
+
+        Окно REVIVE_SCAN_WINDOW_SECONDS ограничивает цену периодической
+        сверки: каждая запись стоит одного crm.activity.list на проход.
+        Сделки, у которых уже есть ожидающее напоминание, не возвращаются:
+        воскрешение рядом с живой записью дало бы два напоминания по одной
+        сделке.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, kind, entity_id, activity_id "
+                "FROM reminders AS r WHERE kind = 'deal' AND status = ? "
+                "AND entity_id IS NOT NULL "
+                "AND created_at > datetime('now', ?) "
+                "AND NOT EXISTS (SELECT 1 FROM reminders AS p "
+                "WHERE p.kind = 'deal' AND p.entity_id = r.entity_id "
+                "AND p.status = ?) "
+                "ORDER BY id DESC LIMIT ?",
+                (
+                    REMINDER_CANCELLED,
+                    f"-{REVIVE_SCAN_WINDOW_SECONDS} seconds",
+                    REMINDER_PENDING,
+                    limit,
+                ),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "chat_id": row[1],
+                "text": row[2],
+                "due_ts": row[3],
+                "kind": row[4],
+                "entity_id": row[5],
+                "activity_id": row[6],
+            }
+            for row in rows
+        ]
+
+    async def revive_reminder(
+        self, reminder_id: int, due_ts: int, text: str, activity_id: int
+    ) -> bool:
+        """Возвращает отменённое напоминание в очередь (CAS по cancelled).
+
+        Появившееся у сделки незавершённое дело со сроком в будущем — сигнал,
+        что дата снова назначена. NOT EXISTS в том же UPDATE защищает от
+        дублей: пока у сделки есть другое ожидающее напоминание, воскрешение
+        не проходит, независимо от гонок между проверкой и записью.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "UPDATE reminders SET status = ?, due_ts = ?, text = ?, "
+                "activity_id = ?, attempts = 0 "
+                "WHERE id = ? AND status = ? "
+                "AND NOT EXISTS (SELECT 1 FROM reminders AS p "
+                "WHERE p.kind = 'deal' AND p.entity_id = reminders.entity_id "
+                "AND p.status = ?)",
+                (
+                    REMINDER_PENDING,
+                    due_ts,
+                    text,
+                    activity_id,
+                    reminder_id,
+                    REMINDER_CANCELLED,
+                    REMINDER_PENDING,
+                ),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
 
     async def reschedule_reminder(
         self, reminder_id: int, due_ts: int, text: str, activity_id: int | None

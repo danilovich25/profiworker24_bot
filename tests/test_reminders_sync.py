@@ -12,6 +12,9 @@ crm.activity.list как сервер — фильтром по OWNER_ID/COMPLET
 с постраничной выдачей.
 """
 
+import asyncio
+import contextlib
+import time
 from datetime import datetime
 from typing import Any
 
@@ -226,6 +229,308 @@ async def test_reminder_without_bitrix_keeps_old_behaviour(db, bot, session):
 
     assert await tasks.send_due_reminders(bot, db, now_ts=OLD_DUE + 5) == 1
     assert "заявка №78" in session.sent_texts[-1]
+
+
+# ---------------------------------------------------------------------------
+# Просроченные дела: ненаступивший срок важнее старого хвоста
+# ---------------------------------------------------------------------------
+
+
+def test_nearest_todo_prefers_upcoming_over_overdue():
+    """Просроченное дело не перебивает ненаступившее.
+
+    Бот не завершает своё дело после отправки напоминания, поэтому рядом с
+    актуальным делом в сделке висят старые просроченные хвосты. Ближайшим
+    считается ненаступившее — перенос на хвост утащил бы напоминание в
+    прошлое и выстрелил немедленно.
+    """
+    now = int(time.time())
+    overdue = todo(9, dates.epoch_to_iso(now - 86400), subject="Старый хвост")
+    upcoming = todo(14, dates.epoch_to_iso(now + 86400))
+    assert tasks.nearest_todo([overdue, upcoming], now) == (14, now + 86400)
+    assert tasks.nearest_todo([upcoming, overdue], now) == (14, now + 86400)
+
+
+def test_nearest_todo_picks_earliest_of_two_upcoming():
+    """Из двух ненаступивших дел ближайшее — с меньшим сроком, в любом порядке."""
+    now = int(time.time())
+    near = todo(21, dates.epoch_to_iso(now + 3600))
+    far = todo(22, dates.epoch_to_iso(now + 7200))
+    assert tasks.nearest_todo([near, far], now) == (21, now + 3600)
+    assert tasks.nearest_todo([far, near], now) == (21, now + 3600)
+
+
+def test_nearest_todo_overdue_fallback_picks_latest():
+    """Все дела просрочены — берётся самое позднее, ближайшее к «сейчас»."""
+    now = int(time.time())
+    older = todo(9, dates.epoch_to_iso(now - 3 * 86400))
+    newer = todo(14, dates.epoch_to_iso(now - 3600))
+    assert tasks.nearest_todo([older, newer], now) == (14, now - 3600)
+    assert tasks.nearest_todo([newer, older], now) == (14, now - 3600)
+
+
+async def test_overdue_todo_does_not_drag_reminder_into_past(db, bot, session):
+    """Просроченный хвост дел не утаскивает ожидающее напоминание в прошлое.
+
+    Напоминание ждёт будущего срока, а в CRM рядом с актуальным делом висит
+    старое незакрытое. Перенос на просроченное дело выстрелил бы немедленно,
+    и реальная дата потерялась бы.
+    """
+    now = int(time.time())
+    future_due = now + 9 * 86400
+    text = f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(future_due)}"
+    await db.add_reminder(1, text, future_due, "deal", DEAL, 14)
+    bx = FakeTodoBitrix(
+        [
+            todo(9, dates.epoch_to_iso(now - 86400), subject="Старый хвост"),
+            todo(14, dates.epoch_to_iso(future_due)),
+        ]
+    )
+
+    assert await tasks.reconcile_deal_reminders(bx, db) == 1
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending["due_ts"] == future_due  # осталось на актуальном деле
+    assert pending["activity_id"] == 14
+    assert await tasks.send_due_reminders(bot, db, now_ts=now + 5, bitrix=bx) == 0
+    assert session.sent_texts == []  # немедленного выстрела нет
+
+
+async def test_single_overdue_todo_still_delivers_late(db, bot, session):
+    """Единственное дело просрочено (планировщик спал) — напоминание уходит.
+
+    Просроченные дела — fallback, а не мусор: опоздавшая отправка лучше
+    отменённой, дубль лучше молчания.
+    """
+    now = int(time.time())
+    stored_due = now - 2 * 3600
+    text = f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(stored_due)}"
+    await db.add_reminder(1, text, stored_due, "deal", DEAL, 14)
+    bx = FakeTodoBitrix([todo(14, dates.epoch_to_iso(stored_due))])
+
+    assert await tasks.send_due_reminders(bot, db, now_ts=now, bitrix=bx) == 1
+    assert "заявка №78" in session.sent_texts[-1]
+
+
+# ---------------------------------------------------------------------------
+# Границы допуска сверки
+# ---------------------------------------------------------------------------
+
+
+async def test_move_by_exactly_one_minute_is_synced(db):
+    """Перенос ровно на минуту — это перенос, а не дрейф.
+
+    Секунды в тесте НАРОЧНО жёсткие, не через SYNC_TOLERANCE_SECONDS: тест
+    фиксирует сам порог — раздутый допуск молча терял бы минутные переносы.
+    """
+    now = int(time.time())
+    due = now + 3600
+    text = f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(due)}"
+    await db.add_reminder(1, text, due, "deal", DEAL, 14)
+    moved = due + 60  # ровно минута
+    bx = FakeTodoBitrix([todo(14, dates.epoch_to_iso(moved))])
+
+    assert await tasks.reconcile_deal_reminders(bx, db) == 1
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending["due_ts"] == moved
+    assert f"Срок: {dates.format_epoch(moved)}" in pending["text"]
+
+
+async def test_thirty_minute_move_is_never_a_drift(db):
+    """Полчаса — заведомо перенос: порог допуска не может его проглотить."""
+    now = int(time.time())
+    due = now + 3600
+    text = f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(due)}"
+    await db.add_reminder(1, text, due, "deal", DEAL, 14)
+    moved = due + 30 * 60
+    bx = FakeTodoBitrix([todo(14, dates.epoch_to_iso(moved))])
+
+    assert await tasks.reconcile_deal_reminders(bx, db) == 1
+
+    assert (await db.pending_deal_reminder(DEAL))["due_ts"] == moved
+
+
+async def test_move_within_tolerance_keeps_queue_calm(db):
+    """Дрейф в 59 секунд (точность портала — минута) очередь не дёргает."""
+    now = int(time.time())
+    due = now + 3600
+    text = f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(due)}"
+    await db.add_reminder(1, text, due, "deal", DEAL, 14)
+    drifted = due + 59
+    bx = FakeTodoBitrix([todo(14, dates.epoch_to_iso(drifted))])
+
+    assert await tasks.reconcile_deal_reminders(bx, db) == 1
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending["due_ts"] == due  # без изменений
+    assert pending["text"] == text
+
+
+async def test_unparsed_deadlines_fail_open_not_cancel(db, bot, session):
+    """Дела есть, но их сроки не разобрались — напоминание живёт дальше.
+
+    Непарсибельный DEADLINE — сбой чтения, а не «с датой разобрались»:
+    отмена по нему молча теряла бы напоминание. Fail-open — очередь работает
+    по сохранённому сроку.
+    """
+    now = int(time.time())
+    due = now + 3600
+    await db.add_reminder(1, OLD_TEXT, due, "deal", DEAL, 14)
+    bx = FakeTodoBitrix([todo(14, "завтра к обеду")])  # DEADLINE не ISO
+
+    assert await tasks.reconcile_deal_reminders(bx, db) == 1
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None
+    assert pending["due_ts"] == due
+    assert await tasks.send_due_reminders(bot, db, now_ts=due + 5, bitrix=bx) == 1
+    assert "заявка №78" in session.sent_texts[-1]
+
+
+# ---------------------------------------------------------------------------
+# Воскрешение отменённых напоминаний
+# ---------------------------------------------------------------------------
+
+
+async def test_cancelled_reminder_revives_on_new_manual_todo(db, bot, session):
+    """Отменённое напоминание воскресает, когда у сделки появляется дело.
+
+    Живой сценарий: заказчик завершил дело бота и через пару минут завёл в
+    карточке своё. Если между этими действиями успела пройти сверка, она
+    отменила напоминание по пустому списку дел — ручное дело со сроком в
+    будущем обязано вернуть его в очередь, иначе Telegram промолчит.
+    """
+    now = int(time.time())
+    due = now + 3 * 3600
+    text = f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(due)}"
+    await db.add_reminder(1, text, due, "deal", DEAL, 14)
+
+    # Тик сверки между «завершил дело бота» и «завёл своё»: дел нет — отмена.
+    assert await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db) == 1
+    assert await db.pending_deal_reminder(DEAL) is None
+
+    manual_due = now + 2 * 3600
+    bx = FakeTodoBitrix(
+        [todo(16, dates.epoch_to_iso(manual_due), subject="Позвонить клиенту")]
+    )
+    await tasks.reconcile_deal_reminders(bx, db)
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None  # напоминание вернулось в очередь
+    assert pending["activity_id"] == 16
+    assert pending["due_ts"] == manual_due
+    assert f"Срок: {dates.format_epoch(manual_due)}" in pending["text"]
+
+    sent = await tasks.send_due_reminders(bot, db, now_ts=manual_due + 5, bitrix=bx)
+    assert sent == 1
+    assert "заявка №78" in session.sent_texts[-1]
+
+
+async def test_cancelled_reminder_ignores_overdue_todo(db, bot, session):
+    """Просроченное дело отменённое напоминание не воскрешает.
+
+    Воскрешение — только по делу со сроком в будущем: срабатывание задним
+    числом по старому хвосту хуже тишины, с той датой уже разобрались.
+    """
+    now = int(time.time())
+    await db.add_reminder(1, OLD_TEXT, now + 3600, "deal", DEAL, 14)
+    assert await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db) == 1
+
+    bx = FakeTodoBitrix([todo(16, dates.epoch_to_iso(now - 3600))])
+    await tasks.reconcile_deal_reminders(bx, db)
+
+    assert await db.pending_deal_reminder(DEAL) is None
+    assert await tasks.send_due_reminders(bot, db, now_ts=now + 10, bitrix=bx) == 0
+    assert session.sent_texts == []
+
+
+async def test_revival_does_not_duplicate_live_pending(db):
+    """Сделка с живым ожидающим напоминанием второго из отменённых не получает.
+
+    После отмены заказчик поставил новый срок через бота — в очереди снова
+    есть ожидающая запись. Старая отменённая не должна воскресать рядом:
+    два напоминания по одной сделке — дубль.
+    """
+    now = int(time.time())
+    await db.add_reminder(1, OLD_TEXT, now + 3600, "deal", DEAL, 14)
+    assert await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db) == 1
+    new_due = now + 2 * 3600
+    await db.add_reminder(
+        1,
+        f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(new_due)}",
+        new_due,
+        "deal",
+        DEAL,
+        500,
+    )
+    bx = FakeTodoBitrix([todo(500, dates.epoch_to_iso(new_due))])
+
+    await tasks.reconcile_deal_reminders(bx, db)
+
+    rows = [r for r in await db.pending_deal_reminders() if r["entity_id"] == DEAL]
+    assert len(rows) == 1
+    assert rows[0]["activity_id"] == 500
+
+
+# ---------------------------------------------------------------------------
+# Устойчивость планировщика
+# ---------------------------------------------------------------------------
+
+
+class HangingBitrix(SemanticBitrixFake):
+    """«Портал», который повис: запрос не отвечает и не падает."""
+
+    async def _dispatch(self, method: str, params: dict) -> Any:
+        await asyncio.Event().wait()
+
+
+async def test_hung_portal_does_not_stall_scheduler_pass(db, bot, session, monkeypatch):
+    """Зависший портал не блокирует проход планировщика.
+
+    Сверка перед отправкой ограничена дедлайном: без него один повисший
+    crm.activity.list остановил бы все отправки прохода. По истечении
+    дедлайна — fail-open, отправка по сохранённому сроку.
+    """
+    monkeypatch.setattr(tasks, "SYNC_CRM_DEADLINE", 0.05)
+    now = int(time.time())
+    await db.add_reminder(1, OLD_TEXT, now - 60, "deal", DEAL, 14)
+
+    sent = await tasks.send_due_reminders(bot, db, now_ts=now, bitrix=HangingBitrix())
+    assert sent == 1
+    assert "заявка №78" in session.sent_texts[-1]
+
+
+async def test_reminder_loop_reconciles_at_startup(db, bot):
+    """Первая сверка — сразу при старте цикла, а не через RECONCILE_INTERVAL.
+
+    Правки, сделанные в CRM пока бот лежал, должны догоняться в первые же
+    секунды после подъёма: до первого сна цикла очередь уже сверена.
+    """
+    now = int(time.time())
+    far_due = now + 9 * 86400
+    near_due = now + 2 * 3600
+    text = f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(far_due)}"
+    await db.add_reminder(1, text, far_due, "deal", DEAL, 14)
+    bx = FakeTodoBitrix([todo(14, dates.epoch_to_iso(near_due))])
+
+    loop_task = asyncio.create_task(tasks.reminder_loop(bot, db, bitrix=bx))
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            pending = await db.pending_deal_reminder(DEAL)
+            if pending is not None and pending["due_ts"] == near_due:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
+
+    assert bx.list_calls >= 1  # сверка прошла до первого сна цикла
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None
+    assert pending["due_ts"] == near_due
 
 
 def test_bitrix_deadline_epoch_parses_portal_forms():
