@@ -292,6 +292,30 @@ def epoch_to_iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, local_tz()).isoformat()
 
 
+def format_epoch(ts: int) -> str:
+    """Unix-момент → «дд.мм.гггг чч:мм» в часовом поясе приложения."""
+    return datetime.fromtimestamp(ts, local_tz()).strftime("%d.%m.%Y %H:%M")
+
+
+def bitrix_deadline_epoch(raw: object) -> int | None:
+    """Unix-момент из DEADLINE дела Bitrix («2026-07-21T03:03:00+03:00»).
+
+    Портал отдаёт ISO с зоной (проверено живым прогоном 21.07); значение без
+    зоны трактуется как местное время приложения — так же, как в
+    reminder_epoch. Пустое или непонятное значение — None.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=local_tz())
+    return int(parsed.timestamp())
+
+
 def reminder_epoch(deadline_iso: str | None) -> int | None:
     """Unix-момент Telegram-напоминания по сроку заявки.
 

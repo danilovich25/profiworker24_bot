@@ -949,6 +949,35 @@ async def create_deal_todo(
     return todo_id
 
 
+async def list_deal_todos(bx: BitrixClient, deal_id: int) -> list[dict[str, Any]]:
+    """Незавершённые дела-напоминания сделки (включая созданные вручную в CRM).
+
+    Источник правды синхронизации CRM → бот: заказчик переносит «назначенную
+    дату» прямо в карточке сделки Bitrix24 (правит дело бота или заводит своё),
+    и бот обязан это увидеть. Возвращаются только универсальные дела
+    (PROVIDER TODO) с заполненным дедлайном; выбор ближайшего по времени —
+    на вызывающей стороне (services/tasks), потому что срок надо разбирать.
+    """
+    rows = await list_all_checked(
+        bx,
+        "crm.activity.list",
+        {
+            "filter": {
+                "OWNER_TYPE_ID": TODO_OWNER_TYPE_DEAL,
+                "OWNER_ID": deal_id,
+                "COMPLETED": "N",
+                "PROVIDER_TYPE_ID": "TODO",
+            },
+            "select": ["ID", "SUBJECT", "DEADLINE", "COMPLETED", "PROVIDER_TYPE_ID"],
+        },
+    )
+    return [
+        row
+        for row in rows
+        if isinstance(row, dict) and str(row.get("DEADLINE") or "").strip()
+    ]
+
+
 async def update_deal_todo_deadline(
     bx: BitrixClient, todo_id: int, deal_id: int, deadline_iso: str, title: str
 ) -> None:

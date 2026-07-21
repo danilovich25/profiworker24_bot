@@ -155,6 +155,8 @@ CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, due_ts);
 REMINDER_PENDING = "pending"
 REMINDER_SENT = "sent"
 REMINDER_FAILED = "failed"
+# Дело сделки завершили или удалили прямо в CRM: напоминать больше не о чем.
+REMINDER_CANCELLED = "cancelled"
 
 
 class Database:
@@ -966,6 +968,66 @@ class Database:
             )
             await conn.commit()
             return cur.rowcount
+
+    async def pending_deal_reminders(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Все неотправленные напоминания сделок — для сверки с делами CRM.
+
+        В отличие от due_reminders отдаёт и те, чей срок ещё не наступил:
+        заказчик мог перенести «назначенную дату» в Bitrix24 на более раннее
+        время, и очередь обязана догнать правку ДО сохранённого момента.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, kind, entity_id, activity_id "
+                "FROM reminders WHERE kind = 'deal' AND status = ? "
+                "AND entity_id IS NOT NULL ORDER BY due_ts LIMIT ?",
+                (REMINDER_PENDING, limit),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "chat_id": row[1],
+                "text": row[2],
+                "due_ts": row[3],
+                "kind": row[4],
+                "entity_id": row[5],
+                "activity_id": row[6],
+            }
+            for row in rows
+        ]
+
+    async def reschedule_reminder(
+        self, reminder_id: int, due_ts: int, text: str, activity_id: int | None
+    ) -> bool:
+        """Переносит неотправленное напоминание на новый срок (CAS по pending).
+
+        Вызывается сверкой CRM → бот: «назначенную дату» перенесли в Bitrix24,
+        очередь догоняет. Счётчик попыток сбрасывается — это новый срок.
+        Отправленные и отменённые напоминания не трогаются.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "UPDATE reminders SET due_ts = ?, text = ?, activity_id = ?, "
+                "attempts = 0 WHERE id = ? AND status = ?",
+                (due_ts, text, activity_id, reminder_id, REMINDER_PENDING),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+
+    async def cancel_reminder(self, reminder_id: int) -> bool:
+        """Отменяет неотправленное напоминание (CAS по pending).
+
+        Все дела сделки завершили или удалили прямо в CRM — значит, с
+        «назначенной датой» разобрались без бота, и писать не о чем.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "UPDATE reminders SET status = ? WHERE id = ? AND status = ?",
+                (REMINDER_CANCELLED, reminder_id, REMINDER_PENDING),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
 
     # -- Черновики заявок (карточки-превью) --------------------------------
 

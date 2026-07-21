@@ -182,7 +182,9 @@ async def main() -> None:
     asyncio.create_task(healthcheck_loop(db))
     # Telegram-напоминания: очередь в SQLite, поэтому цикл спокойно
     # переживает рестарт контейнера — неотправленное уйдёт после подъёма.
-    asyncio.create_task(reminder_loop(bot, db))
+    # Клиент Bitrix нужен циклу для сверки сроков с делами CRM: заказчик
+    # переносит «назначенную дату» прямо в Bitrix24, очередь догоняет.
+    asyncio.create_task(reminder_loop(bot, db, bx))
     logger.info("Запускаю polling")
     await dp.start_polling(bot)
 
