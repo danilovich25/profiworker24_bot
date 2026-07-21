@@ -171,6 +171,19 @@ async def test_all_todos_closed_cancels_reminder(db, bot, session):
     assert session.sent_texts == []
 
 
+async def test_reminder_without_todo_link_survives_empty_crm(db, bot, session):
+    """Дело не создалось при заведении заявки — напоминание всё равно уходит.
+
+    Telegram-канал обещан «гарантированным»: пустой список дел при
+    activity_id=None означает «сверять не с чем», а не «дату отменили».
+    """
+    await db.add_reminder(1, OLD_TEXT, OLD_DUE, "deal", DEAL, None)
+    bx = FakeTodoBitrix([])
+
+    assert await tasks.send_due_reminders(bot, db, now_ts=OLD_DUE + 5, bitrix=bx) == 1
+    assert "заявка №78" in session.sent_texts[-1]
+
+
 async def test_crm_failure_falls_open_and_sends(db, bot, session):
     """Портал недоступен — напоминание уходит по сохранённому сроку.
 
