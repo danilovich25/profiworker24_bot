@@ -5,6 +5,7 @@
 случайно создающий новую сделку, уронит тест AssertionError'ом.
 """
 
+import time
 from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -397,3 +398,114 @@ async def test_changes_summary_formats_money_without_float_tail(flow):
     summary = flow.session.sent_texts[-1]
     assert "Доход → 7777" in summary
     assert "7777.0" not in summary
+
+
+async def test_changes_summary_formats_millions_plainly(flow):
+    """Сводка правок: «Доход → 1500000», а не экспонента «1.5e+06»."""
+    await press(flow, "deal:edit:154")
+    await press(flow, "dedit:f:income")
+    await send(flow, "1500000")
+
+    summary = flow.session.sent_texts[-1]
+    assert "Доход → 1500000" in summary
+    assert "e+06" not in summary
+
+
+async def test_card_money_formats_millions_plainly(flow):
+    """Суммы от миллиона в карточке — числом, а не «2.5e+06 руб.»."""
+    flow.bx.deals[0]["OPPORTUNITY"] = "2500000"
+
+    await press(flow, "deal:open:154")
+
+    card = flow.session.sent_messages[-1].text
+    assert "Доход: 2500000 руб." in card
+    assert "e+06" not in card
+
+
+async def test_open_deal_with_no_todos_cancels_stale_reminder(flow):
+    """Открыл карточку, а дел у сделки ноль — напоминание отменяется сразу.
+
+    Дело завершили или удалили в CRM: сверка при открытии карточки видит
+    пустой (но успешно прочитанный) список дел и снимает напоминание, не
+    дожидаясь периодического прохода.
+    """
+    await flow.db.add_reminder(
+        1,
+        "заявка №154 — замена крана. Срок: 25.07.2026 10:00",
+        FAR_FUTURE_TS,
+        "deal",
+        154,
+        500,
+    )
+
+    await press(flow, "deal:open:154")
+
+    assert await flow.db.pending_deal_reminder(154) is None
+
+
+async def test_card_deadline_prefers_upcoming_todo(flow, monkeypatch):
+    """Срок в карточке — ненаступившее дело, а не просроченный хвост."""
+    freeze_now(monkeypatch)
+    # 18.07 05:00 (+03) = 18.07 12:00 ВВО — просрочено к FROZEN_NOW (19.07 15:00).
+    flow.bx.deal_todos.append(deal_todo_row(700, 154, "2026-07-18T05:00:00+03:00"))
+    flow.bx.deal_todos.append(deal_todo_row(701, 154, "2026-07-26T05:00:00+03:00"))
+
+    await press(flow, "deal:open:154")
+
+    card = flow.session.sent_messages[-1]
+    assert "Срок: 26.07.2026 12:00" in card.text
+
+
+async def test_open_card_revives_cancelled_reminder(flow):
+    """Открытие карточки возвращает отменённое напоминание за новым делом.
+
+    Сверка успела отменить напоминание по пустому списку дел, потом в CRM
+    завели дело со сроком в будущем: сотрудник открыл карточку — очередь
+    догоняет сразу, не дожидаясь периодического прохода.
+    """
+    rid = await flow.db.add_reminder(
+        1,
+        "заявка №154 — замена крана. Срок: 25.07.2026 10:00",
+        FAR_FUTURE_TS,
+        "deal",
+        154,
+        500,
+    )
+    assert await flow.db.cancel_reminder(rid)
+    manual_due = int(time.time()) + 2 * 3600
+    flow.bx.deal_todos.append(deal_todo_row(600, 154, dates.epoch_to_iso(manual_due)))
+
+    await press(flow, "deal:open:154")
+
+    pending = await flow.db.pending_deal_reminder(154)
+    assert pending is not None
+    assert pending["activity_id"] == 600
+    assert pending["due_ts"] == manual_due
+
+
+async def test_new_request_button_does_not_wipe_unsaved_edits(flow):
+    """«Новая заявка» (включая легаси-кнопку и /new) не стирает правки молча.
+
+    Кнопка старого бота посреди правки сбрасывала накопленные изменения без
+    предупреждения. При незаконченной правке бот просит сначала сохранить
+    или отменить — правки живы, «Сохранить» пишет их в ту же сделку.
+    """
+    await press(flow, "deal:edit:154")
+    await press(flow, "dedit:f:income")
+    await send(flow, "7777")
+
+    for btn in ("Новая заявка", "🆕 Новая заявка", "/new"):
+        await send(flow, btn)
+        assert "сохраните или отмените" in flow.session.sent_texts[-1].lower()
+
+    await press(flow, "dedit:save")
+    assert flow.bx.deal_updates[-1]["fields"]["OPPORTUNITY"] == 7777
+
+
+async def test_new_button_without_changes_resets_edit(flow):
+    """Без накопленных правок «Новая заявка» работает как раньше — сброс."""
+    await press(flow, "deal:edit:154")
+
+    await send(flow, "🆕 Новая заявка")
+
+    assert "Пришлите заявку" in flow.session.sent_texts[-1]

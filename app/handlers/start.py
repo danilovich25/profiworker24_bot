@@ -40,6 +40,11 @@ NEW_ORDER_HINT = (
     "замена крана, завтра»."
 )
 
+# Общий ответ на попытку начать новое действие посреди незаконченной правки
+# заявки. Живёт здесь, а не в handlers/edit: edit сам импортирует кнопки из
+# этого модуля, обратный импорт замкнул бы цикл.
+EDIT_IN_PROGRESS = "Сначала сохраните или отмените правки заявки (кнопки выше)."
+
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     """Постоянная клавиатура главного меню."""
@@ -67,6 +72,22 @@ async def _close_search_flow(state: FSMContext) -> None:
         await state.clear()
 
 
+async def _edit_changes_in_progress(state: FSMContext) -> bool:
+    """Правка заявки с несохранёнными изменениями сейчас активна.
+
+    «Новая заявка» (включая легаси-кнопку старого бота) и /new не имеют
+    права молча стереть накопленные правки: сотрудник вводил их руками —
+    сначала «Сохранить» или «Отмена». Правка БЕЗ изменений сбрасывается как
+    обычно: терять в ней нечего. Состояние сверяется по имени группы, а не
+    импортом DealEditFlow: handlers/edit сам импортирует этот модуль.
+    """
+    current = await state.get_state()
+    if current is None or not current.startswith("DealEditFlow"):
+        return False
+    data = await state.get_data()
+    return bool(data.get("changes"))
+
+
 @router.message(CommandStart())
 async def on_start(message: Message, state: FSMContext) -> None:
     await _close_search_flow(state)
@@ -83,6 +104,10 @@ async def on_help(message: Message, state: FSMContext) -> None:
 async def on_new(message: Message, state: FSMContext) -> None:
     # «Новая заявка» начинает с чистого листа: хвосты незаконченных
     # опросников и поисковых запросов не должны мешать новому тексту.
+    # Исключение — правка с несохранёнными изменениями: её не стираем молча.
+    if await _edit_changes_in_progress(state):
+        await message.answer(EDIT_IN_PROGRESS)
+        return
     await state.clear()
     await message.answer(NEW_ORDER_HINT)
 
@@ -95,5 +120,8 @@ async def on_new_button(message: Message, state: FSMContext) -> None:
 @router.message(F.text == LEGACY_BTN_NEW)
 async def on_legacy_new_button(message: Message, state: FSMContext) -> None:
     """Кнопка старого бота: тот же сброс, плюс замена устаревшей клавиатуры."""
+    if await _edit_changes_in_progress(state):
+        await message.answer(EDIT_IN_PROGRESS)
+        return
     await state.clear()
     await message.answer(NEW_ORDER_HINT, reply_markup=main_menu_keyboard())

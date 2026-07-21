@@ -29,7 +29,13 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app.config import settings
 from app.db import Database
 from app.handlers.messages import OrderFlow, category_keyboard, source_keyboard
-from app.handlers.start import BTN_FIND, BTN_LAST, LEGACY_BTN_FIND, LEGACY_BTN_LAST
+from app.handlers.start import (
+    BTN_FIND,
+    BTN_LAST,
+    EDIT_IN_PROGRESS,
+    LEGACY_BTN_FIND,
+    LEGACY_BTN_LAST,
+)
 from app.schemas import Category, Source
 from app.services import dates
 from app.services.bitrix import (
@@ -74,7 +80,8 @@ EDIT_NO_CHANGES = "Пока ничего не изменено. Выберите
 
 EDIT_CANCELLED = "Правки отменены, заявка осталась прежней."
 
-EDIT_IN_PROGRESS = "Сначала сохраните или отмените правки заявки (кнопки выше)."
+# EDIT_IN_PROGRESS импортируется из handlers/start: тем же ответом защищаются
+# и кнопки «Новая заявка» (включая легаси) с /new, чьи хендлеры живут там.
 
 ACTIVE_INPUT_WARNING = (
     "Сначала завершите текущий ввод заявки или нажмите «Отмена» на вопросе."
@@ -205,11 +212,16 @@ def _num(raw: object) -> float | None:
     return value
 
 
+def _fmt_amount(value: float) -> str:
+    """Сумма числом: без хвоста «.0» и без экспоненты («2.5e+06» у миллионов)."""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
 def _fmt_money(raw: object) -> str | None:
     value = _num(raw)
     if value is None:
         return None
-    return f"{value:g} руб."
+    return f"{_fmt_amount(value)} руб."
 
 
 def _deadline_from_comments(comments: object) -> str | None:
@@ -261,7 +273,9 @@ def deal_card_text(
         lines.append(f"Прибыль: {profit}")
     deadline = None
     if todos:
-        best = nearest_todo(todos)
+        # «Сейчас» — чтобы просроченный хвост дел не заслонял актуальный
+        # срок: показывается ближайшее ненаступившее дело.
+        best = nearest_todo(todos, int(dates.now_local().timestamp()))
         if best is not None:
             deadline = dates.format_epoch(best[1])
     if deadline is None:
@@ -282,8 +296,8 @@ def _changes_summary(changes: dict[str, Any]) -> str:
             shown = dates.format_deadline(value)
         elif isinstance(value, float):
             # Суммы разбираются во float: без формата сотрудник видел бы
-            # «Доход → 7777.0» — хвост «.0» в сводке ни к чему.
-            shown = f"{value:g}"
+            # «Доход → 7777.0», а от миллиона — экспоненту «1.5e+06».
+            shown = _fmt_amount(value)
         parts.append(f"{FIELD_TITLES[code]} → {shown}")
     return "Изменения: " + "; ".join(parts) + ".\nСохранить?"
 
@@ -618,9 +632,12 @@ async def _reschedule_reminders(
     try:
         if not activity_id:
             # Дело могло существовать и без записи в очереди (напоминание уже
-            # ушло, или его завели вручную в CRM): переносится ближайшее
+            # ушло, или его завели вручную в CRM): переносится актуальное
             # существующее, а не плодится второе дело в карточке.
-            best = nearest_todo(await list_deal_todos(bitrix, deal_id))
+            best = nearest_todo(
+                await list_deal_todos(bitrix, deal_id),
+                int(dates.now_local().timestamp()),
+            )
             if best is not None:
                 activity_id = best[0]
         if activity_id:
