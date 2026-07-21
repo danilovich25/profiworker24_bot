@@ -245,15 +245,20 @@ class Database:
                 # воскрешения (cancelled_deal_reminders) отсчитывается от
                 # отмены, а не от создания — запись, созданная сильно заранее
                 # и отменённая только что, обязана оставаться кандидатом.
-                # Старым отменённым строкам момент отмены неизвестен:
-                # назначается created_at (поведение прежнего окна).
                 await conn.execute(
                     "ALTER TABLE reminders ADD COLUMN cancelled_at TEXT DEFAULT NULL"
                 )
-                await conn.execute(
-                    "UPDATE reminders SET cancelled_at = created_at WHERE status = ?",
-                    (REMINDER_CANCELLED,),
-                )
+            # Бэкфил — вне ветки ALTER и идемпотентный: упади процесс между
+            # добавлением колонки и заполнением, следующий старт долечит.
+            # Отменённая строка без момента отмены бывает только из старой
+            # схемы (cancel_reminder — единственный писатель статуса — всегда
+            # проставляет cancelled_at): ей назначается created_at, поведение
+            # прежнего окна воскрешения.
+            await conn.execute(
+                "UPDATE reminders SET cancelled_at = created_at "
+                "WHERE status = ? AND cancelled_at IS NULL",
+                (REMINDER_CANCELLED,),
+            )
             # В старой схеме успешный контакт и комментарий возвращали fence
             # в reserved. Наличие contact_id доказывает завершение обеих фаз:
             # после обновления нельзя повторно дописывать timeline-комментарий.
@@ -1140,14 +1145,26 @@ class Database:
         ]
 
     async def revive_reminder(
-        self, reminder_id: int, due_ts: int, text: str, activity_id: int
+        self,
+        reminder_id: int,
+        due_ts: int,
+        text: str,
+        activity_id: int,
+        sent_guard_seconds: int,
     ) -> bool:
         """Возвращает отменённое напоминание в очередь (CAS по cancelled).
 
         Появившееся у сделки незавершённое дело со сроком в будущем — сигнал,
-        что дата снова назначена. NOT EXISTS в том же UPDATE защищает от
-        дублей: пока у сделки есть другое ожидающее напоминание, воскрешение
-        не проходит, независимо от гонок между проверкой и записью.
+        что дата снова назначена. Оба NOT EXISTS живут в том же UPDATE и
+        потому безразличны к гонкам между проверкой и записью:
+        - пока у сделки есть другое ожидающее напоминание, воскрешение не
+          проходит — два pending по одной сделке дали бы два сообщения;
+        - если по этому же сроку (в пределах sent_guard_seconds — допуск
+          сверки, точность портала — минута) у сделки уже ЕСТЬ отправленная
+          запись, воскрешение не проходит: бот своё дело в CRM не завершает,
+          и в первую минуту после отправки открытое дело ещё числится
+          ненаступившим — без гарда отменённый хвост воскресал бы со сроком
+          в прошлом и слал второй «⏰» по уже отработанной дате.
         """
         async with aiosqlite.connect(self.path) as conn:
             cur = await conn.execute(
@@ -1156,7 +1173,10 @@ class Database:
                 "WHERE id = ? AND status = ? "
                 "AND NOT EXISTS (SELECT 1 FROM reminders AS p "
                 "WHERE p.kind = 'deal' AND p.entity_id = reminders.entity_id "
-                "AND p.status = ?)",
+                "AND p.status = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM reminders AS s "
+                "WHERE s.kind = 'deal' AND s.entity_id = reminders.entity_id "
+                "AND s.status = ? AND ABS(s.due_ts - ?) < ?)",
                 (
                     REMINDER_PENDING,
                     due_ts,
@@ -1165,6 +1185,9 @@ class Database:
                     reminder_id,
                     REMINDER_CANCELLED,
                     REMINDER_PENDING,
+                    REMINDER_SENT,
+                    due_ts,
+                    sent_guard_seconds,
                 ),
             )
             await conn.commit()

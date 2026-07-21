@@ -653,6 +653,104 @@ async def test_revival_does_not_duplicate_live_pending(db):
     assert rows[0]["activity_id"] == 500
 
 
+async def test_sent_reminder_blocks_revival_of_same_due(db, bot, session):
+    """Отправленное напоминание не даёт воскресить отменённый хвост той же даты.
+
+    Бот своё дело в CRM не завершает: после отправки дело остаётся открытым
+    и в первую минуту после срока ещё классифицируется ненаступившим. Без
+    гарда отменённый хвост той же сделки воскресал бы со сроком в прошлом,
+    и по уже отработанной дате уходил второй «⏰» со старым текстом.
+    Sent-строка того же срока — доказательство, что по нему отработали.
+    """
+    now = int(time.time())
+    # Хвост: дело бота завершили в CRM, сверка отменила запись.
+    await db.add_reminder(1, OLD_TEXT, now + 3600, "deal", DEAL, 14)
+    assert await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db) == 1
+    assert await db.pending_deal_reminder(DEAL) is None
+
+    # Новый срок поставили через бота; напоминание ушло в свой момент.
+    due = now
+    text = f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(due)}"
+    await db.add_reminder(1, text, due, "deal", DEAL, 16)
+    bx = FakeTodoBitrix([todo(16, dates.epoch_to_iso(due))])
+    assert await tasks.send_due_reminders(bot, db, now_ts=due + 5, bitrix=bx) == 1
+
+    # Дело 16 так и открыто; сверка приходит в окне [срок, срок+60).
+    await tasks.reconcile_deal_reminders(bx, db, now_ts=due + 30)
+
+    assert await db.pending_deal_reminder(DEAL) is None  # хвост не воскрес
+    assert await tasks.send_due_reminders(bot, db, now_ts=due + 45, bitrix=bx) == 0
+    assert len(session.sent_texts) == 1  # «⏰» по этому сроку ровно один
+
+
+async def test_old_sent_reminder_does_not_block_revival(db, bot, session):
+    """Sent-строка с ДРУГОЙ датой легитимному воскрешению не мешает.
+
+    Старое напоминание отработало давно; сегодня запись отменили и завели
+    дело на новую дату. Гард сравнивает сроки: отправка по другой дате —
+    не дубль, воскрешение обязано пройти.
+    """
+    now = int(time.time())
+    old_due = now - 7200
+    await db.add_reminder(1, OLD_TEXT, old_due, "deal", DEAL, 14)
+    bx_old = FakeTodoBitrix([todo(14, dates.epoch_to_iso(old_due))])
+    assert await tasks.send_due_reminders(bot, db, now_ts=old_due + 5, bitrix=bx_old) == 1
+
+    # Новый срок поставили через бота, затем дело завершили — отмена.
+    await db.add_reminder(1, OLD_TEXT, now + 3600, "deal", DEAL, 16)
+    assert await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db) == 1
+    assert await db.pending_deal_reminder(DEAL) is None
+
+    # Через пару минут в карточке завели дело на новую дату.
+    new_due = now + 7200
+    bx = FakeTodoBitrix([todo(17, dates.epoch_to_iso(new_due), subject="Перезвонить")])
+    await tasks.reconcile_deal_reminders(bx, db, now_ts=now)
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None  # воскрешение живо
+    assert pending["activity_id"] == 17
+    assert pending["due_ts"] == new_due
+
+
+async def test_sent_guard_boundary_is_sync_tolerance(db, bot, session):
+    """Граница sent-гарда — минутный допуск сверки, секунды жёсткие.
+
+    Дело на 60 секунд позже отправленного срока — уже ДРУГАЯ дата (точность
+    портала — минута), воскрешение живо; на 59 — та же, воскрешение
+    режется. Порог зажат с обеих сторон: мутант не может ни расширить его
+    (перестало бы воскресать легитимное), ни сузить (пролез бы дубль).
+    """
+    now = int(time.time())
+    # Две сделки с одинаковой историей: отменённый хвост + напоминание,
+    # отправленное в момент `now`. Разница только в сроке нового дела.
+    for deal_id in (301, 302):
+        await db.add_reminder(1, f"заявка №{deal_id}", now + 3600, "deal", deal_id, 14)
+    assert await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db) == 2
+    for deal_id, act in ((301, 16), (302, 26)):
+        await db.add_reminder(1, f"заявка №{deal_id}", now, "deal", deal_id, act)
+    bx_send = FakeTodoBitrix(
+        [
+            todo(16, dates.epoch_to_iso(now), deal_id=301),
+            todo(26, dates.epoch_to_iso(now), deal_id=302),
+        ]
+    )
+    assert await tasks.send_due_reminders(bot, db, now_ts=now + 5, bitrix=bx_send) == 2
+
+    # Дела бота завершили; в карточках завели новые: +60с и +59с к сроку.
+    bx = FakeTodoBitrix(
+        [
+            todo(17, dates.epoch_to_iso(now + 60), deal_id=301),
+            todo(27, dates.epoch_to_iso(now + 59), deal_id=302),
+        ]
+    )
+    await tasks.reconcile_deal_reminders(bx, db, now_ts=now + 10)
+
+    revived = await db.pending_deal_reminder(301)
+    assert revived is not None  # ровно допуск — другая дата, воскресло
+    assert revived["due_ts"] == now + 60
+    assert await db.pending_deal_reminder(302) is None  # 59с — тот же срок
+
+
 # ---------------------------------------------------------------------------
 # Устойчивость планировщика
 # ---------------------------------------------------------------------------

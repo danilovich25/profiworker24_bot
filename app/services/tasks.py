@@ -306,7 +306,10 @@ async def revive_from_todos(
     здесь значило бы транзиентно блокировать воскрешение при живых делах
     у сделки; его минута настала — напоминание уходит немедленно.
     От дублей защищает CAS в revive_reminder: запись не оживает, пока у
-    сделки есть другое ожидающее напоминание.
+    сделки есть другое ожидающее напоминание, и не оживает по сроку, по
+    которому у сделки уже есть ОТПРАВЛЕННАЯ запись (в пределах того же
+    допуска) — иначе в первую минуту после отправки открытое дело бота
+    воскрешало бы отменённый хвост и слало второй «⏰» задним числом.
     """
     if now_ts is None:
         now_ts = int(time.time())
@@ -317,7 +320,9 @@ async def revive_from_todos(
     if due_ts < now_ts - SYNC_TOLERANCE_SECONDS:
         return None
     text = _text_with_deadline(str(reminder["text"]), due_ts)
-    if not await db.revive_reminder(reminder["id"], due_ts, text, activity_id):
+    if not await db.revive_reminder(
+        reminder["id"], due_ts, text, activity_id, SYNC_TOLERANCE_SECONDS
+    ):
         return None
     log.info(
         "Напоминание id=%s воскрешено делом id=%s (сделка %s)",
