@@ -18,6 +18,7 @@ import time
 from datetime import datetime
 from typing import Any
 
+import aiosqlite
 import pytest
 from fast_bitrix24.server_response import ErrorInServerResponseException
 
@@ -443,6 +444,185 @@ async def test_cancelled_reminder_ignores_overdue_todo(db, bot, session):
     assert await db.pending_deal_reminder(DEAL) is None
     assert await tasks.send_due_reminders(bot, db, now_ts=now + 10, bitrix=bx) == 0
     assert session.sent_texts == []
+
+
+async def test_revival_window_counts_from_cancellation_not_creation(db):
+    """Окно воскрешения отсчитывается от момента ОТМЕНЫ, а не создания записи.
+
+    Живой провал: заявка со сроком «через две недели» создана десять дней
+    назад; сегодня заказчик завершил дело бота (сверка отменила запись) и
+    через пару минут завёл в карточке своё дело в будущем. Окно по
+    created_at такую запись не видит никогда — хотя отменили её только что,
+    и воскрешение обязано её подобрать.
+    """
+    now = int(time.time())
+    due = now + 4 * 86400
+    text = f"заявка №78 — повесить люстру. Срок: {dates.format_epoch(due)}"
+    rid = await db.add_reminder(1, text, due, "deal", DEAL, 14)
+    # Запись живёт в базе десять дней (заявку завели сильно заранее).
+    async with aiosqlite.connect(db.path) as conn:
+        await conn.execute(
+            "UPDATE reminders SET created_at = datetime('now', '-10 days') "
+            "WHERE id = ?",
+            (rid,),
+        )
+        await conn.commit()
+
+    # Сегодня: дело бота завершили — сверка отменяет запись.
+    assert await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db) == 1
+    assert await db.pending_deal_reminder(DEAL) is None
+
+    # Через пару минут в карточке завели своё дело со сроком в будущем.
+    manual_due = now + 2 * 3600
+    bx = FakeTodoBitrix(
+        [todo(16, dates.epoch_to_iso(manual_due), subject="Позвонить клиенту")]
+    )
+    await tasks.reconcile_deal_reminders(bx, db)
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None  # отмена была только что — запись в окне
+    assert pending["activity_id"] == 16
+    assert pending["due_ts"] == manual_due
+
+
+async def test_old_schema_reminders_migrate_and_stay_revivable(tmp_path):
+    """База прежней схемы (без cancelled_at) мигрирует без потери кандидатов.
+
+    На проде база живая: колонка добавляется ALTER TABLE, а старым
+    отменённым строкам моментом отмены назначается created_at — недавно
+    отменённые остаются кандидатами на воскрешение, как и до миграции.
+    """
+    path = str(tmp_path / "old.db")
+    async with aiosqlite.connect(path) as conn:
+        await conn.execute(
+            """CREATE TABLE reminders (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id     INTEGER NOT NULL,
+                text        TEXT NOT NULL,
+                due_ts      INTEGER NOT NULL,
+                kind        TEXT NOT NULL DEFAULT 'deal',
+                entity_id   INTEGER,
+                activity_id INTEGER,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            )"""
+        )
+        await conn.execute(
+            "INSERT INTO reminders (chat_id, text, due_ts, kind, entity_id, "
+            "activity_id, status, created_at) "
+            "VALUES (1, ?, ?, 'deal', ?, 14, 'cancelled', "
+            "datetime('now', '-1 day'))",
+            (OLD_TEXT, OLD_DUE, DEAL),
+        )
+        await conn.commit()
+
+    database = Database(path)
+    await database.init()  # миграция живой базы
+
+    rows = await database.cancelled_deal_reminders()
+    assert [r["entity_id"] for r in rows] == [DEAL]
+
+
+async def test_boundary_todo_does_not_block_revival(db, bot, session):
+    """Дело на границе «сейчас» не блокирует воскрешение напоминания.
+
+    Дело в пределах минутного допуска классифицируется ненаступившим и
+    побеждает будущие. Отвергать его воскрешением — транзиентно хоронить
+    напоминание при живых делах у сделки. Его минута настала: запись
+    воскресает и уходит немедленно.
+    """
+    now = int(time.time())
+    await db.add_reminder(1, OLD_TEXT, now + 3600, "deal", DEAL, 14)
+    assert await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db) == 1
+    assert await db.pending_deal_reminder(DEAL) is None
+
+    boundary = now - 30  # в пределах допуска от «сейчас»
+    bx = FakeTodoBitrix(
+        [
+            todo(16, dates.epoch_to_iso(boundary), subject="Минута настала"),
+            todo(17, dates.epoch_to_iso(now + 3600)),
+        ]
+    )
+    await tasks.reconcile_deal_reminders(bx, db, now_ts=now)
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None  # воскрешение не заблокировано
+    assert pending["activity_id"] == 16
+    assert await tasks.send_due_reminders(bot, db, now_ts=now, bitrix=bx) == 1
+    assert "заявка №78" in session.sent_texts[-1]
+
+
+async def test_todo_exactly_at_tolerance_edge_still_revives(db):
+    """Дело ровно на границе допуска (−60 секунд) ещё воскрешает запись.
+
+    Граница воскрешения обязана совпадать с границей nearest_todo, иначе
+    дело, которое сверка считает ненаступившим, блокировало бы воскрешение.
+    Секунды в тесте жёсткие: они фиксируют сам порог.
+    """
+    now = int(time.time())
+    await db.add_reminder(1, OLD_TEXT, now + 3600, "deal", DEAL, 14)
+    assert await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db) == 1
+
+    bx = FakeTodoBitrix([todo(16, dates.epoch_to_iso(now - 60))])
+    await tasks.reconcile_deal_reminders(bx, db, now_ts=now)
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None
+    assert pending["due_ts"] == now - 60
+
+
+async def test_cancelled_scan_does_not_starve_any_record(db):
+    """Каждая отменённая запись рано или поздно попадает в проход воскрешения.
+
+    Кандидатов в окне больше, чем LIMIT одного прохода: детерминированный
+    порядок навсегда прятал бы «лишние» записи за верхушкой — они не
+    воскресли бы никогда. Случайный порядок даёт каждой записи шанс на
+    каждом проходе (вероятность пропуска за 200 проходов — исчезающая).
+    """
+    now = int(time.time())
+    deal_ids = list(range(1001, 1026))  # 25 сделок > лимита прохода (20)
+    for deal_id in deal_ids:
+        rid = await db.add_reminder(
+            1, f"заявка №{deal_id}", now + 3600, "deal", deal_id, 14
+        )
+        assert await db.cancel_reminder(rid)
+
+    seen: set[int] = set()
+    for _ in range(200):
+        seen.update(r["entity_id"] for r in await db.cancelled_deal_reminders())
+        if seen == set(deal_ids):
+            break
+    assert seen == set(deal_ids)
+
+
+async def test_one_deal_tails_do_not_eat_scan_slots(db):
+    """Хвосты отменённых записей одной сделки не вытесняют другие сделки.
+
+    Отменённые записи не удаляются, и у одной сделки их копится много
+    (правки срока, повторные отмены). От сделки в проход обязана идти одна
+    запись — самая свежая, с актуальным текстом: иначе двадцать хвостов
+    одной сделки съедали бы весь лимит прохода, а соседняя сделка не
+    попадала бы в сверку никогда.
+    """
+    now = int(time.time())
+    starved = await db.add_reminder(
+        1, "заявка №200 — прочистить трубу", now + 3600, "deal", 200, 14
+    )
+    assert await db.cancel_reminder(starved)
+    last_tail = None
+    for attempt in range(25):
+        last_tail = await db.add_reminder(
+            1, f"заявка №78 — правка {attempt}", now + 3600, "deal", DEAL, 14
+        )
+        assert await db.cancel_reminder(last_tail)
+
+    rows = await db.cancelled_deal_reminders()
+
+    by_deal = {r["entity_id"]: r for r in rows}
+    assert set(by_deal) == {DEAL, 200}  # обе сделки в одном проходе
+    assert by_deal[DEAL]["id"] == last_tail  # от сделки — самая свежая запись
+    assert len(rows) == 2
 
 
 async def test_revival_does_not_duplicate_live_pending(db):

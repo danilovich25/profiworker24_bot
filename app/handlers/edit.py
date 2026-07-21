@@ -621,11 +621,20 @@ async def _reschedule_reminders(
     deal_id: int,
     new_deadline: str,
 ) -> None:
-    """Переносит Telegram-напоминание и дело CRM на новый срок (best-effort)."""
+    """Переносит Telegram-напоминание и дело CRM на новый срок (best-effort).
+
+    Старые записи очереди снимаются НЕ здесь, а атомарно вместе с
+    постановкой новой (db.replace_deal_reminder): между чтением очереди и
+    записью нового срока эта функция ходит в CRM, и раздельные снятие и
+    постановка оставляли окно, в котором параллельная сверка воскрешала
+    отменённую запись — очередь получала два pending по одной сделке.
+    """
     pending = await db.pending_deal_reminder(deal_id)
-    await db.drop_pending_deal_reminders(deal_id)
     due_ts = dates.reminder_epoch(new_deadline)
     if due_ts is None or due_ts <= int(dates.now_local().timestamp()):
+        # Новый срок в прошлом или не разобрался: напоминания снимаются,
+        # новое не ставится.
+        await db.drop_pending_deal_reminders(deal_id)
         return
     activity_id = pending["activity_id"] if pending else None
     _, problem = split_title(deal.get("TITLE"))
@@ -658,15 +667,14 @@ async def _reschedule_reminders(
             )
     except Exception:
         log.exception("Дело-напоминание сделки %s не перенесено", deal_id)
-    await db.add_reminder(
+    await db.replace_deal_reminder(
+        deal_id,
         message.chat.id,
         text=(
             f"заявка №{deal_id} — {problem}. "
             f"Срок: {dates.format_deadline(new_deadline)}"
         ),
         due_ts=due_ts,
-        kind="deal",
-        entity_id=deal_id,
         activity_id=activity_id,
     )
 

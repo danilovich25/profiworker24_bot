@@ -16,7 +16,7 @@ from app.db import Database
 from app.handlers import edit as edit_handlers
 from app.handlers import routers
 from app.main import create_dispatcher
-from app.services import dates, llm
+from app.services import dates, llm, tasks
 from app.services.bitrix import UF_EXPENSE, UF_PROFIT, UF_SERVICE_CATEGORY
 from tests.conftest import make_callback_update, make_message_update
 from tests.test_search import FakeSearchBitrix
@@ -481,6 +481,73 @@ async def test_open_card_revives_cancelled_reminder(flow):
     assert pending is not None
     assert pending["activity_id"] == 600
     assert pending["due_ts"] == manual_due
+
+
+class RevivingBitrix(FakeSearchBitrix):
+    """Портал, при чтении дел которого успевает пройти параллельная сверка.
+
+    Первый crm.activity.list (чтение дел при правке срока) «одновременно»
+    воскрешает отменённое напоминание сделки — ровно так вклинивается
+    reconcile_deal_reminders из соседней задачи планировщика, пока правка
+    ходит в CRM между снятием старых записей очереди и постановкой новой.
+    """
+
+    def __init__(self, db: Database, deal_id: int) -> None:
+        super().__init__()
+        self._db = db
+        self._deal_id = deal_id
+        self._revived = False
+
+    async def _dispatch(self, method: str, params: dict):
+        result = await super()._dispatch(method, params)
+        if method == "crm.activity.list" and not self._revived:
+            self._revived = True
+            cancelled = await self._db.cancelled_deal_reminder(self._deal_id)
+            assert cancelled is not None
+            revived = await tasks.revive_from_todos(
+                self._db,
+                {**cancelled, "entity_id": self._deal_id},
+                list(self.deal_todos),
+                int(dates.now_local().timestamp()),
+            )
+            assert revived is not None  # гонка реальна: воскрешение прошло
+        return result
+
+
+async def test_deadline_edit_survives_parallel_revival(tmp_path, bot, monkeypatch):
+    """Правка срока не плодит второе напоминание рядом с воскрешением.
+
+    Снятие старых записей и постановка новой разделены походом в CRM: в это
+    окно параллельная сверка воскрешала отменённую запись, очередь получала
+    два pending — сотруднику ушло бы два сообщения. Замена обязана быть
+    одной транзакцией: воскрешённая запись либо режется ею, либо (после
+    замены) отсекается NOT EXISTS в revive_reminder.
+    """
+    freeze_now(monkeypatch)
+    db = Database(str(tmp_path / "race.db"))
+    await db.init()
+    old_due = int(datetime(2026, 7, 25, 10, 0, tzinfo=VVO).timestamp())
+    rid = await db.add_reminder(
+        1, "заявка №154 — замена крана. Срок: 25.07.2026 10:00",
+        old_due, "deal", 154, 500,
+    )
+    assert await db.cancel_reminder(rid)
+    bx = RevivingBitrix(db, 154)
+    # Дело в карточке живо, срок в будущем (22.07 10:00 ВВО к FROZEN_NOW).
+    bx.deal_todos.append(deal_todo_row(600, 154, "2026-07-22T03:00:00+03:00"))
+    message = SimpleNamespace(chat=SimpleNamespace(id=1))
+
+    await edit_handlers._reschedule_reminders(
+        message, db, bx, bx.deals[0], 154, "2026-07-24T10:00:00"
+    )
+
+    rows = [r for r in await db.pending_deal_reminders() if r["entity_id"] == 154]
+    assert len(rows) == 1  # ровно одно напоминание, не дубль
+    new_due = int(datetime(2026, 7, 24, 10, 0, tzinfo=VVO).timestamp())
+    assert rows[0]["due_ts"] == new_due
+    # Существующее дело перенесено на новый срок, второе не создано.
+    assert bx.activities == []
+    assert bx.activity_updates[0]["id"] == 600
 
 
 async def test_new_request_button_does_not_wipe_unsaved_edits(flow):
