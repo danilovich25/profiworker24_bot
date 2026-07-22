@@ -40,6 +40,7 @@ from app.services.bitrix import (
     BitrixClient,
     MalformedBitrixResponse,
     call_once,
+    is_server_refusal,
     list_all_checked,
     list_deal_todos,
     require_positive_id,
@@ -118,6 +119,50 @@ async def find_reminder_task(bx: BitrixClient, key: str) -> int | None:
         "tasks.task.list", {"filter": {"TAG": _key_tag(key)}, "select": ["ID"]}
     )
     return require_positive_id(rows[0]["id"], "tasks.task.list") if rows else None
+
+
+# Статус задачи Bitrix24 «завершена» (STATUS в tasks.task.*): напоминать
+# больше не о чем. «Ждёт контроля» (4) завершением не считается — пинг
+# полезен, пока постановщик не подтвердил результат.
+TASK_STATUS_COMPLETED = "5"
+
+
+async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | None:
+    """Задача Bitrix24 (tasks.task.get) с полями срока и статуса.
+
+    None — портал ЯВНО ответил, что задачи нет (удалена или недоступна):
+    такой исход однозначен. Транспортные сбои пробрасываются — их исход
+    неизвестен, и решение (fail-open) остаётся за вызывающим.
+    Поля ответа tasks.task.get приходят в нижнем регистре (deadline, status).
+    """
+    try:
+        result = await call_once(
+            bx,
+            "tasks.task.get",
+            {"taskId": task_id, "select": ["ID", "DEADLINE", "STATUS"]},
+        )
+    except Exception as exc:
+        if is_server_refusal(exc):
+            return None
+        raise
+    if not isinstance(result, dict):
+        raise MalformedBitrixResponse("Bitrix вернул неверный result для tasks.task.get")
+    return result
+
+
+async def complete_reminder_task(bx: BitrixClient, task_id: int) -> bool:
+    """Завершает задачу-напоминание (tasks.task.complete), best-effort.
+
+    Вызывается при отмене напоминания через бота: иначе Bitrix продолжал бы
+    слать свой колокольчик по отменённому. Сбой только логируется — Telegram-
+    пинг уже снят, а задачу заказчик может закрыть и руками.
+    """
+    try:
+        await call_once(bx, "tasks.task.complete", {"taskId": task_id})
+    except Exception:
+        log.warning("Задача-напоминание %s не завершена в Bitrix24", task_id, exc_info=True)
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +459,79 @@ async def resync_deal_reminder(
         await rearm_deal_reminder(db, {**sent, "entity_id": deal_id}, todos, now_ts)
 
 
+async def sync_task_reminder(
+    bx: BitrixClient,
+    db: Database,
+    reminder: dict[str, Any],
+    now_ts: int | None = None,
+) -> dict[str, Any] | None:
+    """Сверяет отдельное напоминание с его задачей Bitrix24; None — снято.
+
+    Правила (источник правды — задача tasks.task.get):
+    - задача удалена или завершена — пинг отменяется: с напоминанием
+      разобрались в портале;
+    - крайний срок перенесли — пинг переезжает за ним (в обе стороны);
+    - срок пуст или не разобрался — fail-open по сохранённому сроку: это
+      не решение заказчика;
+    - портал недоступен или повис (дедлайн SYNC_CRM_DEADLINE) — fail-open,
+      молчание хуже пинга по чуть устаревшей дате.
+    """
+    task_id = reminder.get("entity_id")
+    if not task_id:
+        return reminder
+    try:
+        async with asyncio.timeout(SYNC_CRM_DEADLINE):
+            task = await get_reminder_task(bx, int(task_id))
+    except Exception:
+        log.warning(
+            "Задача %s не прочитана — пинг живёт по сохранённому сроку",
+            task_id,
+            exc_info=True,
+        )
+        return reminder
+    if task is None or str(task.get("status")) == TASK_STATUS_COMPLETED:
+        if await db.cancel_reminder(reminder["id"]):
+            log.info(
+                "Пинг id=%s снят: задача %s завершена или удалена",
+                reminder["id"],
+                task_id,
+            )
+        return None
+    due_ts = dates.bitrix_deadline_epoch(task.get("deadline"))
+    if due_ts is None:
+        return reminder
+    if abs(due_ts - int(reminder["due_ts"])) < SYNC_TOLERANCE_SECONDS:
+        return reminder
+    text = _text_with_deadline(str(reminder["text"]), due_ts)
+    if not await db.reschedule_reminder(
+        reminder["id"], due_ts, text, reminder.get("activity_id")
+    ):
+        # Запись уже не pending (параллельная отправка/отмена) — как есть.
+        return reminder
+    log.info("Пинг id=%s перенесён за задачей %s", reminder["id"], task_id)
+    return {**reminder, "due_ts": due_ts, "text": text}
+
+
+async def reconcile_task_reminders(
+    bx: BitrixClient, db: Database, now_ts: int | None = None
+) -> int:
+    """Сверяет ожидающие пинги отдельных напоминаний с задачами Bitrix24.
+
+    Тот же рисунок, что у reconcile_deal_reminders: по каждой ожидающей
+    записи один tasks.task.get, ошибки одной записи не мешают остальным.
+    Возвращает счёт сверенных.
+    """
+    count = 0
+    for reminder in await db.pending_task_reminders():
+        try:
+            await sync_task_reminder(bx, db, reminder, now_ts)
+        except Exception:
+            log.exception("Сверка пинга id=%s не удалась", reminder["id"])
+            continue
+        count += 1
+    return count
+
+
 async def reconcile_deal_reminders(
     bx: BitrixClient, db: Database, now_ts: int | None = None
 ) -> int:
@@ -492,9 +610,14 @@ async def send_due_reminders(
         now_ts = int(time.time())
     sent = 0
     for reminder in await db.due_reminders(now_ts):
-        if bitrix is not None and reminder.get("kind") == "deal":
+        if bitrix is not None and reminder.get("kind") in ("deal", "task"):
+            syncer = (
+                sync_deal_reminder
+                if reminder.get("kind") == "deal"
+                else sync_task_reminder
+            )
             try:
-                synced = await sync_deal_reminder(bitrix, db, reminder, now_ts)
+                synced = await syncer(bitrix, db, reminder, now_ts)
             except Exception:
                 log.exception(
                     "Сверка напоминания id=%s не удалась — шлю по сохранённому сроку",
@@ -552,6 +675,7 @@ async def reminder_loop(bot: Any, db: Database, bitrix: BitrixClient | None = No
         try:
             if bitrix is not None and tick % reconcile_every == 0:
                 await reconcile_deal_reminders(bitrix, db)
+                await reconcile_task_reminders(bitrix, db)
             await send_due_reminders(bot, db, bitrix=bitrix)
         except Exception:
             log.exception("Проход планировщика напоминаний не удался")

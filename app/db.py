@@ -1214,6 +1214,34 @@ class Database:
             for row in rows
         ]
 
+    async def pending_task_reminders(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Неотправленные пинги отдельных напоминаний — для сверки с задачами.
+
+        Как pending_deal_reminders, но по kind='task': entity_id здесь —
+        номер задачи Bitrix24 (tasks.task.add), и заказчик правит её срок
+        или завершает прямо в портале.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, kind, entity_id, activity_id "
+                "FROM reminders WHERE kind = 'task' AND status = ? "
+                "AND entity_id IS NOT NULL ORDER BY due_ts LIMIT ?",
+                (REMINDER_PENDING, limit),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "chat_id": row[1],
+                "text": row[2],
+                "due_ts": row[3],
+                "kind": row[4],
+                "entity_id": row[5],
+                "activity_id": row[6],
+            }
+            for row in rows
+        ]
+
     async def cancelled_deal_reminder(self, deal_id: int) -> dict[str, Any] | None:
         """Последнее отменённое напоминание сделки — кандидат на воскрешение.
 
