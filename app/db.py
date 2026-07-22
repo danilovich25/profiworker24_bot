@@ -148,7 +148,8 @@ CREATE TABLE IF NOT EXISTS reminders (
     attempts    INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     cancelled_at TEXT DEFAULT NULL,
-    sent_at     TEXT DEFAULT NULL
+    sent_at     TEXT DEFAULT NULL,
+    rearm_checked_at TEXT DEFAULT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, due_ts);
 """
@@ -269,6 +270,14 @@ class Database:
                 # попадать в скан сразу после пинга.
                 await conn.execute(
                     "ALTER TABLE reminders ADD COLUMN sent_at TEXT DEFAULT NULL"
+                )
+            if "rearm_checked_at" not in reminder_columns:
+                # Момент последнего скана перевооружения: честная ротация
+                # «давно не проверявшиеся — первыми» вместо случайного
+                # порядка, у которого выборки перекрывались и хвост бэклога
+                # мог голодать. NULL = ещё не сканировалась, идёт первой.
+                await conn.execute(
+                    "ALTER TABLE reminders ADD COLUMN rearm_checked_at TEXT DEFAULT NULL"
                 )
             # Бэкфилы — вне веток ALTER и идемпотентные: упади процесс между
             # добавлением колонки и заполнением, следующий старт долечит.
@@ -1187,21 +1196,22 @@ class Database:
         на проход, а sent-строка остаётся у каждой отработавшей заявки
         навсегда. Сделки с ожидающим напоминанием не возвращаются — их и
         так ведёт обычная сверка. От каждой сделки — одна запись, самая
-        свежая; порядок случайный (см. cancelled_deal_reminders: те же
-        причины — кандидатов может быть больше limit).
+        свежая.
 
-        Ёмкость по построению конечна: limit сделок в проход, проходы раз в
-        RECONCILE_INTERVAL, grace перевооружения — два интервала. То есть в
-        пределах grace сканируются до 3*limit сделок — заведомо больше
-        реального бэклога портала (единицы заявок в день); ещё больший
-        одномоментный бэклог сознательно не гонится за полнотой, а платит
-        поздним пингом только за хвост дальше 3*limit.
+        Порядок — честная ротация по rearm_checked_at (давно не
+        проверявшиеся и ещё не проверявшиеся первыми; отметку ставит
+        mark_rearm_checked после успешного скана): каждая запись в окне
+        гарантированно сканируется не реже, чем раз в ceil(N/limit)
+        проходов. Случайный порядок без памяти давал перекрытия выборок —
+        сделка, чей пинг только что ушёл, возвращалась в пул и могла
+        вытеснять ещё не проверенные, и хвост большого бэклога выходил за
+        grace перевооружения непросканированным.
         """
         async with aiosqlite.connect(self.path) as conn:
             cur = await conn.execute(
                 "SELECT id, chat_id, text, due_ts, kind, entity_id, activity_id "
                 "FROM (SELECT r.id, r.chat_id, r.text, r.due_ts, r.kind, "
-                "r.entity_id, r.activity_id, ROW_NUMBER() OVER "
+                "r.entity_id, r.activity_id, r.rearm_checked_at, ROW_NUMBER() OVER "
                 "(PARTITION BY r.entity_id ORDER BY r.id DESC) AS rn "
                 "FROM reminders AS r WHERE r.kind = 'deal' AND r.status = ? "
                 "AND r.entity_id IS NOT NULL "
@@ -1209,7 +1219,8 @@ class Database:
                 "AND NOT EXISTS (SELECT 1 FROM reminders AS p "
                 "WHERE p.kind = 'deal' AND p.entity_id = r.entity_id "
                 "AND p.status = ?)) "
-                "WHERE rn = 1 ORDER BY RANDOM() LIMIT ?",
+                "WHERE rn = 1 "
+                "ORDER BY COALESCE(rearm_checked_at, '') ASC, id ASC LIMIT ?",
                 (
                     REMINDER_SENT,
                     f"-{SENT_REARM_WINDOW_SECONDS} seconds",
@@ -1400,6 +1411,19 @@ class Database:
             }
             for row in rows
         ]
+
+    async def mark_rearm_checked(self, reminder_id: int) -> None:
+        """Отмечает sent-строку просканированной — двигает ротацию скана.
+
+        Ставится ТОЛЬКО после успешного чтения дел сделки: сбой чтения
+        отметку не получает, и сделка не теряет приоритет следующего прохода.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            await conn.execute(
+                "UPDATE reminders SET rearm_checked_at = datetime('now') WHERE id = ?",
+                (reminder_id,),
+            )
+            await conn.commit()
 
     async def cancelled_deal_reminder(self, deal_id: int) -> dict[str, Any] | None:
         """Последнее отменённое напоминание сделки — кандидат на воскрешение.

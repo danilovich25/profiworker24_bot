@@ -1004,6 +1004,66 @@ async def test_rearm_skips_long_overdue_todo(db, bot, session):
     assert await db.pending_deal_reminder(DEAL) is None
 
 
+async def test_sent_scan_rotates_without_starvation(db, bot, session):
+    """Скан sent-строк — честная ротация: давно не проверявшиеся первыми.
+
+    Случайный порядок без памяти давал перекрытия выборок: сделка, чей пинг
+    только что ушёл, возвращалась в пул и могла вытеснять ещё не
+    проверенные. Теперь порядок по rearm_checked_at — каждая запись
+    гарантированно сканируется не реже, чем раз в ceil(N/limit) проходов.
+    """
+    now = int(time.time())
+    for deal_id in (78, 79, 80):
+        await db.add_reminder(
+            1, f"заявка №{deal_id}. Срок: скоро", now - 300, "deal", deal_id, deal_id * 10
+        )
+    assert await tasks.send_due_reminders(bot, db, now_ts=now, bitrix=None) == 3
+
+    seen = []
+    for _ in range(3):
+        rows = await db.sent_deal_reminders(limit=1)
+        assert len(rows) == 1
+        seen.append(rows[0]["entity_id"])
+        await db.mark_rearm_checked(rows[0]["id"])
+
+    assert sorted(seen) == [78, 79, 80]  # три прохода покрывают все три сделки
+
+    # Четвёртый проход возвращается к началу ротации, ничего не голодает.
+    rows = await db.sent_deal_reminders(limit=1)
+    assert rows[0]["entity_id"] == seen[0]
+
+
+async def test_reconcile_marks_scanned_sent_rows(db, bot, session):
+    """Проход сверки отмечает просканированные sent-строки для ротации.
+
+    Сбой чтения дел отметку НЕ ставит: такая сделка не теряет приоритет и
+    перечитывается следующим проходом (fail-open).
+    """
+    now = int(time.time())
+    await db.add_reminder(1, "заявка №78. Срок: скоро", now - 300, "deal", DEAL, 14)
+    assert await tasks.send_due_reminders(bot, db, now_ts=now, bitrix=None) == 1
+
+    await tasks.reconcile_deal_reminders(FakeTodoBitrix([]), db, now_ts=now)
+    async with aiosqlite.connect(db.path) as conn:
+        cur = await conn.execute(
+            "SELECT rearm_checked_at FROM reminders WHERE status = 'sent'"
+        )
+        checked = [row[0] for row in await cur.fetchall()]
+    assert checked and all(checked)
+
+    # Второй sent — портал недоступен: отметка не ставится, приоритет цел.
+    await db.add_reminder(1, "заявка №79. Срок: скоро", now - 300, "deal", 79, 21)
+    assert await tasks.send_due_reminders(bot, db, now_ts=now, bitrix=None) == 1
+    await tasks.reconcile_deal_reminders(FakeTodoBitrix(fail=True), db, now_ts=now)
+    async with aiosqlite.connect(db.path) as conn:
+        cur = await conn.execute(
+            "SELECT rearm_checked_at FROM reminders "
+            "WHERE status = 'sent' AND entity_id = 79"
+        )
+        row = await cur.fetchone()
+    assert row is not None and row[0] is None
+
+
 async def test_sent_scan_window_limits_rearm_cost(db, bot, session):
     """Давно отправленные записи не сканируются: окно перевооружения конечно.
 

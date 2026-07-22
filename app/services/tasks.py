@@ -658,8 +658,11 @@ async def reconcile_deal_reminders(
         try:
             todos = await _read_deal_todos(bx, int(deal_id))
             if todos is None:
+                # Отметка ротации не ставится: сделка не теряет приоритет
+                # и перечитывается следующим проходом.
                 continue
             await rearm_deal_reminder(db, reminder, todos, now_ts)
+            await db.mark_rearm_checked(reminder["id"])
         except Exception:
             log.exception(
                 "Перевооружение после напоминания id=%s не удалось", reminder["id"]
