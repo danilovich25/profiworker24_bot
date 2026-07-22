@@ -81,6 +81,16 @@ def test_parse_human_date(text, expected):
     assert dates.parse_human_date(text, NOW) == expected
 
 
+def test_feb29_rollover_does_not_crash():
+    """29 февраля прошедшего високосного года: следующего года не существует.
+
+    Ролловер обязан вернуть None (переспрос), а не уронить разбор ValueError.
+    """
+    after_leap = datetime(2028, 3, 1, 12, 0, tzinfo=VVO)
+    assert dates.parse_human_date("29 февраля", after_leap) is None
+    assert dates.parse_human_date("29.02", after_leap) is None
+
+
 @pytest.mark.parametrize(
     "text",
     [

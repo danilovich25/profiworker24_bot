@@ -298,17 +298,23 @@ async def _schedule_deal_reminder(
 async def _schedule_task_reminder(
     message: Message, db: Database, order: ParsedOrder, task_id: int
 ) -> None:
-    """Telegram-напоминание к задаче-напоминанию (intent=reminder)."""
+    """Telegram-напоминание к задаче-напоминанию (intent=reminder).
+
+    Идемпотентно по задаче (db.spawn_task_reminder): вызывается на ЛЮБОМ
+    пути, где задача существует, включая «ответ task.add потерялся, сверка
+    нашла id» — раньше этот путь оставлял очередь пустой, хотя пользователю
+    обещан пинг. Повторная доставка сообщения дубля не создаёт, отменённый
+    пользователем пинг не воскрешает.
+    """
     due_ts = dates.reminder_epoch(order.deadline)
     if due_ts is None or due_ts <= int(dates.now_local().timestamp()):
         return
     try:
-        await db.add_reminder(
+        await db.spawn_task_reminder(
+            task_id,
             message.chat.id,
             text=f"{order.problem}. Срок: {dates.format_deadline(order.deadline)}",
             due_ts=due_ts,
-            kind="task",
-            entity_id=task_id,
         )
     except Exception:
         log.exception("Telegram-напоминание для задачи %s не записано", task_id)
@@ -985,9 +991,6 @@ async def _create_reminder(
     # Первая буква — заглавная: заголовок задачи читается как фраза.
     title = title[:1].upper() + title[1:] if title else "Напоминание"
     add_sent = False
-    # True только когда задача создана ИМЕННО этим вызовом: найденная сверкой
-    # или предпроверкой задача своё Telegram-напоминание уже получила.
-    task_created = False
     try:
         async with asyncio.timeout(CRM_DEADLINE):
             fence = await db.get_or_create_task_fence(key)
@@ -1023,7 +1026,6 @@ async def _create_reminder(
                             task_id = await create_reminder_task(
                                 bitrix, title, deadline=order.deadline, key=key
                             )
-                            task_created = True
                         except Exception as exc:
                             if is_server_refusal(exc):
                                 # Сбрасывается только граница именно этого
@@ -1071,9 +1073,10 @@ async def _create_reminder(
     if on_task_settled is not None:
         on_task_settled()
     await asyncio.shield(db.complete_task_fence(key, task_id))
-    if task_created:
-        # Гарантированный канал: бот сам напишет в Telegram в момент срока.
-        await _schedule_task_reminder(message, db, order, task_id)
+    # Гарантированный канал: бот сам напишет в Telegram в момент срока.
+    # Ставится на любом пути существования задачи (в т.ч. найденной сверкой
+    # после потерянного ответа add) — вставка идемпотентна по задаче.
+    await _schedule_task_reminder(message, db, order, task_id)
     try:
         await message.answer(REMINDER_CREATED.format(task_id=task_id))
     except Exception:

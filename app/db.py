@@ -277,10 +277,12 @@ class Database:
                 (REMINDER_CANCELLED,),
             )
             # Отправленным строкам старой схемы момент отправки неизвестен —
-            # назначается created_at: недавние остаются кандидатами
-            # перевооружения, древние отсекаются окном.
+            # назначается момент их СРОКА (due_ts): планировщик шлёт в
+            # пределах секунд от срока, а created_at у записи, созданной
+            # задолго до срока и отправленной перед миграцией, выкидывал бы
+            # её из окна перевооружения сразу.
             await conn.execute(
-                "UPDATE reminders SET sent_at = created_at "
+                "UPDATE reminders SET sent_at = datetime(due_ts, 'unixepoch') "
                 "WHERE status = ? AND sent_at IS NULL",
                 (REMINDER_SENT,),
             )
@@ -1257,6 +1259,104 @@ class Database:
             "entity_id": row[5],
             "status": row[6],
         }
+
+    async def spawn_task_reminder(
+        self, task_id: int, chat_id: int, text: str, due_ts: int
+    ) -> bool:
+        """Ставит Telegram-пинг задаче-напоминанию, если у неё ещё нет записи.
+
+        Идемпотентно по задаче: ЛЮБАЯ существующая запись (pending, sent,
+        cancelled, failed) блокирует вставку — повторная доставка сообщения
+        или сверка после потерянного ответа task.add не должны ни дублировать
+        живой пинг, ни воскрешать отменённый пользователем. Проверка и
+        вставка — один INSERT, гонки двух обработчиков ему безразличны.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "INSERT INTO reminders (chat_id, text, due_ts, kind, entity_id) "
+                "SELECT ?, ?, ?, 'task', ? "
+                "WHERE NOT EXISTS (SELECT 1 FROM reminders "
+                "WHERE kind = 'task' AND entity_id = ?)",
+                (chat_id, text, due_ts, task_id, task_id),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+
+    async def cancelled_task_reminders(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Недавно отменённые пинги задач — кандидаты на воскрешение.
+
+        Зеркало cancelled_deal_reminders для kind='task': завершённую в
+        Bitrix24 задачу могли переоткрыть, и пинг обязан ожить. Окно — от
+        момента отмены, от каждой задачи одна свежая запись, задачи с
+        ожидающим пингом не возвращаются.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, kind, entity_id "
+                "FROM (SELECT r.id, r.chat_id, r.text, r.due_ts, r.kind, "
+                "r.entity_id, ROW_NUMBER() OVER "
+                "(PARTITION BY r.entity_id ORDER BY r.id DESC) AS rn "
+                "FROM reminders AS r WHERE r.kind = 'task' AND r.status = ? "
+                "AND r.entity_id IS NOT NULL "
+                "AND COALESCE(r.cancelled_at, r.created_at) > datetime('now', ?) "
+                "AND NOT EXISTS (SELECT 1 FROM reminders AS p "
+                "WHERE p.kind = 'task' AND p.entity_id = r.entity_id "
+                "AND p.status = ?)) "
+                "WHERE rn = 1 ORDER BY RANDOM() LIMIT ?",
+                (
+                    REMINDER_CANCELLED,
+                    f"-{REVIVE_SCAN_WINDOW_SECONDS} seconds",
+                    REMINDER_PENDING,
+                    limit,
+                ),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "chat_id": row[1],
+                "text": row[2],
+                "due_ts": row[3],
+                "kind": row[4],
+                "entity_id": row[5],
+            }
+            for row in rows
+        ]
+
+    async def revive_task_reminder(
+        self, reminder_id: int, due_ts: int, text: str, sent_guard_seconds: int
+    ) -> bool:
+        """Возвращает отменённый пинг задачи в очередь (CAS по cancelled).
+
+        Те же гарды, что у revive_reminder сделок, в одном UPDATE: не оживать
+        рядом с ожидающим пингом той же задачи и не оживать по сроку, по
+        которому у задачи уже есть отправленная запись (в пределах допуска).
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "UPDATE reminders SET status = ?, due_ts = ?, text = ?, "
+                "attempts = 0, cancelled_at = NULL "
+                "WHERE id = ? AND status = ? "
+                "AND NOT EXISTS (SELECT 1 FROM reminders AS p "
+                "WHERE p.kind = 'task' AND p.entity_id = reminders.entity_id "
+                "AND p.status = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM reminders AS s "
+                "WHERE s.kind = 'task' AND s.entity_id = reminders.entity_id "
+                "AND s.status = ? AND ABS(s.due_ts - ?) < ?)",
+                (
+                    REMINDER_PENDING,
+                    due_ts,
+                    text,
+                    reminder_id,
+                    REMINDER_CANCELLED,
+                    REMINDER_PENDING,
+                    REMINDER_SENT,
+                    due_ts,
+                    sent_guard_seconds,
+                ),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
 
     async def pending_task_reminders(self, limit: int = 200) -> list[dict[str, Any]]:
         """Неотправленные пинги отдельных напоминаний — для сверки с задачами.

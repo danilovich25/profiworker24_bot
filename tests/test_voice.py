@@ -521,6 +521,29 @@ async def test_recognize_voice_short_single_request(respx_mock, stt_settings):
     assert route.call_count == 1
 
 
+async def test_recognize_voice_duration_30_goes_through_split(
+    respx_mock, stt_settings, monkeypatch
+):
+    """Ровно 30 секунд метаданных — уже нарезка: Telegram округляет вниз.
+
+    Реальная длительность такого файла может быть 30.9с — целиком SpeechKit
+    его отверг бы, граница «без нарезки» обязана быть строгой (< 30).
+    """
+    split_calls = {"count": 0}
+
+    async def fake_split(data: bytes) -> list[bytes]:
+        split_calls["count"] += 1
+        return [b"chunk"]
+
+    monkeypatch.setattr(speech, "_split_ogg", fake_split)
+    respx_mock.post(speech.STT_URL).mock(
+        return_value=httpx.Response(200, json={"result": "текст"})
+    )
+
+    assert await speech.recognize_voice(b"OggS...", duration=30) == "текст"
+    assert split_calls["count"] == 1
+
+
 async def test_recognize_voice_long_splits_and_joins(
     respx_mock, stt_settings, monkeypatch
 ):

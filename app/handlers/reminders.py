@@ -15,6 +15,7 @@ intent=reminder в свободном тексте (_create_reminder), — а Te
 
 import logging
 import re
+import time
 from uuid import uuid4
 
 from aiogram import F, Router
@@ -166,7 +167,11 @@ async def _show_reminders(message: Message, db: Database) -> None:
 
 
 @router.message(Command("reminders"))
-async def on_reminders(message: Message, db: Database) -> None:
+async def on_reminders(message: Message, state: FSMContext, db: Database) -> None:
+    # Команда в режиме ввода напоминания закрывает режим, как и кнопка:
+    # иначе следующий текст с датой молча становился бы напоминанием.
+    if await state.get_state() == ReminderFlow.query.state:
+        await state.clear()
     await _show_reminders(message, db)
 
 
@@ -292,6 +297,10 @@ async def on_cancel_reminder(
         or row["kind"] != "task"
         or row["chat_id"] != chat_id
         or row["status"] != REMINDER_PENDING
+        # Наступивший срок не отменяется: планировщик шлёт до отметки, и
+        # «отмена» в этот момент рапортовала бы успех, завершала задачу
+        # Bitrix, а сообщение всё равно приходило.
+        or row["due_ts"] <= int(time.time())
     ):
         await callback.answer(CANCEL_STALE)
         return

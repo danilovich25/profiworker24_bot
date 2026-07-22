@@ -118,7 +118,10 @@ async def recognize_voice(data: bytes, duration: int) -> str:
     """
     if len(data) > BOT_MAX_SIZE_BYTES:
         raise SpeechUnavailable(f"файл больше {BOT_MAX_SIZE_BYTES} байт")
-    if duration <= MAX_DURATION_SECONDS and len(data) <= MAX_SIZE_BYTES:
+    # Граница «без нарезки» строгая: Telegram округляет длительность ВНИЗ,
+    # и файл с duration=30 может реально длиться 30.9с — целиком SpeechKit
+    # его отверг бы.
+    if duration < MAX_DURATION_SECONDS and len(data) <= MAX_SIZE_BYTES:
         return await recognize_ogg(data)
     parts = []
     for chunk in await _split_ogg(data):

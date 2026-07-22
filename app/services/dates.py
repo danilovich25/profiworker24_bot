@@ -172,7 +172,12 @@ def _extract_date(text: str, now: datetime) -> date | None:
             return None
         if match.group(3) is None and found < now.date():
             # «15.01» в июле — про следующий январь, а не про прошедший.
-            found = date(year + 1, month, day)
+            # «29.02» после високосного года в следующем не существует —
+            # это не дата, а повод переспросить, но не падать.
+            try:
+                found = date(year + 1, month, day)
+            except ValueError:
+                return None
         return found
 
     match = _MONTH_NAME_RE.search(text)
@@ -184,8 +189,12 @@ def _extract_date(text: str, now: datetime) -> date | None:
         except ValueError:
             return None
         if match.group(3) is None and found < now.date():
-            # «5 января» в июле — про следующий январь.
-            found = date(year + 1, month, day)
+            # «5 января» в июле — про следующий январь; «29 февраля» после
+            # високосного года в следующем не существует — не дата.
+            try:
+                found = date(year + 1, month, day)
+            except ValueError:
+                return None
         return found
 
     match = _IN_DAYS_RE.search(text)

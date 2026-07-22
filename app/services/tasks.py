@@ -126,13 +126,18 @@ async def find_reminder_task(bx: BitrixClient, key: str) -> int | None:
 # полезен, пока постановщик не подтвердил результат.
 TASK_STATUS_COMPLETED = "5"
 
+# Ответы портала, означающие именно «задачи нет» (tasks.task.get по
+# удалённой задаче). Прочие ЯВНЫЕ отказы (нет прав, квота) задачей-нет НЕ
+# считаются: снятие пинга по ACCESS_DENIED хоронило бы живое напоминание.
+_TASK_MISSING_RE = re.compile(r"не найдена|not\s*found|TASK_NOT_FOUND", re.IGNORECASE)
+
 
 async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | None:
     """Задача Bitrix24 (tasks.task.get) с полями срока и статуса.
 
-    None — портал ЯВНО ответил, что задачи нет (удалена или недоступна):
-    такой исход однозначен. Транспортные сбои пробрасываются — их исход
-    неизвестен, и решение (fail-open) остаётся за вызывающим.
+    None — портал ЯВНО ответил, что ЗАДАЧИ НЕТ (удалена): только такой
+    исход однозначен. Остальные отказы сервера и транспортные сбои
+    пробрасываются — решение (fail-open) остаётся за вызывающим.
     Поля ответа tasks.task.get приходят в нижнем регистре (deadline, status).
     """
     try:
@@ -142,7 +147,7 @@ async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | 
             {"taskId": task_id, "select": ["ID", "DEADLINE", "STATUS"]},
         )
     except Exception as exc:
-        if is_server_refusal(exc):
+        if is_server_refusal(exc) and _TASK_MISSING_RE.search(str(exc)):
             return None
         raise
     if not isinstance(result, dict):
@@ -521,8 +526,15 @@ async def reconcile_task_reminders(
 
     Тот же рисунок, что у reconcile_deal_reminders: по каждой ожидающей
     записи один tasks.task.get, ошибки одной записи не мешают остальным.
-    Возвращает счёт сверенных.
+    Возвращает счёт сверенных (второй проход в счёт не входит).
+
+    Вторым проходом проверяются недавно отменённые пинги (окно и защита от
+    дублей — в db.cancelled_task_reminders): завершённую задачу могли
+    переоткрыть в Bitrix24 со сроком в будущем — без воскрешения отмена
+    была бы терминальной и переоткрытая задача молчала бы навсегда.
     """
+    if now_ts is None:
+        now_ts = int(time.time())
     count = 0
     for reminder in await db.pending_task_reminders():
         try:
@@ -531,6 +543,34 @@ async def reconcile_task_reminders(
             log.exception("Сверка пинга id=%s не удалась", reminder["id"])
             continue
         count += 1
+    for reminder in await db.cancelled_task_reminders():
+        task_id = reminder.get("entity_id")
+        try:
+            async with asyncio.timeout(SYNC_CRM_DEADLINE):
+                task = await get_reminder_task(bx, int(task_id))
+        except Exception:
+            log.warning(
+                "Задача %s не прочитана — воскрешение пинга отложено",
+                task_id,
+                exc_info=True,
+            )
+            continue
+        if task is None or str(task.get("status")) == TASK_STATUS_COMPLETED:
+            continue
+        due_ts = dates.bitrix_deadline_epoch(task.get("deadline"))
+        if due_ts is None or due_ts < now_ts - SYNC_TOLERANCE_SECONDS:
+            # Срока нет или он в прошлом: срабатывание задним числом хуже
+            # тишины, с той датой уже разобрались.
+            continue
+        text = _text_with_deadline(str(reminder["text"]), due_ts)
+        if await db.revive_task_reminder(
+            reminder["id"], due_ts, text, SYNC_TOLERANCE_SECONDS
+        ):
+            log.info(
+                "Пинг id=%s воскрешён: задача %s снова открыта",
+                reminder["id"],
+                task_id,
+            )
     return count
 
 

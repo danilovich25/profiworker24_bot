@@ -135,6 +135,55 @@ async def test_deleted_task_cancels_ping(db, bot, session):
     assert session.sent_texts == []
 
 
+async def test_access_denied_keeps_ping(db, bot, session):
+    """Отказ портала НЕ «задача не найдена» (права, квота) — fail-open.
+
+    Явный отказ сервера не доказывает, что задачи нет: снятие пинга по
+    ACCESS_DENIED хоронило бы живое напоминание навсегда.
+    """
+    await db.add_reminder(CHAT, TEXT, DUE, "task", TASK)
+
+    class DeniedBitrix(SemanticBitrixFake):
+        async def _dispatch(self, method: str, params: dict) -> Any:
+            raise ErrorInServerResponseException("ACCESS_DENIED: нет прав на задачу")
+
+    await tasks.reconcile_task_reminders(DeniedBitrix(), db)
+
+    rows = await db.pending_task_reminders()
+    assert [row["due_ts"] for row in rows] == [DUE]
+
+
+async def test_reopened_task_revives_cancelled_ping(db, bot, session):
+    """Задачу завершили, пинг снят; переоткрыли со сроком в будущем — пинг ожил.
+
+    Без воскрешения отмена была бы терминальной: переоткрытая в Bitrix24
+    задача молчала бы в Telegram навсегда.
+    """
+    await db.add_reminder(CHAT, TEXT, DUE, "task", TASK)
+    await tasks.reconcile_task_reminders(
+        FakeTaskBitrix(deadline=dates.epoch_to_iso(DUE), status="5"), db
+    )
+    assert await db.pending_task_reminders() == []
+
+    future = int(time.time()) + 7200
+    bx = FakeTaskBitrix(deadline=dates.epoch_to_iso(future), status="2")
+    await tasks.reconcile_task_reminders(bx, db)
+
+    rows = await db.pending_task_reminders()
+    assert [row["due_ts"] for row in rows] == [future]
+    assert dates.format_epoch(future) in rows[0]["text"]
+
+
+async def test_completed_task_stays_cancelled(db, bot, session):
+    """Завершённая задача не воскрешает пинг, сколько бы сверок ни прошло."""
+    await db.add_reminder(CHAT, TEXT, DUE, "task", TASK)
+    bx = FakeTaskBitrix(deadline=dates.epoch_to_iso(int(time.time()) + 7200), status="5")
+    await tasks.reconcile_task_reminders(bx, db)
+    await tasks.reconcile_task_reminders(bx, db)
+
+    assert await db.pending_task_reminders() == []
+
+
 async def test_crm_failure_keeps_stored_schedule(db, bot, session):
     """Недоступный портал не трогает очередь: fail-open, пинг по сохранённому.
 

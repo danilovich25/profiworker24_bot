@@ -13,6 +13,7 @@ import pytest
 
 from app.db import Database
 from app.handlers import routers
+from app.handlers.messages import OrderFlow
 from app.handlers.reminders import (
     MY_REMINDERS_EMPTY,
     REMIND_NO_DATE,
@@ -21,7 +22,6 @@ from app.handlers.reminders import (
 )
 from app.handlers.search import ACTIVE_ORDER_WARNING, ASK_QUERY, SearchFlow
 from app.handlers.start import BTN_FIND, BTN_MY_REMINDERS, BTN_REMIND
-from app.handlers.messages import OrderFlow
 from app.main import create_dispatcher
 from app.schemas import Intent, ParsedOrder
 from app.services import llm, speech
@@ -231,3 +231,80 @@ async def test_cancel_command_leaves_reminder_flow(flow):
     await send(flow, "/cancel")
 
     assert await state_of(flow) is None
+
+
+async def test_reminders_command_leaves_reminder_flow(flow):
+    """/reminders в режиме ввода показывает список и ЗАКРЫВАЕТ режим.
+
+    Иначе следующий текст с датой молча становился бы напоминанием.
+    """
+    await send(flow, BTN_REMIND)
+    await send(flow, "/reminders")
+
+    assert flow.session.sent_texts[-1] == MY_REMINDERS_EMPTY
+    assert await state_of(flow) is None
+
+
+async def test_cancel_button_on_due_reminder_is_stale(flow):
+    """Пинг, чей срок уже наступил, кнопкой не отменяется: он уже уходит.
+
+    Планировщик шлёт до отметки, и отмена «в момент срока» рапортовала бы
+    успех, завершала задачу Bitrix, а сообщение всё равно приходило.
+    """
+    now = int(time.time())
+    rid = await flow.db.add_reminder(
+        1, "почти ушедший пинг. Срок: сейчас", now - 5, "task", 88
+    )
+
+    from tests.conftest import make_callback_update
+
+    await flow.dp.feed_update(
+        flow.bot, make_callback_update(flow.bot, f"rem:cancel:{rid}")
+    )
+
+    rows = await flow.db.pending_task_reminders()
+    assert [row["id"] for row in rows] == [rid]  # пинг не тронут
+    assert flow.bx.completed == []  # задача Bitrix не завершалась
+    assert all("отменено" not in t.lower() for t in flow.session.sent_texts)
+
+
+class AddThenFailBitrix(FakeReminderBitrix):
+    """Портал, у которого первый tasks.task.add ПРОХОДИТ, но ответ теряется."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lose_add_responses = 1
+
+    async def _dispatch(self, method: str, params: dict):
+        if method == "tasks.task.add" and self.lose_add_responses > 0:
+            self.lose_add_responses -= 1
+            self.tasks.append(params["fields"])
+            raise RuntimeError("обрыв связи после отправки")
+        return await super()._dispatch(method, params)
+
+
+async def test_reminder_ping_survives_lost_add_response(tmp_path, bot, session, monkeypatch):
+    """Ответ task.add потерялся, сверка нашла задачу — TG-пинг ВСЁ РАВНО встаёт.
+
+    Раньше пинг ставился только при чистом ответе add: после таймаута бот
+    обещал «Пришлю напоминание», но в очередь ничего не попадало.
+    """
+    db = Database(str(tmp_path / "lost-add.db"))
+    await db.init()
+    bx = AddThenFailBitrix()
+    dp = create_dispatcher(db, bitrix=bx, allowed_ids=set(), allow_all=True)
+    flow = SimpleNamespace(dp=dp, bot=bot, session=session, db=db, bx=bx)
+    text = "через 2 часа позвонить заказчику"
+    mock_parse(monkeypatch, {text: reminder_order("позвонить заказчику")})
+    try:
+        await send(flow, BTN_REMIND)
+        before = int(time.time())
+        await send(flow, text)
+
+        replies = "\n".join(flow.session.sent_texts)
+        assert "задача №77" in replies  # сверка нашла созданную задачу
+        rows = await db.pending_task_reminders()
+        assert len(rows) == 1
+        assert abs(rows[0]["due_ts"] - (before + 2 * 3600)) <= 120
+    finally:
+        await dp.storage.close()

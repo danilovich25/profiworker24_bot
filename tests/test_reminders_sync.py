@@ -962,8 +962,16 @@ async def test_old_schema_sent_rows_migrate_and_rearm(tmp_path, bot, session):
     """База старой схемы (без sent_at) мигрирует, и её sent-строки сканируются.
 
     Старым отправленным строкам момент отправки неизвестен — назначается
-    created_at, недавняя строка остаётся кандидатом перевооружения.
+    МОМЕНТ ИХ СРОКА (due_ts): планировщик шлёт в пределах секунд от срока,
+    и это точнее created_at, который у записи, созданной задолго до срока,
+    выкидывал бы её из окна сразу после миграции. Свежеотправленная строка
+    остаётся кандидатом перевооружения, давняя — отсекается окном.
     """
+    now = int(time.time())
+    early_due = now - 600
+    deal_due = now + 1200
+    stale_due = now - 3 * 86400
+    early_text = f"заявка №{DEAL} — электрика. Срок: {dates.format_epoch(early_due)}"
     path = str(tmp_path / "old-sent.db")
     async with aiosqlite.connect(path) as conn:
         await conn.execute(
@@ -976,10 +984,19 @@ async def test_old_schema_sent_rows_migrate_and_rearm(tmp_path, bot, session):
             "created_at TEXT NOT NULL DEFAULT (datetime('now')), "
             "cancelled_at TEXT DEFAULT NULL)"
         )
+        # Запись создана давно (месяц назад), отправлена только что (по due):
+        # окно обязано считать её свежей.
         await conn.execute(
             "INSERT INTO reminders (chat_id, text, due_ts, kind, entity_id, "
-            "activity_id, status) VALUES (1, ?, ?, 'deal', ?, 16, 'sent')",
-            (EARLY_TEXT, EARLY_DUE, DEAL),
+            "activity_id, status, created_at) "
+            "VALUES (1, ?, ?, 'deal', ?, 16, 'sent', datetime('now', '-30 days'))",
+            (early_text, early_due, DEAL),
+        )
+        # Давно отработавшая строка — вне окна, дела её сделки не читаются.
+        await conn.execute(
+            "INSERT INTO reminders (chat_id, text, due_ts, kind, entity_id, "
+            "activity_id, status) VALUES (1, 'старый пинг', ?, 'deal', 79, 21, 'sent')",
+            (stale_due,),
         )
         await conn.commit()
 
@@ -988,11 +1005,16 @@ async def test_old_schema_sent_rows_migrate_and_rearm(tmp_path, bot, session):
 
     rows = await database.sent_deal_reminders()
     assert [row["entity_id"] for row in rows] == [DEAL]
-    bx = FakeTodoBitrix([DEAL_TODO, EARLY_TODO])
-    await tasks.reconcile_deal_reminders(bx, database, now_ts=EARLY_DUE + 120)
+    bx = FakeTodoBitrix(
+        [
+            todo(14, dates.epoch_to_iso(deal_due), subject="Заявка: электрика"),
+            todo(16, dates.epoch_to_iso(early_due), subject="Запланировано дело"),
+        ]
+    )
+    await tasks.reconcile_deal_reminders(bx, database, now_ts=now)
     pending = await database.pending_deal_reminder(DEAL)
     assert pending is not None
-    assert pending["due_ts"] == DEAL_DUE
+    assert pending["due_ts"] == deal_due
 
 
 def test_bitrix_deadline_epoch_parses_portal_forms():
