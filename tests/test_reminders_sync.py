@@ -938,6 +938,72 @@ async def test_card_open_resync_arms_next_todo_after_sent(db, bot, session):
     assert pending["activity_id"] == 14
 
 
+async def test_rearm_catches_todo_missed_by_scan_gap(db, bot, session):
+    """Дело, наступившее между проходами скана, вооружается с опозданием.
+
+    Сканы идут раз в RECONCILE_INTERVAL, и дело, чей срок пришёлся на зазор
+    (или чью сделку случайный LIMIT отложил на проход), к следующему проходу
+    уже «просрочено». Жёсткий отсев просроченных терял такой пинг навсегда —
+    grace на пару интервалов шлёт его с опозданием: поздний пинг лучше
+    потерянного.
+    """
+    now = int(time.time())
+    early_due = now - 900
+    missed_due = now - 180
+    await db.add_reminder(
+        1,
+        f"заявка №{DEAL} — электрика. Срок: {dates.format_epoch(early_due)}",
+        early_due,
+        "deal",
+        DEAL,
+        16,
+    )
+    assert await tasks.send_due_reminders(bot, db, now_ts=early_due + 5, bitrix=None) == 1
+
+    bx = FakeTodoBitrix(
+        [
+            todo(14, dates.epoch_to_iso(missed_due), subject="Заявка: электрика"),
+            todo(16, dates.epoch_to_iso(early_due), subject="Запланировано дело"),
+        ]
+    )
+    await tasks.reconcile_deal_reminders(bx, db, now_ts=now)
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None
+    assert pending["due_ts"] == missed_due
+    assert await tasks.send_due_reminders(bot, db, now_ts=now, bitrix=bx) == 1
+
+
+async def test_rearm_skips_long_overdue_todo(db, bot, session):
+    """Давно просроченное дело пинг не вооружает: задним числом хуже тишины.
+
+    Граница grace — жёсткими секундами (661 > 2 интервала + допуск), чтобы
+    раздутый мутантом интервал уронил тест, а не отмасштабировал границу.
+    """
+    now = int(time.time())
+    early_due = now - 3 * 3600
+    stale_due = now - 661
+    await db.add_reminder(
+        1,
+        f"заявка №{DEAL} — электрика. Срок: {dates.format_epoch(early_due)}",
+        early_due,
+        "deal",
+        DEAL,
+        16,
+    )
+    assert await tasks.send_due_reminders(bot, db, now_ts=early_due + 5, bitrix=None) == 1
+
+    bx = FakeTodoBitrix(
+        [
+            todo(14, dates.epoch_to_iso(stale_due), subject="Заявка: электрика"),
+            todo(16, dates.epoch_to_iso(early_due), subject="Запланировано дело"),
+        ]
+    )
+    await tasks.reconcile_deal_reminders(bx, db, now_ts=now)
+
+    assert await db.pending_deal_reminder(DEAL) is None
+
+
 async def test_sent_scan_window_limits_rearm_cost(db, bot, session):
     """Давно отправленные записи не сканируются: окно перевооружения конечно.
 

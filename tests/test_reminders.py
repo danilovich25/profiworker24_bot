@@ -96,6 +96,35 @@ async def test_send_failure_then_success_delivers(db, bot, session, monkeypatch)
     assert "со второй попытки" in session.sent_texts[-1]
 
 
+async def test_cancel_during_pass_skips_not_yet_sent_reminder(db, bot, session, monkeypatch):
+    """Отмена во время прохода снимает ещё НЕ отправленные пинги этого прохода.
+
+    Проход читает наступившие записи пачкой и шлёт по очереди: пока уходит
+    первая, пользователь успевает отменить вторую — без пересверки статуса
+    прямо перед отправкой отменённый пинг всё равно доставлялся бы.
+    Интерливинг детерминированный: хук в подменённом транспорте (см. грабли
+    раунда 3 этапа 2) во время первой отправки гасит вторую запись.
+    """
+    await db.add_reminder(1, "первый пинг", 1000, "task", 55)
+    second = await db.add_reminder(1, "второй пинг", 1000, "task", 56)
+    original = session.make_request
+    fired = {"done": False}
+
+    async def cancelling(bot_, method, timeout=None):
+        if isinstance(method, SendMessage) and not fired["done"]:
+            fired["done"] = True
+            assert await db.dismiss_reminder(second)
+        return await original(bot_, method, timeout)
+
+    monkeypatch.setattr(session, "make_request", cancelling)
+
+    assert await tasks.send_due_reminders(bot, db, now_ts=1001) == 1
+
+    assert [t for t in session.sent_texts if "второй пинг" in t] == []
+    row = await db.get_reminder(second)
+    assert row["status"] == "dismissed"
+
+
 async def test_drop_pending_deal_reminders_for_reschedule(db, bot, session):
     """Перенос срока: старое напоминание сделки снимается, отправленное — нет."""
     first = await db.add_reminder(1, "старый срок", 1000, "deal", 154, 500)

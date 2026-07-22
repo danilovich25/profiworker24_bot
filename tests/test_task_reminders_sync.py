@@ -143,6 +143,10 @@ async def test_deleted_task_cancels_ping(db, bot, session):
         # Код без человеческого «задача не найдена» неоднозначен: задача
         # может существовать, но быть недоступной — снимать пинг нельзя.
         "ERROR_TASK_NOT_FOUND_OR_NOT_ACCESSIBLE: доступ ограничен",
+        # «...или недоступна» в ЛЮБОЙ локали — та же неоднозначность, даже
+        # если рядом есть слова про «не найдена».
+        "ERROR_TASK_NOT_FOUND_OR_NOT_ACCESSIBLE: Task not found or not accessible",
+        "ERROR_TASK_NOT_FOUND_OR_NOT_ACCESSIBLE: Задача не найдена или недоступна",
     ],
 )
 async def test_ambiguous_refusal_keeps_ping(db, bot, session, error):

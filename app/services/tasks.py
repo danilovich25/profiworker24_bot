@@ -34,7 +34,7 @@ import time
 from typing import Any
 
 from app.config import settings
-from app.db import Database
+from app.db import REMINDER_PENDING, Database
 from app.services import dates
 from app.services.bitrix import (
     BitrixClient,
@@ -127,13 +127,22 @@ async def find_reminder_task(bx: BitrixClient, key: str) -> int | None:
 TASK_STATUS_COMPLETED = "5"
 
 # Ответы портала, означающие именно «задачи нет» (tasks.task.get по
-# удалённой задаче): только человекочитаемое «задача не найдена». Прочие
-# отказы — ACCESS_DENIED, METHOD_NOT_FOUND, код TASK_NOT_FOUND_OR_NOT_
-# ACCESSIBLE без этого текста (задача может существовать, но быть
-# недоступной) — задачей-нет НЕ считаются: снятие пинга по ним хоронило бы
-# живое напоминание. Цена ложного fail-open — лишний пинг по удалённой
-# задаче, его можно отменить кнопкой; цена ложного «нет» — тишина навсегда.
+# удалённой задаче): человекочитаемое «задача не найдена» БЕЗ оговорки про
+# недоступность. Формулировки «…или недоступна» / «…or not accessible» (в
+# любой локали) неоднозначны — задача может существовать, но быть закрытой
+# правами, — и вместе с ACCESS_DENIED/METHOD_NOT_FOUND задачей-нет НЕ
+# считаются: снятие пинга по ним хоронило бы живое напоминание. Цена
+# ложного fail-open — лишний пинг по удалённой задаче, его можно отменить
+# кнопкой; цена ложного «нет» — тишина навсегда.
 _TASK_MISSING_RE = re.compile(r"задача не найдена|\btask not found\b", re.IGNORECASE)
+_TASK_AMBIGUOUS_RE = re.compile(r"недоступ|not\s+accessible", re.IGNORECASE)
+
+
+def _task_is_missing(error_text: str) -> bool:
+    return bool(
+        _TASK_MISSING_RE.search(error_text)
+        and not _TASK_AMBIGUOUS_RE.search(error_text)
+    )
 
 
 async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | None:
@@ -151,7 +160,7 @@ async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | 
             {"taskId": task_id, "select": ["ID", "DEADLINE", "STATUS"]},
         )
     except Exception as exc:
-        if is_server_refusal(exc) and _TASK_MISSING_RE.search(str(exc)):
+        if is_server_refusal(exc) and _task_is_missing(str(exc)):
             return None
         raise
     if not isinstance(result, dict):
@@ -196,6 +205,13 @@ SYNC_TOLERANCE_SECONDS = 60
 # дедлайна заморозил бы все отправки прохода (в хендлерах такое же чтение
 # ограничено своим таймаутом).
 SYNC_CRM_DEADLINE = 25
+
+# Grace перевооружения: дело, чей срок пришёлся на зазор между проходами
+# скана (или чью сделку случайный LIMIT отложил на проход-другой), к
+# следующему проходу уже «просрочено» — жёсткий отсев терял бы его пинг
+# навсегда. В пределах пары интервалов сверки поздний пинг лучше
+# потерянного; всё, что старше, — по-настоящему просрочено и молчит.
+REARM_OVERDUE_GRACE_SECONDS = 2 * RECONCILE_INTERVAL + SYNC_TOLERANCE_SECONDS
 
 # Хвост «Срок: …» в тексте напоминания (его пишут _schedule_deal_reminder и
 # _reschedule_reminders); при переносе срока сверкой хвост переписывается.
@@ -399,13 +415,14 @@ async def rearm_deal_reminder(
 
     Кейс заказчика: своё дело-напоминание «за 2 часа» отработало, а дело с
     самим сроком заявки ещё впереди — после отправки у сделки не оставалось
-    ожидающей записи, и в момент заявки бот молчал. Здесь из ненаступивших
-    дел (граница — та же, что у nearest_todo) по возрастанию срока
-    выбирается первое, на которое проходит spawn_deal_reminder: его гарды
-    отсекают дату только что отправленного пинга (и любую другую, по которой
-    сделка уже отработала) и гонку с параллельно возникшим pending.
-    Просроченные дела пинг не вооружают: срабатывание задним числом хуже
-    тишины, с той датой уже разобрались.
+    ожидающей записи, и в момент заявки бот молчал. Здесь из актуальных дел
+    по возрастанию срока выбирается первое, на которое проходит
+    spawn_deal_reminder: его гарды отсекают дату только что отправленного
+    пинга (и любую другую, по которой сделка уже отработала) и гонку с
+    параллельно возникшим pending. Актуальны ненаступившие дела и недавно
+    наступившие в пределах REARM_OVERDUE_GRACE_SECONDS (срок попал в зазор
+    между проходами скана — поздний пинг лучше потерянного); давно
+    просроченные пинг не вооружают: задним числом хуже тишины.
     """
     if now_ts is None:
         now_ts = int(time.time())
@@ -415,7 +432,7 @@ async def rearm_deal_reminder(
     candidates: list[tuple[int, int]] = []
     for todo in todos:
         due_ts = dates.bitrix_deadline_epoch(todo.get("DEADLINE"))
-        if due_ts is None or due_ts < now_ts - SYNC_TOLERANCE_SECONDS:
+        if due_ts is None or due_ts < now_ts - REARM_OVERDUE_GRACE_SECONDS:
             continue
         try:
             activity_id = require_positive_id(todo.get("ID"), "crm.activity.list")
@@ -676,6 +693,18 @@ async def send_due_reminders(
             if int(reminder["due_ts"]) > now_ts:
                 # Срок уехал в будущее — напоминание подождёт нового момента.
                 continue
+        # Пересверка прямо перед отправкой: записи прохода читаются пачкой,
+        # и пока уходили предыдущие, эту могли отменить кнопкой или
+        # перенести. Окно гонки сжимается до самой отправки; вместе с CAS
+        # в mark_reminder_sent это не трогает принцип «отправить, потом
+        # пометить» — упавший процесс по-прежнему шлёт дубль, а не молчит.
+        fresh = await db.get_reminder(reminder["id"])
+        if (
+            fresh is None
+            or fresh["status"] != REMINDER_PENDING
+            or int(fresh["due_ts"]) != int(reminder["due_ts"])
+        ):
+            continue
         try:
             await bot.send_message(
                 reminder["chat_id"], REMINDER_MESSAGE.format(text=reminder["text"])
