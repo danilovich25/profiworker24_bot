@@ -811,6 +811,190 @@ async def test_reminder_loop_reconciles_at_startup(db, bot):
     assert pending["due_ts"] == near_due
 
 
+# ---------------------------------------------------------------------------
+# Перевооружение после отправки: пинг и на само время заявки
+# ---------------------------------------------------------------------------
+
+# Кейс заказчика 22.07: заявка на 22:00 (дело бота), своё дело-напоминание
+# на 21:31. Ранний пинг ушёл, а в момент самой заявки бот молчал: после
+# отправки у сделки не оставалось pending-записи, и дело 22:00 никто не ждал.
+DEAL_DUE = epoch("2026-07-22T22:00:00+10:00")
+EARLY_DUE = epoch("2026-07-22T21:31:00+10:00")
+DEAL_TODO = todo(14, "2026-07-22T22:00:00+10:00", subject="Заявка №78: электрика")
+EARLY_TODO = todo(16, "2026-07-22T21:31:00+10:00", subject="Запланировано дело")
+EARLY_TEXT = "заявка №78 — электрика. Срок: 22.07.2026 21:31"
+
+
+async def test_ping_fires_at_deal_time_after_early_manual_reminder(db, bot, session):
+    """Заявка в 22:00 + своё напоминание на 21:31 — бот шлёт ОБА пинга.
+
+    После отправки раннего напоминания очередь обязана перевооружиться на
+    следующее ненаступившее дело сделки — само время заявки.
+    """
+    await db.add_reminder(
+        1, "заявка №78 — электрика. Срок: 22.07.2026 22:00", DEAL_DUE, "deal", DEAL, 14
+    )
+    bx = FakeTodoBitrix([DEAL_TODO, EARLY_TODO])
+
+    # Сверка до раннего срока: напоминание переезжает на ручное дело 21:31.
+    await tasks.reconcile_deal_reminders(bx, db, now_ts=EARLY_DUE - 600)
+    assert await tasks.send_due_reminders(bot, db, now_ts=EARLY_DUE + 5, bitrix=bx) == 1
+    assert "21:31" in session.sent_texts[-1]
+
+    # Сразу после отправки очередь снова вооружена — на само время заявки.
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None
+    assert pending["due_ts"] == DEAL_DUE
+    assert pending["activity_id"] == 14
+
+    # В момент заявки уходит второй пинг, и срок в нём — её собственный.
+    assert await tasks.send_due_reminders(bot, db, now_ts=DEAL_DUE + 5, bitrix=bx) == 1
+    assert len(session.sent_texts) == 2
+    assert "22.07.2026 22:00" in session.sent_texts[-1]
+
+
+async def test_reconcile_arms_deal_time_when_crm_was_down_at_send(db, bot, session):
+    """CRM лежала в момент раннего пинга — сверка после подъёма вооружает 22:00.
+
+    Немедленное перевооружение при отправке требует живого портала; если его
+    не было, следующее дело обязан подхватить периодический проход сверки.
+    """
+    await db.add_reminder(1, EARLY_TEXT, EARLY_DUE, "deal", DEAL, 16)
+    assert await tasks.send_due_reminders(bot, db, now_ts=EARLY_DUE + 5, bitrix=None) == 1
+    assert await db.pending_deal_reminder(DEAL) is None
+
+    bx = FakeTodoBitrix([DEAL_TODO, EARLY_TODO])
+    await tasks.reconcile_deal_reminders(bx, db, now_ts=EARLY_DUE + 120)
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None
+    assert pending["due_ts"] == DEAL_DUE
+    assert await tasks.send_due_reminders(bot, db, now_ts=DEAL_DUE + 5, bitrix=bx) == 1
+    assert "22.07.2026 22:00" in session.sent_texts[-1]
+
+
+async def test_sent_rearm_does_not_duplicate_single_todo(db, bot, session):
+    """Единственное дело: после отправки перевооружение не плодит второй пинг.
+
+    Бот своё дело в CRM не завершает — открытое дело с уже отработанным
+    сроком не должно вооружать дубль ни в первую минуту, ни позже.
+    """
+    await db.add_reminder(1, OLD_TEXT, OLD_DUE, "deal", DEAL, 14)
+    bx = FakeTodoBitrix([todo(14, "2026-07-21T10:00:00+10:00")])
+
+    assert await tasks.send_due_reminders(bot, db, now_ts=OLD_DUE + 5, bitrix=bx) == 1
+    assert await db.pending_deal_reminder(DEAL) is None
+
+    for now in (OLD_DUE + 30, OLD_DUE + 120):
+        await tasks.reconcile_deal_reminders(bx, db, now_ts=now)
+        assert await db.pending_deal_reminder(DEAL) is None
+        assert await tasks.send_due_reminders(bot, db, now_ts=now, bitrix=bx) == 0
+    assert len(session.sent_texts) == 1
+
+
+async def test_rearm_boundary_is_sync_tolerance(db, bot, session):
+    """Граница «та же дата» у перевооружения — ровно допуск сверки.
+
+    Дело на 59-й секунде от отправленного срока — та же дата (дубль зарезан),
+    на 60-й — уже другая (пинг обязан встать). Секунды жёсткие, не через
+    константу: раздутый мутантом допуск обязан уронить тест.
+    """
+    await db.add_reminder(1, EARLY_TEXT, EARLY_DUE, "deal", DEAL, 16)
+    bx = FakeTodoBitrix([EARLY_TODO])
+    assert await tasks.send_due_reminders(bot, db, now_ts=EARLY_DUE + 5, bitrix=bx) == 1
+
+    bx59 = FakeTodoBitrix(
+        [EARLY_TODO, todo(18, "2026-07-22T21:31:59+10:00", subject="Запланировано дело")]
+    )
+    await tasks.reconcile_deal_reminders(bx59, db, now_ts=EARLY_DUE + 10)
+    assert await db.pending_deal_reminder(DEAL) is None
+
+    bx60 = FakeTodoBitrix(
+        [EARLY_TODO, todo(18, "2026-07-22T21:32:00+10:00", subject="Запланировано дело")]
+    )
+    await tasks.reconcile_deal_reminders(bx60, db, now_ts=EARLY_DUE + 10)
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None
+    assert pending["due_ts"] == EARLY_DUE + 60
+    assert pending["activity_id"] == 18
+
+
+async def test_card_open_resync_arms_next_todo_after_sent(db, bot, session):
+    """Открытие карточки вооружает следующее дело и после отправленного пинга.
+
+    Дела карточки уже прочитаны — ждать периодическую сверку не нужно.
+    """
+    await db.add_reminder(1, EARLY_TEXT, EARLY_DUE, "deal", DEAL, 16)
+    assert await tasks.send_due_reminders(bot, db, now_ts=EARLY_DUE + 5, bitrix=None) == 1
+    assert await db.pending_deal_reminder(DEAL) is None
+
+    await tasks.resync_deal_reminder(
+        db, DEAL, [DEAL_TODO, EARLY_TODO], now_ts=EARLY_DUE + 120
+    )
+
+    pending = await db.pending_deal_reminder(DEAL)
+    assert pending is not None
+    assert pending["due_ts"] == DEAL_DUE
+    assert pending["activity_id"] == 14
+
+
+async def test_sent_scan_window_limits_rearm_cost(db, bot, session):
+    """Давно отправленные записи не сканируются: окно перевооружения конечно.
+
+    Каждая строка скана стоит одного crm.activity.list на проход — сделки,
+    отправленные раньше окна, из кандидатов выпадают.
+    """
+    await db.add_reminder(1, EARLY_TEXT, EARLY_DUE, "deal", DEAL, 16)
+    assert await tasks.send_due_reminders(bot, db, now_ts=EARLY_DUE + 5, bitrix=None) == 1
+    rows = await db.sent_deal_reminders()
+    assert [row["entity_id"] for row in rows] == [DEAL]
+
+    async with aiosqlite.connect(db.path) as conn:
+        await conn.execute(
+            "UPDATE reminders SET sent_at = datetime('now', '-259200 seconds') "
+            "WHERE status = 'sent'"
+        )
+        await conn.commit()
+    assert await db.sent_deal_reminders() == []
+
+
+async def test_old_schema_sent_rows_migrate_and_rearm(tmp_path, bot, session):
+    """База старой схемы (без sent_at) мигрирует, и её sent-строки сканируются.
+
+    Старым отправленным строкам момент отправки неизвестен — назначается
+    created_at, недавняя строка остаётся кандидатом перевооружения.
+    """
+    path = str(tmp_path / "old-sent.db")
+    async with aiosqlite.connect(path) as conn:
+        await conn.execute(
+            "CREATE TABLE reminders ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, "
+            "text TEXT NOT NULL, due_ts INTEGER NOT NULL, "
+            "kind TEXT NOT NULL DEFAULT 'deal', entity_id INTEGER, "
+            "activity_id INTEGER, status TEXT NOT NULL DEFAULT 'pending', "
+            "attempts INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT NOT NULL DEFAULT (datetime('now')), "
+            "cancelled_at TEXT DEFAULT NULL)"
+        )
+        await conn.execute(
+            "INSERT INTO reminders (chat_id, text, due_ts, kind, entity_id, "
+            "activity_id, status) VALUES (1, ?, ?, 'deal', ?, 16, 'sent')",
+            (EARLY_TEXT, EARLY_DUE, DEAL),
+        )
+        await conn.commit()
+
+    database = Database(path)
+    await database.init()
+
+    rows = await database.sent_deal_reminders()
+    assert [row["entity_id"] for row in rows] == [DEAL]
+    bx = FakeTodoBitrix([DEAL_TODO, EARLY_TODO])
+    await tasks.reconcile_deal_reminders(bx, database, now_ts=EARLY_DUE + 120)
+    pending = await database.pending_deal_reminder(DEAL)
+    assert pending is not None
+    assert pending["due_ts"] == DEAL_DUE
+
+
 def test_bitrix_deadline_epoch_parses_portal_forms():
     """Разбор DEADLINE: полный ISO, короткий офсет «+03», мусор и пустота."""
     assert dates.bitrix_deadline_epoch("2026-07-21T03:03:00+03:00") == epoch(

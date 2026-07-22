@@ -147,7 +147,8 @@ CREATE TABLE IF NOT EXISTS reminders (
     status      TEXT NOT NULL DEFAULT 'pending',
     attempts    INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    cancelled_at TEXT DEFAULT NULL
+    cancelled_at TEXT DEFAULT NULL,
+    sent_at     TEXT DEFAULT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (status, due_ts);
 """
@@ -168,6 +169,14 @@ REMINDER_CANCELLED = "cancelled"
 # вечно. Открытие карточки заявки воскрешает и без окна — дела к тому
 # моменту уже прочитаны.
 REVIVE_SCAN_WINDOW_SECONDS = 7 * 24 * 3600
+
+# Окно скана ОТПРАВЛЕННЫХ напоминаний (sent_deal_reminders): после пинга
+# очередь перевооружается на следующее дело сделки — заказчик ставит своё
+# напоминание «за 2 часа или за день» до срока заявки, и пинг на само её
+# время не должен теряться. Окно короче воскрешения: у каждой отработавшей
+# заявки навсегда остаётся sent-строка, и без узкого окна каждый проход
+# сверки читал бы дела всех сделок недели.
+SENT_REARM_WINDOW_SECONDS = 48 * 3600
 
 
 class Database:
@@ -248,7 +257,15 @@ class Database:
                 await conn.execute(
                     "ALTER TABLE reminders ADD COLUMN cancelled_at TEXT DEFAULT NULL"
                 )
-            # Бэкфил — вне ветки ALTER и идемпотентный: упади процесс между
+            if "sent_at" not in reminder_columns:
+                # Момент отправки добавлен вместе с перевооружением очереди:
+                # окно sent_deal_reminders отсчитывается от отправки, а не от
+                # создания — запись, созданная задолго до срока, обязана
+                # попадать в скан сразу после пинга.
+                await conn.execute(
+                    "ALTER TABLE reminders ADD COLUMN sent_at TEXT DEFAULT NULL"
+                )
+            # Бэкфилы — вне веток ALTER и идемпотентные: упади процесс между
             # добавлением колонки и заполнением, следующий старт долечит.
             # Отменённая строка без момента отмены бывает только из старой
             # схемы (cancel_reminder — единственный писатель статуса — всегда
@@ -258,6 +275,14 @@ class Database:
                 "UPDATE reminders SET cancelled_at = created_at "
                 "WHERE status = ? AND cancelled_at IS NULL",
                 (REMINDER_CANCELLED,),
+            )
+            # Отправленным строкам старой схемы момент отправки неизвестен —
+            # назначается created_at: недавние остаются кандидатами
+            # перевооружения, древние отсекаются окном.
+            await conn.execute(
+                "UPDATE reminders SET sent_at = created_at "
+                "WHERE status = ? AND sent_at IS NULL",
+                (REMINDER_SENT,),
             )
             # В старой схеме успешный контакт и комментарий возвращали fence
             # в reserved. Наличие contact_id доказывает завершение обеих фаз:
@@ -952,7 +977,7 @@ class Database:
         """
         async with aiosqlite.connect(self.path) as conn:
             cur = await conn.execute(
-                "UPDATE reminders SET status = ? "
+                "UPDATE reminders SET status = ?, sent_at = datetime('now') "
                 "WHERE id = ? AND status = ? AND due_ts = ?",
                 (REMINDER_SENT, reminder_id, REMINDER_PENDING, due_ts),
             )
@@ -1054,6 +1079,126 @@ class Database:
                 "FROM reminders WHERE kind = 'deal' AND status = ? "
                 "AND entity_id IS NOT NULL ORDER BY due_ts LIMIT ?",
                 (REMINDER_PENDING, limit),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "chat_id": row[1],
+                "text": row[2],
+                "due_ts": row[3],
+                "kind": row[4],
+                "entity_id": row[5],
+                "activity_id": row[6],
+            }
+            for row in rows
+        ]
+
+    async def spawn_deal_reminder(
+        self,
+        deal_id: int,
+        chat_id: int,
+        text: str,
+        due_ts: int,
+        activity_id: int,
+        sent_guard_seconds: int,
+    ) -> bool:
+        """Ставит сделке НОВОЕ ожидающее напоминание после отправленного.
+
+        Перевооружение очереди: ранний пинг (своё дело-напоминание заказчика)
+        ушёл, а дело с самим сроком заявки ещё впереди — по нему нужна новая
+        pending-запись. Оба NOT EXISTS живут в одном INSERT и потому
+        безразличны к гонкам между проверкой и записью:
+        - пока у сделки есть другое ожидающее напоминание, вставка не
+          проходит — два pending дали бы два сообщения;
+        - если по этому сроку (в пределах sent_guard_seconds — допуск
+          сверки, точность портала — минута) у сделки уже ЕСТЬ отправленная
+          запись, вставка не проходит: открытое дело бота в первую минуту
+          после пинга ещё числится ненаступившим, и без гарда очередь
+          вооружала бы дубль по уже отработанной дате.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "INSERT INTO reminders "
+                "(chat_id, text, due_ts, kind, entity_id, activity_id) "
+                "SELECT ?, ?, ?, 'deal', ?, ? "
+                "WHERE NOT EXISTS (SELECT 1 FROM reminders AS p "
+                "WHERE p.kind = 'deal' AND p.entity_id = ? AND p.status = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM reminders AS s "
+                "WHERE s.kind = 'deal' AND s.entity_id = ? AND s.status = ? "
+                "AND ABS(s.due_ts - ?) < ?)",
+                (
+                    chat_id,
+                    text,
+                    due_ts,
+                    deal_id,
+                    activity_id,
+                    deal_id,
+                    REMINDER_PENDING,
+                    deal_id,
+                    REMINDER_SENT,
+                    due_ts,
+                    sent_guard_seconds,
+                ),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+
+    async def sent_deal_reminder(self, deal_id: int) -> dict[str, Any] | None:
+        """Последнее отправленное напоминание сделки — база перевооружения.
+
+        Читается при открытии карточки заявки (resync): дела сделки уже
+        загружены, окно SENT_REARM_WINDOW_SECONDS здесь не действует.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, activity_id FROM reminders "
+                "WHERE kind = 'deal' AND entity_id = ? AND status = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (deal_id, REMINDER_SENT),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "chat_id": row[1],
+            "text": row[2],
+            "due_ts": row[3],
+            "activity_id": row[4],
+        }
+
+    async def sent_deal_reminders(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Недавно отправленные напоминания сделок — кандидаты перевооружения.
+
+        Окно SENT_REARM_WINDOW_SECONDS отсчитывается от момента ОТПРАВКИ
+        (sent_at; для строк старой схемы — created_at) и ограничивает цену
+        периодической сверки: каждая запись стоит одного crm.activity.list
+        на проход, а sent-строка остаётся у каждой отработавшей заявки
+        навсегда. Сделки с ожидающим напоминанием не возвращаются — их и
+        так ведёт обычная сверка. От каждой сделки — одна запись, самая
+        свежая; порядок случайный (см. cancelled_deal_reminders: те же
+        причины — кандидатов может быть больше limit).
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, kind, entity_id, activity_id "
+                "FROM (SELECT r.id, r.chat_id, r.text, r.due_ts, r.kind, "
+                "r.entity_id, r.activity_id, ROW_NUMBER() OVER "
+                "(PARTITION BY r.entity_id ORDER BY r.id DESC) AS rn "
+                "FROM reminders AS r WHERE r.kind = 'deal' AND r.status = ? "
+                "AND r.entity_id IS NOT NULL "
+                "AND COALESCE(r.sent_at, r.created_at) > datetime('now', ?) "
+                "AND NOT EXISTS (SELECT 1 FROM reminders AS p "
+                "WHERE p.kind = 'deal' AND p.entity_id = r.entity_id "
+                "AND p.status = ?)) "
+                "WHERE rn = 1 ORDER BY RANDOM() LIMIT ?",
+                (
+                    REMINDER_SENT,
+                    f"-{SENT_REARM_WINDOW_SECONDS} seconds",
+                    REMINDER_PENDING,
+                    limit,
+                ),
             )
             rows = await cur.fetchall()
         return [

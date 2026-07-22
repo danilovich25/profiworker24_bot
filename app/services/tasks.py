@@ -333,6 +333,59 @@ async def revive_from_todos(
     return {**reminder, "due_ts": due_ts, "text": text, "activity_id": activity_id}
 
 
+async def rearm_deal_reminder(
+    db: Database,
+    reminder: dict[str, Any],
+    todos: list[dict[str, Any]],
+    now_ts: int | None = None,
+) -> dict[str, Any] | None:
+    """Вооружает следующий пинг сделки после отправленного напоминания.
+
+    Кейс заказчика: своё дело-напоминание «за 2 часа» отработало, а дело с
+    самим сроком заявки ещё впереди — после отправки у сделки не оставалось
+    ожидающей записи, и в момент заявки бот молчал. Здесь из ненаступивших
+    дел (граница — та же, что у nearest_todo) по возрастанию срока
+    выбирается первое, на которое проходит spawn_deal_reminder: его гарды
+    отсекают дату только что отправленного пинга (и любую другую, по которой
+    сделка уже отработала) и гонку с параллельно возникшим pending.
+    Просроченные дела пинг не вооружают: срабатывание задним числом хуже
+    тишины, с той датой уже разобрались.
+    """
+    if now_ts is None:
+        now_ts = int(time.time())
+    deal_id = reminder.get("entity_id")
+    if not deal_id:
+        return None
+    candidates: list[tuple[int, int]] = []
+    for todo in todos:
+        due_ts = dates.bitrix_deadline_epoch(todo.get("DEADLINE"))
+        if due_ts is None or due_ts < now_ts - SYNC_TOLERANCE_SECONDS:
+            continue
+        try:
+            activity_id = require_positive_id(todo.get("ID"), "crm.activity.list")
+        except MalformedBitrixResponse:
+            continue
+        candidates.append((due_ts, activity_id))
+    for due_ts, activity_id in sorted(candidates):
+        text = _text_with_deadline(str(reminder["text"]), due_ts)
+        if await db.spawn_deal_reminder(
+            int(deal_id),
+            reminder["chat_id"],
+            text,
+            due_ts,
+            activity_id,
+            SYNC_TOLERANCE_SECONDS,
+        ):
+            log.info(
+                "Очередь перевооружена делом id=%s (сделка %s): пинг на само "
+                "время заявки",
+                activity_id,
+                deal_id,
+            )
+            return {**reminder, "due_ts": due_ts, "text": text, "activity_id": activity_id}
+    return None
+
+
 async def resync_deal_reminder(
     db: Database,
     deal_id: int,
@@ -343,8 +396,10 @@ async def resync_deal_reminder(
 
     Вызывается при открытии карточки заявки: дела для неё только что
     загружены, и очередь догоняет правки Bitrix24 сразу, не дожидаясь
-    периодической сверки. Если ожидающего напоминания нет, а отменённое
-    есть — дело со сроком в будущем воскрешает его (revive_from_todos).
+    периодической сверки. Если ожидающего напоминания нет, отменённое
+    воскрешается делом со сроком в будущем (revive_from_todos), а после
+    отправленного очередь перевооружается следующим делом
+    (rearm_deal_reminder) — пинг на само время заявки не ждёт сверку.
     """
     reminder = await db.pending_deal_reminder(deal_id)
     if reminder is not None:
@@ -353,6 +408,10 @@ async def resync_deal_reminder(
     cancelled = await db.cancelled_deal_reminder(deal_id)
     if cancelled is not None:
         await revive_from_todos(db, {**cancelled, "entity_id": deal_id}, todos, now_ts)
+        return
+    sent = await db.sent_deal_reminder(deal_id)
+    if sent is not None:
+        await rearm_deal_reminder(db, {**sent, "entity_id": deal_id}, todos, now_ts)
 
 
 async def reconcile_deal_reminders(
@@ -369,8 +428,10 @@ async def reconcile_deal_reminders(
 
     Вторым проходом проверяются недавно отменённые напоминания (окно и
     защита от дублей — в db.cancelled_deal_reminders): появившееся у сделки
-    дело со сроком в будущем воскрешает запись. В счёт сверенных этот проход
-    не входит.
+    дело со сроком в будущем воскрешает запись. Третьим — недавно
+    ОТПРАВЛЕННЫЕ (db.sent_deal_reminders): очередь перевооружается следующим
+    делом сделки, пинг на само время заявки уходит и если в момент раннего
+    напоминания CRM была недоступна. В счёт сверенных эти проходы не входят.
     """
     count = 0
     for reminder in await db.pending_deal_reminders():
@@ -393,6 +454,22 @@ async def reconcile_deal_reminders(
             await revive_from_todos(db, reminder, todos, now_ts)
         except Exception:
             log.exception("Воскрешение напоминания id=%s не удалось", reminder["id"])
+    for reminder in await db.sent_deal_reminders():
+        deal_id = reminder.get("entity_id")
+        if not deal_id or deal_id in seen:
+            # Сделку уже вело воскрешение этого прохода: у неё либо появился
+            # pending (spawn его гард отсечёт), либо дела прочитаны зря.
+            continue
+        seen.add(deal_id)
+        try:
+            todos = await _read_deal_todos(bx, int(deal_id))
+            if todos is None:
+                continue
+            await rearm_deal_reminder(db, reminder, todos, now_ts)
+        except Exception:
+            log.exception(
+                "Перевооружение после напоминания id=%s не удалось", reminder["id"]
+            )
     return count
 
 
@@ -440,8 +517,23 @@ async def send_due_reminders(
             continue
         # CAS и по сроку: если параллельная сверка успела перенести запись,
         # отметка промахнётся и напоминание уйдёт по новой дате отдельно.
-        await db.mark_reminder_sent(reminder["id"], int(reminder["due_ts"]))
+        marked = await db.mark_reminder_sent(reminder["id"], int(reminder["due_ts"]))
         sent += 1
+        if marked and bitrix is not None and reminder.get("kind") == "deal":
+            # Перевооружение сразу после пинга: следующее дело сделки (само
+            # время заявки) не должно ждать периодическую сверку — зазор
+            # между ранним напоминанием и сроком бывает меньше её интервала.
+            # Сбой или недоступная CRM не мешают проходу: третий проход
+            # reconcile_deal_reminders доберёт эту сделку по sent-строке.
+            try:
+                todos = await _read_deal_todos(bitrix, int(reminder["entity_id"]))
+                if todos is not None:
+                    await rearm_deal_reminder(db, reminder, todos, now_ts)
+            except Exception:
+                log.exception(
+                    "Перевооружение после напоминания id=%s не удалось",
+                    reminder["id"],
+                )
     return sent
 
 
