@@ -13,11 +13,13 @@
 поздний результат STT отбрасывается: старое голосовое не может стереть новую
 заявку или записать ответ уже в другое поле.
 
-Лимиты SpeechKit (30 секунд / 1 МБ) проверяются ДО скачивания файла:
-сначала по метаданным апдейта, затем по размеру из getFile — отсутствующий
-в апдейте размер не считается нулём, а само скачивание жёстко обрезается
-лимитом. Любой сбой — скачивание, сеть, распознавание, тишина — отвечает
-мягкой подсказкой и не роняет апдейт.
+Лимиты бота (минута / 2 МБ) проверяются ДО скачивания файла: сначала по
+метаданным апдейта, затем по размеру из getFile — отсутствующий в апдейте
+размер не считается нулём, а само скачивание жёстко обрезается лимитом.
+Голосовое длиннее лимита одного запроса SpeechKit (30 секунд) режется на
+куски и распознаётся по частям (speech.recognize_voice). Любой сбой —
+скачивание, сеть, нарезка, распознавание, тишина — отвечает мягкой
+подсказкой и не роняет апдейт.
 """
 
 import io
@@ -52,7 +54,7 @@ log = logging.getLogger("bot.voice")
 router = Router(name="voice")
 
 VOICE_TOO_LONG = (
-    "Голосовое длиннее 30 секунд (или больше 1 МБ) распознать не могу. "
+    "Голосовое длиннее 1 минуты (или больше 2 МБ) распознать не могу. "
     "Пришлите покороче или отправьте заявку текстом."
 )
 
@@ -168,10 +170,10 @@ async def on_voice(
     voice_fence = uuid4().hex
     await state.update_data(_voice_fence=voice_fence)
     voice = message.voice
-    if voice.duration > speech.MAX_DURATION_SECONDS:
+    if voice.duration > speech.BOT_MAX_DURATION_SECONDS:
         await message.answer(VOICE_TOO_LONG)
         return
-    if voice.file_size is not None and voice.file_size > speech.MAX_SIZE_BYTES:
+    if voice.file_size is not None and voice.file_size > speech.BOT_MAX_SIZE_BYTES:
         await message.answer(VOICE_TOO_LONG)
         return
 
@@ -179,14 +181,16 @@ async def on_voice(
         file = await message.bot.get_file(voice.file_id)
         # Отсутствующий размер в апдейте не означает «ноль»: настоящий размер
         # сообщает getFile, и он проверяется ДО скачивания файла в память.
-        if file.file_size is not None and file.file_size > speech.MAX_SIZE_BYTES:
+        if file.file_size is not None and file.file_size > speech.BOT_MAX_SIZE_BYTES:
             await message.answer(VOICE_TOO_LONG)
             return
         # Жёсткий предел на само скачивание: даже если размер не заявлен ни
         # в апдейте, ни в getFile, читается не больше лимита плюс кусок —
         # превышение обрывает поток, а не грузит весь файл ради отказа STT.
-        data = await _download_capped(message.bot, file.file_path, speech.MAX_SIZE_BYTES)
-        text = await speech.recognize_ogg(data)
+        data = await _download_capped(
+            message.bot, file.file_path, speech.BOT_MAX_SIZE_BYTES
+        )
+        text = await speech.recognize_voice(data, voice.duration)
     except VoiceTooBig:
         await message.answer(VOICE_TOO_LONG)
         return

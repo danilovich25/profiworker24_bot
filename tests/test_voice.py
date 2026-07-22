@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import shutil
 from types import SimpleNamespace
 
 import httpx
@@ -122,15 +123,44 @@ async def test_voice_stt_error_soft_answer(flow, monkeypatch):
 async def test_voice_too_long_rejected_without_stt(flow, monkeypatch):
     stt = recognize_mock(monkeypatch)
 
-    await send_voice(flow, duration=31)
+    await send_voice(flow, duration=61)
     assert flow.session.sent_texts[-1] == VOICE_TOO_LONG
     assert stt["count"] == 0  # к распознаванию не ходили
+
+
+async def test_voice_up_to_minute_recognized_via_chunks(flow, monkeypatch):
+    """Голосовое 30–60 секунд распознаётся по кускам, а не отклоняется.
+
+    Синхронный SpeechKit принимает максимум 30 секунд, поэтому длинное
+    голосовое режется на сегменты (ffmpeg) и распознаётся по частям;
+    сотруднику показывается склеенный текст.
+    """
+    split_calls = {"count": 0}
+
+    async def fake_split(data: bytes) -> list[bytes]:
+        split_calls["count"] += 1
+        return [b"chunk-a", b"chunk-b"]
+
+    parts = iter(["первая часть", "вторая часть"])
+
+    async def fake_stt(data: bytes) -> str:
+        return next(parts)
+
+    monkeypatch.setattr(speech, "_split_ogg", fake_split)
+    monkeypatch.setattr(speech, "recognize_ogg", fake_stt)
+    parse_order_mock(monkeypatch)
+
+    await send_voice(flow, duration=45, file_size=300_000)
+
+    assert split_calls["count"] == 1
+    recognized = [t for t in flow.session.sent_texts if t.startswith("Распознал")]
+    assert recognized and "первая часть вторая часть" in recognized[-1]
 
 
 async def test_voice_too_big_rejected_without_stt(flow, monkeypatch):
     stt = recognize_mock(monkeypatch)
 
-    await send_voice(flow, file_size=2 * 1024 * 1024)
+    await send_voice(flow, file_size=3 * 1024 * 1024)
     assert flow.session.sent_texts[-1] == VOICE_TOO_LONG
     assert stt["count"] == 0
 
@@ -142,7 +172,7 @@ async def test_voice_unknown_size_checked_via_get_file(flow, monkeypatch):
     файл целиком скачивался в память, чтобы только потом быть отклонённым.
     """
     stt = recognize_mock(monkeypatch)
-    flow.session.get_file_size = 2 * 1024 * 1024  # настоящий размер из getFile
+    flow.session.get_file_size = 3 * 1024 * 1024  # настоящий размер из getFile
 
     await send_voice(flow, file_size=None)
 
@@ -167,9 +197,9 @@ async def test_voice_unknown_everywhere_capped_during_download(flow, monkeypatch
 
     assert flow.session.sent_texts[-1] == VOICE_TOO_LONG
     assert stt["count"] == 0  # к распознаванию не ходили
-    # прочитано ровно до превышения лимита (1 МБ / 64 КБ = 16 кусков + 1),
-    # остальные ~83 куска не скачивались
-    assert flow.session.streamed_chunks <= 17
+    # прочитано ровно до превышения лимита (2 МБ / 64 КБ = 32 куска + 1),
+    # остальные ~67 кусков не скачивались
+    assert flow.session.streamed_chunks <= 33
 
 
 async def test_voice_small_stream_without_sizes_recognized(flow, monkeypatch):
@@ -474,3 +504,91 @@ async def test_recognize_ogg_without_keys(monkeypatch):
 
     with pytest.raises(speech.SpeechUnavailable):
         await speech.recognize_ogg(b"OggS...")
+
+
+# ---------------------------------------------------------------------------
+# recognize_voice: голосовые до минуты — нарезка на куски под лимит SpeechKit
+# ---------------------------------------------------------------------------
+
+
+async def test_recognize_voice_short_single_request(respx_mock, stt_settings):
+    """До 30 секунд — один запрос, без нарезки."""
+    route = respx_mock.post(speech.STT_URL).mock(
+        return_value=httpx.Response(200, json={"result": "замена крана"})
+    )
+
+    assert await speech.recognize_voice(b"OggS...", duration=10) == "замена крана"
+    assert route.call_count == 1
+
+
+async def test_recognize_voice_long_splits_and_joins(
+    respx_mock, stt_settings, monkeypatch
+):
+    """Дольше 30 секунд — нарезка ffmpeg и склейка распознанных кусков."""
+
+    async def fake_split(data: bytes) -> list[bytes]:
+        assert data == b"long-ogg"
+        return [b"chunk-a", b"chunk-b"]
+
+    monkeypatch.setattr(speech, "_split_ogg", fake_split)
+    route = respx_mock.post(speech.STT_URL).mock(
+        side_effect=[
+            httpx.Response(200, json={"result": "первая часть"}),
+            httpx.Response(200, json={"result": "вторая часть"}),
+        ]
+    )
+
+    result = await speech.recognize_voice(b"long-ogg", duration=45)
+
+    assert result == "первая часть вторая часть"
+    assert route.call_count == 2
+
+
+async def test_recognize_voice_split_failure_unavailable(monkeypatch, stt_settings):
+    """Сбой нарезки (нет ffmpeg, битый файл) — мягкая недоступность STT."""
+
+    async def broken_split(data: bytes) -> list[bytes]:
+        raise speech.SpeechUnavailable("ffmpeg не справился")
+
+    monkeypatch.setattr(speech, "_split_ogg", broken_split)
+
+    with pytest.raises(speech.SpeechUnavailable):
+        await speech.recognize_voice(b"long-ogg", duration=45)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нет ffmpeg")
+async def test_split_ogg_real_ffmpeg(tmp_path):
+    """Живой ffmpeg режет длинный OggOpus на куски короче лимита SpeechKit.
+
+    35 секунд тишины кодируются в opus и режутся: кусков минимум два, все
+    непустые. Тот же ffmpeg стоит в Docker-образе — тест охраняет команду
+    нарезки от расхождения с реальным бинарём.
+    """
+    source = tmp_path / "long.ogg"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=48000:cl=mono",
+        "-t",
+        "35",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "48k",
+        str(source),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.communicate()
+    assert proc.returncode == 0
+
+    chunks = await speech._split_ogg(source.read_bytes())
+
+    assert len(chunks) >= 2
+    assert all(chunks)
+    assert all(len(chunk) <= speech.MAX_SIZE_BYTES for chunk in chunks)
