@@ -1178,7 +1178,7 @@ class Database:
             "activity_id": row[4],
         }
 
-    async def sent_deal_reminders(self, limit: int = 20) -> list[dict[str, Any]]:
+    async def sent_deal_reminders(self, limit: int = 50) -> list[dict[str, Any]]:
         """Недавно отправленные напоминания сделок — кандидаты перевооружения.
 
         Окно SENT_REARM_WINDOW_SECONDS отсчитывается от момента ОТПРАВКИ
@@ -1189,6 +1189,13 @@ class Database:
         так ведёт обычная сверка. От каждой сделки — одна запись, самая
         свежая; порядок случайный (см. cancelled_deal_reminders: те же
         причины — кандидатов может быть больше limit).
+
+        Ёмкость по построению конечна: limit сделок в проход, проходы раз в
+        RECONCILE_INTERVAL, grace перевооружения — два интервала. То есть в
+        пределах grace сканируются до 3*limit сделок — заведомо больше
+        реального бэклога портала (единицы заявок в день); ещё больший
+        одномоментный бэклог сознательно не гонится за полнотой, а платит
+        поздним пингом только за хвост дальше 3*limit.
         """
         async with aiosqlite.connect(self.path) as conn:
             cur = await conn.execute(

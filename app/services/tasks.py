@@ -135,7 +135,11 @@ TASK_STATUS_COMPLETED = "5"
 # ложного fail-open — лишний пинг по удалённой задаче, его можно отменить
 # кнопкой; цена ложного «нет» — тишина навсегда.
 _TASK_MISSING_RE = re.compile(r"задача не найдена|\btask not found\b", re.IGNORECASE)
-_TASK_AMBIGUOUS_RE = re.compile(r"недоступ|not\s+accessible", re.IGNORECASE)
+# «Недоступна» в тексте ЛЮБОЙ локали или в самом коде ошибки (с
+# подчёркиваниями): такой ответ допускает «нет прав», а не «удалена».
+_TASK_AMBIGUOUS_RE = re.compile(
+    r"недоступ|not\s+accessible|NOT_ACCESSIBLE", re.IGNORECASE
+)
 
 
 def _task_is_missing(error_text: str) -> bool:
@@ -163,6 +167,12 @@ async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | 
         if is_server_refusal(exc) and _task_is_missing(str(exc)):
             return None
         raise
+    if isinstance(result, list) and not result:
+        # Живой контракт портала (проверено tasks.task.get по несуществующему
+        # id 23.07): на отсутствующую задачу приходит ПУСТОЙ result без
+        # ошибки. Пустой список — единственный надёжный признак «задачи нет»;
+        # ветка с текстом ошибки выше — запас на другие конфигурации.
+        return None
     if not isinstance(result, dict):
         raise MalformedBitrixResponse("Bitrix вернул неверный result для tasks.task.get")
     return result
