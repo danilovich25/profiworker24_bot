@@ -1033,11 +1033,13 @@ async def test_sent_scan_rotates_without_starvation(db, bot, session):
     assert rows[0]["entity_id"] == seen[0]
 
 
-async def test_reconcile_marks_scanned_sent_rows(db, bot, session):
-    """Проход сверки отмечает просканированные sent-строки для ротации.
+async def test_reconcile_marks_scanned_sent_rows_even_on_failure(db, bot, session):
+    """Проход сверки отмечает КАЖДУЮ обработанную sent-строку, включая сбойные.
 
-    Сбой чтения дел отметку НЕ ставит: такая сделка не теряет приоритет и
-    перечитывается следующим проходом (fail-open).
+    Если бы сбой чтения дел не отмечался, сделка с постоянной ошибкой (или
+    их толпа) навсегда занимала бы голову очереди ротации и исправный хвост
+    не сканировался бы никогда. Отметка после любой попытки честна для
+    всех: сбойная сделка ретраится следующим кругом ротации.
     """
     now = int(time.time())
     await db.add_reminder(1, "заявка №78. Срок: скоро", now - 300, "deal", DEAL, 14)
@@ -1051,7 +1053,8 @@ async def test_reconcile_marks_scanned_sent_rows(db, bot, session):
         checked = [row[0] for row in await cur.fetchall()]
     assert checked and all(checked)
 
-    # Второй sent — портал недоступен: отметка не ставится, приоритет цел.
+    # Второй sent — портал в ошибке: отметка ВСЁ РАВНО ставится, голова
+    # очереди не залипает на сбойной сделке.
     await db.add_reminder(1, "заявка №79. Срок: скоро", now - 300, "deal", 79, 21)
     assert await tasks.send_due_reminders(bot, db, now_ts=now, bitrix=None) == 1
     await tasks.reconcile_deal_reminders(FakeTodoBitrix(fail=True), db, now_ts=now)
@@ -1061,7 +1064,7 @@ async def test_reconcile_marks_scanned_sent_rows(db, bot, session):
             "WHERE status = 'sent' AND entity_id = 79"
         )
         row = await cur.fetchone()
-    assert row is not None and row[0] is None
+    assert row is not None and row[0] is not None
 
 
 async def test_sent_scan_window_limits_rearm_cost(db, bot, session):

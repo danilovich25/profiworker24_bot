@@ -657,16 +657,20 @@ async def reconcile_deal_reminders(
         seen.add(deal_id)
         try:
             todos = await _read_deal_todos(bx, int(deal_id))
-            if todos is None:
-                # Отметка ротации не ставится: сделка не теряет приоритет
-                # и перечитывается следующим проходом.
-                continue
-            await rearm_deal_reminder(db, reminder, todos, now_ts)
-            await db.mark_rearm_checked(reminder["id"])
+            if todos is not None:
+                await rearm_deal_reminder(db, reminder, todos, now_ts)
         except Exception:
             log.exception(
                 "Перевооружение после напоминания id=%s не удалось", reminder["id"]
             )
+        # Отметка ротации ставится после ЛЮБОЙ попытки, включая сбойную:
+        # иначе сделка с постоянной ошибкой чтения (или их толпа) навсегда
+        # занимала бы голову очереди и исправный хвост не сканировался бы.
+        # Повтор сбойной придёт следующим кругом ротации.
+        try:
+            await db.mark_rearm_checked(reminder["id"])
+        except Exception:
+            log.exception("Отметка ротации id=%s не записана", reminder["id"])
     return count
 
 
