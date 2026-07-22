@@ -54,6 +54,8 @@ BOT_COMMANDS = [
     BotCommand(command="new", description="Новая заявка"),
     BotCommand(command="find", description="Найти заявку"),
     BotCommand(command="last", description="Последние заявки"),
+    BotCommand(command="remind", description="Поставить напоминание"),
+    BotCommand(command="reminders", description="Мои напоминания"),
     BotCommand(command="help", description="Помощь"),
 ]
 

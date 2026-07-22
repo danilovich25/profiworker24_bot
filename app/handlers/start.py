@@ -15,6 +15,8 @@ router = Router(name="start")
 BTN_NEW = "Новая заявка"
 BTN_FIND = "Найти"
 BTN_LAST = "Последние"
+BTN_REMIND = "Напоминание"
+BTN_MY_REMINDERS = "Мои напоминания"
 
 # Кнопки клавиатуры СТАРОГО бота (ветка legacy/telebot-mvp). Reply-клавиатура
 # живёт в чате, пока её не заменят: у сотрудника, не нажимавшего /start после
@@ -31,7 +33,9 @@ WELCOME = (
     "«Иван, 89141234567, сантехника, срочно завтра, замена крана»\n\n"
     "Я разберу сообщение и заведу клиента и сделку в Bitrix24.\n\n"
     "Кнопки меню: «Новая заявка» — подсказка по формату, «Найти» — поиск "
-    "по телефону, номеру заявки или названию, «Последние» — последние 10 заявок."
+    "по телефону, номеру заявки или названию, «Последние» — последние 10 заявок, "
+    "«Напоминание» — отдельное напоминание на любую дату и с любым текстом, "
+    "«Мои напоминания» — список ожидающих и отмена."
 )
 
 NEW_ORDER_HINT = (
@@ -52,6 +56,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=BTN_NEW)],
             [KeyboardButton(text=BTN_FIND), KeyboardButton(text=BTN_LAST)],
+            [KeyboardButton(text=BTN_REMIND), KeyboardButton(text=BTN_MY_REMINDERS)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -59,16 +64,19 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 
 async def _close_search_flow(state: FSMContext) -> None:
-    """Закрывает ожидание поискового запроса при /start и /help.
+    """Закрывает ожидание поискового запроса или напоминания при /start и /help.
 
     После приветствия пользователь следует подсказке и шлёт заявку — она не
-    должна поглощаться как поисковый запрос забытого /find. Незаконченный
-    опросник заявки командами помощи НЕ сбрасывается (полный сброс — /new).
-    Состояние сверяется по имени группы, а не импортом SearchFlow:
-    handlers/search сам импортирует кнопки из этого модуля.
+    должна поглощаться как поисковый запрос забытого /find или как текст
+    напоминания. Незаконченный опросник заявки командами помощи НЕ
+    сбрасывается (полный сброс — /new). Состояние сверяется по имени группы,
+    а не импортом SearchFlow/ReminderFlow: handlers/search и
+    handlers/reminders сами импортируют кнопки из этого модуля.
     """
     current = await state.get_state()
-    if current is not None and current.startswith("SearchFlow"):
+    if current is not None and (
+        current.startswith("SearchFlow") or current.startswith("ReminderFlow")
+    ):
         await state.clear()
 
 

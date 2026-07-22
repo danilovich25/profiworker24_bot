@@ -1214,6 +1214,50 @@ class Database:
             for row in rows
         ]
 
+    async def pending_chat_reminders(
+        self, chat_id: int, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Ожидающие пинги чата (все виды) — список «Мои напоминания»."""
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, kind, entity_id FROM reminders "
+                "WHERE chat_id = ? AND status = ? ORDER BY due_ts LIMIT ?",
+                (chat_id, REMINDER_PENDING, limit),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "chat_id": row[1],
+                "text": row[2],
+                "due_ts": row[3],
+                "kind": row[4],
+                "entity_id": row[5],
+            }
+            for row in rows
+        ]
+
+    async def get_reminder(self, reminder_id: int) -> dict[str, Any] | None:
+        """Напоминание по id (для кнопки отмены) или None."""
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "SELECT id, chat_id, text, due_ts, kind, entity_id, status "
+                "FROM reminders WHERE id = ?",
+                (reminder_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "chat_id": row[1],
+            "text": row[2],
+            "due_ts": row[3],
+            "kind": row[4],
+            "entity_id": row[5],
+            "status": row[6],
+        }
+
     async def pending_task_reminders(self, limit: int = 200) -> list[dict[str, Any]]:
         """Неотправленные пинги отдельных напоминаний — для сверки с задачами.
 

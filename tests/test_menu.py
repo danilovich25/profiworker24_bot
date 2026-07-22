@@ -63,7 +63,9 @@ async def test_start_shows_menu_keyboard(flow):
     msg = flow.session.sent_messages[-1]
     assert "заявк" in msg.text.lower()
     buttons = [b.text for row in msg.reply_markup.keyboard for b in row]
-    assert buttons == [BTN_NEW, BTN_FIND, BTN_LAST]
+    from app.handlers.start import BTN_MY_REMINDERS, BTN_REMIND
+
+    assert buttons == [BTN_NEW, BTN_FIND, BTN_LAST, BTN_REMIND, BTN_MY_REMINDERS]
 
 
 async def test_new_order_button_hints(flow):
@@ -222,7 +224,7 @@ async def test_setup_bot_commands(bot, session):
     await setup_bot_commands(bot)
     request = [r for r in session.requests if isinstance(r, SetMyCommands)][-1]
     names = [c.command for c in request.commands]
-    assert names == ["new", "find", "last", "help"]
+    assert names == ["new", "find", "last", "remind", "reminders", "help"]
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +271,9 @@ async def test_legacy_new_button_hints_and_refreshes_keyboard(flow):
     msg = flow.session.sent_messages[-1]
     assert msg.text == NEW_ORDER_HINT
     buttons = [b.text for row in msg.reply_markup.keyboard for b in row]
-    assert buttons == [BTN_NEW, BTN_FIND, BTN_LAST]
+    from app.handlers.start import BTN_MY_REMINDERS, BTN_REMIND
+
+    assert buttons == [BTN_NEW, BTN_FIND, BTN_LAST, BTN_REMIND, BTN_MY_REMINDERS]
 
 
 async def test_legacy_buttons_do_not_break_active_order(flow, monkeypatch):

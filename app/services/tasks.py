@@ -154,11 +154,13 @@ async def complete_reminder_task(bx: BitrixClient, task_id: int) -> bool:
     """Завершает задачу-напоминание (tasks.task.complete), best-effort.
 
     Вызывается при отмене напоминания через бота: иначе Bitrix продолжал бы
-    слать свой колокольчик по отменённому. Сбой только логируется — Telegram-
-    пинг уже снят, а задачу заказчик может закрыть и руками.
+    слать свой колокольчик по отменённому. Сбой и повисший портал (дедлайн
+    SYNC_CRM_DEADLINE) только логируются — Telegram-пинг уже снят, а задачу
+    заказчик может закрыть и руками.
     """
     try:
-        await call_once(bx, "tasks.task.complete", {"taskId": task_id})
+        async with asyncio.timeout(SYNC_CRM_DEADLINE):
+            await call_once(bx, "tasks.task.complete", {"taskId": task_id})
     except Exception:
         log.warning("Задача-напоминание %s не завершена в Bitrix24", task_id, exc_info=True)
         return False

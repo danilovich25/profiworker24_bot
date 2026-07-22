@@ -32,6 +32,8 @@ from app.handlers.messages import OrderFlow, category_keyboard, source_keyboard
 from app.handlers.start import (
     BTN_FIND,
     BTN_LAST,
+    BTN_MY_REMINDERS,
+    BTN_REMIND,
     EDIT_IN_PROGRESS,
     LEGACY_BTN_FIND,
     LEGACY_BTN_LAST,
@@ -540,14 +542,21 @@ async def on_edit_value(message: Message, state: FSMContext) -> None:
     await edit_value_step(message, state, message.text or "")
 
 
-_MENU_BUTTON_TEXTS = {BTN_FIND, BTN_LAST, LEGACY_BTN_FIND, LEGACY_BTN_LAST}
+_MENU_BUTTON_TEXTS = {
+    BTN_FIND,
+    BTN_LAST,
+    BTN_REMIND,
+    BTN_MY_REMINDERS,
+    LEGACY_BTN_FIND,
+    LEGACY_BTN_LAST,
+}
 
 
 @router.message(DealEditFlow.choosing, F.text.in_(_MENU_BUTTON_TEXTS))
 @router.message(DealEditFlow.typing, F.text.in_(_MENU_BUTTON_TEXTS))
-@router.message(EDIT_STATES, Command("find", "last"))
+@router.message(EDIT_STATES, Command("find", "last", "remind", "reminders"))
 async def protect_edit_flow(message: Message) -> None:
-    """Поиск не рвёт незаконченную правку — сначала сохранить или отменить."""
+    """Поиск и напоминания не рвут правку — сначала сохранить или отменить."""
     await message.answer(EDIT_IN_PROGRESS)
 
 
