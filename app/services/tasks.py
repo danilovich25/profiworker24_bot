@@ -170,8 +170,11 @@ async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | 
     if isinstance(result, list) and not result:
         # Живой контракт портала (проверено tasks.task.get по несуществующему
         # id 23.07): на отсутствующую задачу приходит ПУСТОЙ result без
-        # ошибки. Пустой список — единственный надёжный признак «задачи нет»;
-        # ветка с текстом ошибки выше — запас на другие конфигурации.
+        # ошибки. Для ЧУЖОЙ задачи пустой result значил бы и «нет доступа»,
+        # но сюда попадают только задачи, созданные этим же вебхуком
+        # (create_reminder_task): создатель видит свою задачу, пока она
+        # существует, поэтому пустой result для неё — удаление. Ветка с
+        # текстом ошибки выше — запас на другие конфигурации портала.
         return None
     if not isinstance(result, dict):
         raise MalformedBitrixResponse("Bitrix вернул неверный result для tasks.task.get")
