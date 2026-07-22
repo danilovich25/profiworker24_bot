@@ -21,12 +21,12 @@ from app.handlers.reminders import (
 )
 from app.handlers.search import ACTIVE_ORDER_WARNING, ASK_QUERY, SearchFlow
 from app.handlers.start import BTN_FIND, BTN_MY_REMINDERS, BTN_REMIND
+from app.handlers.messages import OrderFlow
 from app.main import create_dispatcher
 from app.schemas import Intent, ParsedOrder
 from app.services import llm, speech
 from tests.conftest import make_message_update, make_voice_update
 from tests.test_handlers_messages import FakeBitrix
-from app.handlers.messages import OrderFlow
 
 
 class FakeReminderBitrix(FakeBitrix):

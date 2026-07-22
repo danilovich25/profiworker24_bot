@@ -69,6 +69,41 @@ _WEEKDAY_RE = re.compile(
 # датой не считаются.
 _DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{2})(?:\.(\d{4}))?\b")
 
+# Дата с месяцем словами: «23 июля», «23 июля 2026», «15 июль» — просьба
+# заказчика («говорить не 07 месяц, а июля»). Принимаются именительный и
+# родительный падежи; число месяца прописью («двадцать третьего июля»)
+# детерминированно не разбирается — его понимает модель, а resolve_deadline
+# берёт её ISO, когда код даты в тексте не нашёл.
+_MONTH_NAME_RE = re.compile(
+    r"\b(\d{1,2})\s+(январ[ья]?|феврал[ья]?|март[а]?|апрел[ья]?|ма[йя]|июн[ья]?|"
+    r"июл[ья]?|август[а]?|сентябр[ья]?|октябр[ья]?|ноябр[ья]?|декабр[ья]?)\b"
+    r"(?:\s+(\d{4})\b)?"
+)
+
+# Основы месяцев к номерам. Проверка — по startswith от самой длинной
+# основы: «март…» обязан совпасть раньше «ма» (иначе март стал бы маем).
+_MONTH_STEMS = (
+    ("январ", 1),
+    ("феврал", 2),
+    ("март", 3),
+    ("апрел", 4),
+    ("ма", 5),
+    ("июн", 6),
+    ("июл", 7),
+    ("август", 8),
+    ("сентябр", 9),
+    ("октябр", 10),
+    ("ноябр", 11),
+    ("декабр", 12),
+)
+
+
+def _month_number(word: str) -> int:
+    for stem, number in sorted(_MONTH_STEMS, key=lambda pair: -len(pair[0])):
+        if word.startswith(stem):
+            return number
+    raise ValueError(f"не месяц: {word}")
+
 # Время принимается только в однозначной форме: с минутами («в 10:00»),
 # со словом «час…» («к 9 часам») или с уточнением суток («в 9 утра»).
 # Голое «в 10» временем не считается — это может быть «в 10 метрах».
@@ -137,6 +172,19 @@ def _extract_date(text: str, now: datetime) -> date | None:
             return None
         if match.group(3) is None and found < now.date():
             # «15.01» в июле — про следующий январь, а не про прошедший.
+            found = date(year + 1, month, day)
+        return found
+
+    match = _MONTH_NAME_RE.search(text)
+    if match is not None:
+        day, month = int(match.group(1)), _month_number(match.group(2))
+        year = int(match.group(3)) if match.group(3) else now.year
+        try:
+            found = date(year, month, day)
+        except ValueError:
+            return None
+        if match.group(3) is None and found < now.date():
+            # «5 января» в июле — про следующий январь.
             found = date(year + 1, month, day)
         return found
 
