@@ -961,11 +961,12 @@ async def test_sent_scan_window_limits_rearm_cost(db, bot, session):
 async def test_old_schema_sent_rows_migrate_and_rearm(tmp_path, bot, session):
     """База старой схемы (без sent_at) мигрирует, и её sent-строки сканируются.
 
-    Старым отправленным строкам момент отправки неизвестен — назначается
-    МОМЕНТ ИХ СРОКА (due_ts): планировщик шлёт в пределах секунд от срока,
-    и это точнее created_at, который у записи, созданной задолго до срока,
-    выкидывал бы её из окна сразу после миграции. Свежеотправленная строка
-    остаётся кандидатом перевооружения, давняя — отсекается окном.
+    Момент отправки старых строк неизвестен, и любая оценка (created_at —
+    запись могла быть создана задолго до срока; due_ts — планировщик после
+    простоя шлёт и с опозданием в дни) кого-нибудь теряет. Поэтому бэкфил —
+    моментом миграции: разово в окно попадает вся история sent-строк, зато
+    ни одна недавно отправленная не выпадает из перевооружения. Цена — по
+    одному crm.activity.list на сделку в проход, пока окно не остынет.
     """
     now = int(time.time())
     early_due = now - 600
@@ -984,18 +985,18 @@ async def test_old_schema_sent_rows_migrate_and_rearm(tmp_path, bot, session):
             "created_at TEXT NOT NULL DEFAULT (datetime('now')), "
             "cancelled_at TEXT DEFAULT NULL)"
         )
-        # Запись создана давно (месяц назад), отправлена только что (по due):
-        # окно обязано считать её свежей.
+        # Запись создана давно (месяц назад): бэкфил по created_at терял бы её.
         await conn.execute(
             "INSERT INTO reminders (chat_id, text, due_ts, kind, entity_id, "
             "activity_id, status, created_at) "
             "VALUES (1, ?, ?, 'deal', ?, 16, 'sent', datetime('now', '-30 days'))",
             (early_text, early_due, DEAL),
         )
-        # Давно отработавшая строка — вне окна, дела её сделки не читаются.
+        # Срок трёхдневной давности, отправлена перед миграцией (простой бота):
+        # бэкфил по due_ts терял бы её — а она тоже обязана попасть в скан.
         await conn.execute(
             "INSERT INTO reminders (chat_id, text, due_ts, kind, entity_id, "
-            "activity_id, status) VALUES (1, 'старый пинг', ?, 'deal', 79, 21, 'sent')",
+            "activity_id, status) VALUES (1, 'поздний пинг', ?, 'deal', 79, 21, 'sent')",
             (stale_due,),
         )
         await conn.commit()
@@ -1003,8 +1004,8 @@ async def test_old_schema_sent_rows_migrate_and_rearm(tmp_path, bot, session):
     database = Database(path)
     await database.init()
 
-    rows = await database.sent_deal_reminders()
-    assert [row["entity_id"] for row in rows] == [DEAL]
+    rows = await database.sent_deal_reminders(limit=50)
+    assert sorted(row["entity_id"] for row in rows) == [DEAL, 79]
     bx = FakeTodoBitrix(
         [
             todo(14, dates.epoch_to_iso(deal_due), subject="Заявка: электрика"),

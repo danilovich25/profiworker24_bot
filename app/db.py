@@ -161,6 +161,11 @@ REMINDER_FAILED = "failed"
 # Не навсегда: появившееся у сделки дело со сроком в будущем воскрешает
 # запись (revive_reminder) — см. services/tasks.revive_from_todos.
 REMINDER_CANCELLED = "cancelled"
+# Пинг отменён РУКАМИ через бота (кнопка «Отменить») — терминально: в
+# отличие от cancelled, воскрешению не подлежит никогда. Отдельный статус
+# закрывает гонку «пользователь отменил, а сверка успела до завершения
+# задачи в Bitrix (или завершение упало) и воскресила бы отменённое».
+REMINDER_DISMISSED = "dismissed"
 
 # Окно, в котором периодическая сверка перепроверяет ОТМЕНЁННЫЕ напоминания
 # сделок (cancelled_deal_reminders); отсчитывается от МОМЕНТА ОТМЕНЫ
@@ -276,13 +281,16 @@ class Database:
                 "WHERE status = ? AND cancelled_at IS NULL",
                 (REMINDER_CANCELLED,),
             )
-            # Отправленным строкам старой схемы момент отправки неизвестен —
-            # назначается момент их СРОКА (due_ts): планировщик шлёт в
-            # пределах секунд от срока, а created_at у записи, созданной
-            # задолго до срока и отправленной перед миграцией, выкидывал бы
-            # её из окна перевооружения сразу.
+            # Отправленным строкам старой схемы момент отправки неизвестен,
+            # и любая оценка кого-то теряет: created_at — запись, созданную
+            # задолго до срока; due_ts — отправленную с опозданием после
+            # простоя. Назначается момент миграции: разово в окно скана
+            # попадает вся история sent-строк (цена — по одному
+            # crm.activity.list на сделку в проход, пока окно не остынет),
+            # зато ни одна недавно отправленная не выпадает из
+            # перевооружения.
             await conn.execute(
-                "UPDATE reminders SET sent_at = datetime(due_ts, 'unixepoch') "
+                "UPDATE reminders SET sent_at = datetime('now') "
                 "WHERE status = ? AND sent_at IS NULL",
                 (REMINDER_SENT,),
             )
@@ -1524,6 +1532,23 @@ class Database:
                 "UPDATE reminders SET due_ts = ?, text = ?, activity_id = ?, "
                 "attempts = 0 WHERE id = ? AND status = ?",
                 (due_ts, text, activity_id, reminder_id, REMINDER_PENDING),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+
+    async def dismiss_reminder(self, reminder_id: int) -> bool:
+        """Терминально снимает пинг по РУЧНОЙ отмене (CAS по pending).
+
+        В отличие от cancel_reminder (отмена по состоянию CRM, обратимая
+        воскрешением) dismissed-запись не сканируется и не оживает никогда:
+        решение пользователя не переигрывается сверкой, даже если задача в
+        Bitrix осталась открытой. Момент фиксируется в cancelled_at.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "UPDATE reminders SET status = ?, cancelled_at = datetime('now') "
+                "WHERE id = ? AND status = ?",
+                (REMINDER_DISMISSED, reminder_id, REMINDER_PENDING),
             )
             await conn.commit()
             return cur.rowcount == 1

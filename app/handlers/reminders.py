@@ -103,6 +103,12 @@ CANCEL_STALE = "Уже неактуально"
 
 CANCEL_DONE = "Отменено"
 
+# Окно гонки с отправкой: пинг, чей срок наступил только что, уже может
+# уходить (планировщик шлёт до отметки), отменять его поздно. Сильно
+# просроченный pending — наоборот, застрял (планировщик стоял или отправка
+# падает), и кнопка отмены обязана работать.
+CANCEL_RACE_WINDOW_SECONDS = 60
+
 CANCELLED_TEXT = "Напоминание отменено: {label}"
 
 # Хвост «Срок: …» в тексте пинга дублировал бы дату в списке — срезается.
@@ -292,19 +298,25 @@ async def on_cancel_reminder(
     raw = (callback.data or "").rsplit(":", 1)[-1]
     row = await db.get_reminder(int(raw)) if raw.isdecimal() else None
     chat_id = callback.message.chat.id if callback.message else None
+    now = int(time.time())
+    # Только что наступивший срок не отменяется: планировщик шлёт до
+    # отметки, и «отмена» в этот момент рапортовала бы успех, завершала
+    # задачу Bitrix, а сообщение всё равно приходило. Застрявший сильно
+    # просроченный pending (планировщик стоял, отправка падает) отменяется.
+    racing = (
+        row is not None
+        and row["due_ts"] <= now < row["due_ts"] + CANCEL_RACE_WINDOW_SECONDS
+    )
     if (
         row is None
         or row["kind"] != "task"
         or row["chat_id"] != chat_id
         or row["status"] != REMINDER_PENDING
-        # Наступивший срок не отменяется: планировщик шлёт до отметки, и
-        # «отмена» в этот момент рапортовала бы успех, завершала задачу
-        # Bitrix, а сообщение всё равно приходило.
-        or row["due_ts"] <= int(time.time())
+        or racing
     ):
         await callback.answer(CANCEL_STALE)
         return
-    if not await db.cancel_reminder(row["id"]):
+    if not await db.dismiss_reminder(row["id"]):
         # Гонка: пинг успел отправиться или его уже отменили.
         await callback.answer(CANCEL_STALE)
         return

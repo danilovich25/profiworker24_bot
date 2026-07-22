@@ -127,9 +127,13 @@ async def find_reminder_task(bx: BitrixClient, key: str) -> int | None:
 TASK_STATUS_COMPLETED = "5"
 
 # Ответы портала, означающие именно «задачи нет» (tasks.task.get по
-# удалённой задаче). Прочие ЯВНЫЕ отказы (нет прав, квота) задачей-нет НЕ
-# считаются: снятие пинга по ACCESS_DENIED хоронило бы живое напоминание.
-_TASK_MISSING_RE = re.compile(r"не найдена|not\s*found|TASK_NOT_FOUND", re.IGNORECASE)
+# удалённой задаче): только человекочитаемое «задача не найдена». Прочие
+# отказы — ACCESS_DENIED, METHOD_NOT_FOUND, код TASK_NOT_FOUND_OR_NOT_
+# ACCESSIBLE без этого текста (задача может существовать, но быть
+# недоступной) — задачей-нет НЕ считаются: снятие пинга по ним хоронило бы
+# живое напоминание. Цена ложного fail-open — лишний пинг по удалённой
+# задаче, его можно отменить кнопкой; цена ложного «нет» — тишина навсегда.
+_TASK_MISSING_RE = re.compile(r"задача не найдена|\btask not found\b", re.IGNORECASE)
 
 
 async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | None:

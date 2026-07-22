@@ -268,6 +268,65 @@ async def test_cancel_button_on_due_reminder_is_stale(flow):
     assert all("отменено" not in t.lower() for t in flow.session.sent_texts)
 
 
+async def test_user_cancelled_ping_is_not_revived_by_reconcile(flow):
+    """Ручная отмена терминальна: открытая задача её не воскрешает.
+
+    Гонка ревью: пользователь отменил пинг, а reconcile успел между
+    SQLite-отменой и завершением задачи в Bitrix (или завершение упало) —
+    открытая задача со сроком в будущем НЕ должна оживлять отменённое
+    пользователем.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.services import tasks as tasks_service
+    from tests.conftest import SemanticBitrixFake, make_callback_update
+
+    now = int(time.time())
+    future = now + 3600
+    rid = await flow.db.add_reminder(
+        1, "позвонить заказчику. Срок: скоро", future, "task", 77
+    )
+    await flow.dp.feed_update(
+        flow.bot, make_callback_update(flow.bot, f"rem:cancel:{rid}")
+    )
+    assert await flow.db.pending_task_reminders() == []
+    assert flow.bx.completed == [77]
+
+    deadline_iso = datetime.fromtimestamp(
+        future, timezone(timedelta(hours=10))
+    ).isoformat()
+
+    class OpenTaskBitrix(SemanticBitrixFake):
+        async def _dispatch(self, method: str, params: dict):
+            assert method == "tasks.task.get"
+            return {"task": {"id": "77", "deadline": deadline_iso, "status": "2"}}
+
+    await tasks_service.reconcile_task_reminders(OpenTaskBitrix(), flow.db)
+
+    assert await flow.db.pending_task_reminders() == []
+
+
+async def test_cancel_long_overdue_pending_works(flow):
+    """Пинг, застрявший в pending сильно позже срока, отменить МОЖНО.
+
+    Гвард гонки с отправкой держит только окно вокруг срока: при упавшем
+    планировщике или вечных ретраях пользователь не должен терять кнопку.
+    """
+    now = int(time.time())
+    rid = await flow.db.add_reminder(
+        1, "застрявший пинг. Срок: давно", now - 300, "task", 90
+    )
+
+    from tests.conftest import make_callback_update
+
+    await flow.dp.feed_update(
+        flow.bot, make_callback_update(flow.bot, f"rem:cancel:{rid}")
+    )
+
+    assert await flow.db.pending_task_reminders() == []
+    assert flow.bx.completed == [90]
+
+
 class AddThenFailBitrix(FakeReminderBitrix):
     """Портал, у которого первый tasks.task.add ПРОХОДИТ, но ответ теряется."""
 

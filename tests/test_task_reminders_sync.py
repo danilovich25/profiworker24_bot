@@ -135,17 +135,27 @@ async def test_deleted_task_cancels_ping(db, bot, session):
     assert session.sent_texts == []
 
 
-async def test_access_denied_keeps_ping(db, bot, session):
-    """Отказ портала НЕ «задача не найдена» (права, квота) — fail-open.
+@pytest.mark.parametrize(
+    "error",
+    [
+        "ACCESS_DENIED: нет прав на задачу",
+        "ERROR_METHOD_NOT_FOUND: Method not found",
+        # Код без человеческого «задача не найдена» неоднозначен: задача
+        # может существовать, но быть недоступной — снимать пинг нельзя.
+        "ERROR_TASK_NOT_FOUND_OR_NOT_ACCESSIBLE: доступ ограничен",
+    ],
+)
+async def test_ambiguous_refusal_keeps_ping(db, bot, session, error):
+    """Отказ портала БЕЗ явного «задача не найдена» — fail-open.
 
-    Явный отказ сервера не доказывает, что задачи нет: снятие пинга по
-    ACCESS_DENIED хоронило бы живое напоминание навсегда.
+    ACCESS_DENIED, METHOD_NOT_FOUND и прочие отказы не доказывают, что
+    задачи нет: снятие пинга по ним хоронило бы живое напоминание навсегда.
     """
     await db.add_reminder(CHAT, TEXT, DUE, "task", TASK)
 
     class DeniedBitrix(SemanticBitrixFake):
         async def _dispatch(self, method: str, params: dict) -> Any:
-            raise ErrorInServerResponseException("ACCESS_DENIED: нет прав на задачу")
+            raise ErrorInServerResponseException(error)
 
     await tasks.reconcile_task_reminders(DeniedBitrix(), db)
 
