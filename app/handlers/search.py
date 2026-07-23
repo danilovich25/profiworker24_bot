@@ -247,6 +247,11 @@ def _stem_search_query(query: str) -> str | None:
     return query[: match.start()] + stem
 
 
+def stem_search_query(query: str) -> str | None:
+    """Публичная основа последнего слова запроса (для шага привязки)."""
+    return _stem_search_query(query)
+
+
 def text_search_candidates(raw_query: str) -> list[str]:
     """Варианты текстового запроса от точного к широкому, без дублей.
 

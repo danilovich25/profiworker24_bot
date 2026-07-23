@@ -39,10 +39,14 @@ _NONE_RE = re.compile(
 # а не привязку.
 _LAST_RE = re.compile(r"\b(?:к|по|для)\s+последн\w*\s+заявк\w*", re.IGNORECASE)
 
+# Общий префикс инлайн-ссылки: предлог + «заявка» в любом падеже + пунктуация,
+# которую вставляет STT («к заявке: 154», «по заявке 154»; ревью ULTRA).
+_REF_PREFIX = r"\b(?:к|по|для)\s+заявк[а-яё]*[\s.,:;-]*"
+
 # «К заявке по телефону 8914…» — телефон назван явно.
 _PHONE_KEYWORD_RE = re.compile(
-    r"\bк\s+заявк\w*\s+(?:по\s+)?(?:телефону?|номеру\s+телефона)\s*[:\s]"
-    r"\s*(\+?\d[\d\s()\-]{4,}\d)",
+    _REF_PREFIX + r"(?:по\s+)?(?:телефону?|номеру\s+телефона)[\s.,:;-]*"
+    r"(\+?\d[\d\s()\-]{4,}\d)",
     re.IGNORECASE,
 )
 
@@ -51,12 +55,14 @@ _PHONE_KEYWORD_RE = re.compile(
 # (без восьмёрки) — тоже штатная российская форма (normalize_phone),
 # поэтому минимум — 10 знаков (ревью R5).
 _PHONE_BARE_RE = re.compile(
-    r"\bк\s+заявк\w*\s+(\+?\d[\d\s()\-]{8,}\d)", re.IGNORECASE
+    _REF_PREFIX + r"(\+?\d[\d\s()\-]{8,}\d)", re.IGNORECASE
 )
 
-# «К заявке 154», «к заявке №154», «к заявке номер 154».
+# «К заявке 154», «к заявке №154», «к заявке номер: 154». Цифровой блок
+# может содержать STT-пробелы («123 456 789» — это один номер, не первый
+# его кусок; ревью ULTRA), поэтому захватывается целиком и сжимается кодом.
 _DEAL_NUM_RE = re.compile(
-    r"\bк\s+заявк\w*\s+(?:№\s*|номер[ау]?\s+)?(\d{1,%d})\b" % MAX_DEAL_ID_DIGITS,
+    _REF_PREFIX + r"(?:№\s*|номер[ау]?[\s.,:;-]*)?(\d(?:[ \d]{0,18}\d)?)(?!\d)",
     re.IGNORECASE,
 )
 
@@ -81,9 +87,11 @@ _ANSWER_LAST_RE = re.compile(
 # Падежные формы — ЗАКРЫТЫМ списком: произвольный кириллический хвост
 # съедал бы смысловые слова («Номерной», «Телефонов» — это названия,
 # а не служебные слова; ревью R5).
+# Однобуквенные предлоги срезаются только перед ПРОБЕЛОМ: «К-12» — это
+# название, а не «к» + номер 12 (ревью ULTRA).
 _SERVICE_WORD_RE = re.compile(
-    r"^(?:(?:к|по|для"
-    r"|заявк(?:а|и|е|у|ой|ою)?"
+    r"^(?:(?:к|по|для)(?=\s)"
+    r"|(?:заявк(?:а|и|е|у|ой|ою)?"
     r"|номер(?:а|у|е|ом)?"
     r"|телефон(?:а|у|е|ом)?"
     r")(?=[\s.,:;№\d-]|$)|№)",
@@ -110,14 +118,34 @@ def _cut(text: str, start: int, end: int) -> str:
     return re.sub(r"\s+", " ", rest)
 
 
-def extract_inline_binding(text: str) -> tuple[str, BindingRef | None]:
-    """Находит привязку прямо в тексте напоминания.
+def _trim_phone_span(group: str) -> tuple[str | None, int]:
+    """Телефон из захваченной группы и длина реально потреблённой части.
 
-    Возвращает (текст без фразы привязки, ссылка | None). None — привязка
-    не названа, нужно спросить. Распознаются только однозначные формы
-    (последняя, номер, телефон, «обычное») — свободное название заявки в
-    потоке текста не угадывается, чтобы не съесть само напоминание.
+    STT может приклеить к номеру следующую дату («89141234567 23 июля»):
+    для российских форм берётся штатная длина (11 цифр с 8/7, 10 цифр с 9),
+    остаток остаётся тексту напоминания (ревью ULTRA).
     """
+    digits = re.sub(r"\D", "", group)
+    limit = None
+    if len(digits) > 11 and digits[0] in "78":
+        limit = 11
+    elif len(digits) > 10 and digits[0] == "9":
+        limit = 10
+    if limit is None:
+        return normalize_phone(group), len(group)
+    count = 0
+    end = len(group)
+    for index, char in enumerate(group):
+        if char.isdigit():
+            count += 1
+            if count == limit:
+                end = index + 1
+                break
+    return normalize_phone(group[:end]), end
+
+
+def _extract_one(text: str) -> tuple[str, BindingRef | None]:
+    """Первая инлайн-ссылка в тексте: (текст без фразы, ссылка | None)."""
     raw = (text or "").strip()
     if not raw:
         return raw, None
@@ -129,15 +157,47 @@ def extract_inline_binding(text: str) -> tuple[str, BindingRef | None]:
         return _cut(raw, match.start(), match.end()), BindingRef("last")
     match = _PHONE_KEYWORD_RE.search(raw) or _PHONE_BARE_RE.search(raw)
     if match:
-        phone = normalize_phone(match.group(1))
+        phone, consumed = _trim_phone_span(match.group(1))
         if phone is not None:
-            return _cut(raw, match.start(), match.end()), BindingRef("phone", phone)
+            end = match.start(1) + consumed
+            return _cut(raw, match.start(), end), BindingRef("phone", phone)
     match = _DEAL_NUM_RE.search(raw)
     if match:
-        return _cut(raw, match.start(), match.end()), BindingRef(
-            "deal_id", match.group(1)
-        )
+        compact = re.sub(r"\s", "", match.group(1))
+        if len(compact) <= MAX_DEAL_ID_DIGITS:
+            return _cut(raw, match.start(), match.end()), BindingRef(
+                "deal_id", compact
+            )
+        # 10-15 цифр — это телефон, названный без слова «телефон».
+        phone = normalize_phone(compact)
+        if phone is not None:
+            return _cut(raw, match.start(), match.end()), BindingRef("phone", phone)
     return raw, None
+
+
+def extract_inline_binding(text: str) -> tuple[str, BindingRef | None]:
+    """Находит привязку прямо в тексте напоминания.
+
+    Возвращает (текст без фразы привязки, ссылка | None). None — привязка
+    не названа, нужно спросить. Распознаются только однозначные формы
+    (последняя, номер, телефон, «обычное») — свободное название заявки в
+    потоке текста не угадывается, чтобы не съесть само напоминание.
+
+    Две РАЗНЫЕ ссылки в одном сообщении («к заявке 154, нет, к заявке
+    155») — kind="conflict": самоисправление не угадывается, выбор задаёт
+    явный вопрос (ревью ULTRA). Повтор ОДНОЙ И ТОЙ ЖЕ ссылки конфликтом
+    не считается.
+    """
+    clean, ref = _extract_one(text)
+    if ref is None:
+        return clean, None
+    remainder, second = _extract_one(clean)
+    if second is not None and (second.kind, second.value) != (ref.kind, ref.value):
+        return (text or "").strip(), BindingRef("conflict")
+    if second is not None:
+        # Дубль той же ссылки: вычищаем и его, текст короче и честнее.
+        clean = remainder
+    return clean, ref
 
 
 def is_vague_query(text: str) -> bool:

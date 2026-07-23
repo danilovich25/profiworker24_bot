@@ -51,9 +51,10 @@ from app.handlers.search import (
     LIST_LIMIT,
     MENU_BUTTON_STATES,
     SEARCH_DEADLINE,
+    clean_search_query,
     on_find,
     on_last,
-    text_search_candidates,
+    stem_search_query,
 )
 from app.handlers.start import (
     BTN_FIND,
@@ -138,6 +139,8 @@ BIND_QUERY_TOO_SHORT = (
     "или телефон, или нажмите «Без привязки»."
 )
 
+BIND_CONFIRM = "Похоже, это заявка (проверьте и подтвердите кнопкой):"
+
 BIND_LAST_EMPTY = "Заявок пока нет, ставлю обычное напоминание."
 
 BIND_LOST = (
@@ -167,8 +170,10 @@ CANCEL_RACE_WINDOW_SECONDS = 60
 
 CANCELLED_TEXT = "Напоминание отменено: {label}"
 
-# Хвост «Срок: …» в тексте пинга дублировал бы дату в списке — срезается.
-_TAIL_RE = re.compile(r"\.?\s*Срок: .*$", re.S)
+# Хвост «Срок: …» в тексте пинга дублировал бы дату в списке — срезается
+# ПОСЛЕДНЕЕ вхождение: «Срок:» внутри самого текста напоминания
+# («Проверить поле Срок: оплаты») — это текст, а не служебный хвост.
+_TAIL_RE = re.compile(r"\.?\s*Срок:(?:(?!Срок:).)*$", re.S)
 
 
 def _prompt_markup() -> ForceReply:
@@ -361,6 +366,10 @@ async def handle_reminder_query(
         # относиться к любому из них — инлайн-привязка не угадывается,
         # шаг привязки спросит явно (ревью R3).
         ref = None
+    if ref is not None and ref.kind == "conflict":
+        # Самоисправление («к заявке 154, нет, к 155»): не угадываем,
+        # выбор задаёт явный вопрос (ревью ULTRA).
+        ref = None
     now = dates.now_local()
     deadline = dates.resolve_deadline(llm_deadline, source, now)
     due_ts = dates.reminder_epoch(deadline)
@@ -386,14 +395,20 @@ async def handle_reminder_query(
     if ref is not None and ref.kind == "none":
         await _finalize_reminder(message, state, db, bitrix, pending, None)
         return
-    # Дальше шаг привязки: pending кладётся в FSM ДО похода в CRM, чтобы
-    # /cancel и кнопки меню честно снимали его даже посреди поиска.
-    await state.set_state(ReminderFlow.binding)
-    await state.update_data(rem_pending=pending)
     if ref is not None:
+        # Инлайн-ссылка: pending кладётся в FSM ДО похода в CRM, чтобы
+        # /cancel и кнопки меню честно снимали его даже посреди поиска.
+        await state.set_state(ReminderFlow.binding)
+        await state.update_data(rem_pending=pending)
         await _resolve_binding(message, state, db, bitrix, pending["nonce"], ref)
         return
+    # Вопрос отправляется ДО записи состояния: если он не ушёл, чат не
+    # заперт в невидимом шаге привязки — повтор текста снова разберётся
+    # как напоминание, а не как название заявки (ревью ULTRA; тот же
+    # инвариант, что у опросника заявки).
     await message.answer(BIND_PROMPT, reply_markup=_binding_keyboard(pending["nonce"]))
+    await state.set_state(ReminderFlow.binding)
+    await state.update_data(rem_pending=pending)
 
 
 async def _finalize_reminder(
@@ -476,15 +491,29 @@ async def _reask_binding(
 
 async def _find_deals(
     bitrix: BitrixClient, ref: BindingRef
-) -> tuple[list[dict], bool]:
-    """Заявки по ссылке сотрудника: (совпадения, обрезана ли выборка)."""
+) -> tuple[list[dict], bool, bool]:
+    """Заявки по ссылке: (совпадения, обрезана ли выборка, неточный матч).
+
+    Неточный матч (fuzzy) — совпадение нашлось только основой последнего
+    слова («Ромашке» → «Ромашк»): такое НЕ привязывается молча, а требует
+    подтверждения кнопкой (ревью ULTRA).
+    """
     if ref.kind == "text":
-        for candidate in text_search_candidates(ref.value or ""):
+        raw_query = (ref.value or "").strip()
+        cleaned = clean_search_query(raw_query)
+        exact = list(dict.fromkeys([raw_query] + ([cleaned] if cleaned else [])))
+        for candidate in exact:
             found = await search_deals_by_text(bitrix, candidate)
             if found.deals or found.truncated:
-                return found.deals, found.truncated
-        return [], False
-    return await find_ref_deals(bitrix, ref)
+                return found.deals, found.truncated, False
+        stem = stem_search_query(cleaned) if cleaned else None
+        if stem is not None:
+            found = await search_deals_by_text(bitrix, stem)
+            if found.deals or found.truncated:
+                return found.deals, found.truncated, True
+        return [], False, False
+    deals, truncated = await find_ref_deals(bitrix, ref)
+    return deals, truncated, False
 
 
 async def _resolve_binding(
@@ -503,7 +532,7 @@ async def _resolve_binding(
         return
     try:
         async with asyncio.timeout(SEARCH_DEADLINE):
-            deals, truncated = await _find_deals(bitrix, ref)
+            deals, truncated, fuzzy = await _find_deals(bitrix, ref)
     except Exception:
         log.exception("Поиск заявки для привязки напоминания не удался")
         await _reask_binding(message, state, nonce, BIND_FAILED)
@@ -511,8 +540,15 @@ async def _resolve_binding(
     if truncated:
         await _reask_binding(message, state, nonce, BIND_TOO_BROAD)
         return
-    if len(deals) == 1:
+    if len(deals) == 1 and not fuzzy:
         await _consume_and_finalize(message, state, db, bitrix, nonce, deals[0])
+        return
+    if len(deals) == 1:
+        # Совпадение только по основе слова: показываем и ждём кнопку.
+        line = f"№{deals[0]['ID']} · {str(deals[0].get('TITLE') or 'без названия')}"
+        await _reask_binding(
+            message, state, nonce, "\n".join([BIND_CONFIRM, line]), deals
+        )
         return
     if not deals:
         if ref.kind == "last":

@@ -341,18 +341,23 @@ async def _schedule_task_reminder(
     due_ts = dates.reminder_epoch(order.deadline)
     if due_ts is None or due_ts <= int(dates.now_local().timestamp()):
         return
-    body = order.problem
-    if deal_label:
-        body = f"{body} (заявка {deal_label})"
     try:
         await db.spawn_task_reminder(
             task_id,
             message.chat.id,
-            text=f"{body}. Срок: {dates.format_deadline(order.deadline)}",
+            text=_task_ping_text(order, deal_label),
             due_ts=due_ts,
         )
     except Exception:
         log.exception("Telegram-напоминание для задачи %s не записано", task_id)
+
+
+def _task_ping_text(order: ParsedOrder, deal_label: str | None) -> str:
+    """Текст Telegram-пинга отдельного напоминания (с подписью заявки)."""
+    body = order.problem
+    if deal_label:
+        body = f"{body} (заявка {deal_label})"
+    return f"{body}. Срок: {dates.format_deadline(order.deadline)}"
 
 
 async def _freeze_draft_unknown(db: Database, draft_id: str, token: str, key: str) -> bool:
@@ -1083,24 +1088,31 @@ async def _actual_task_binding_label(
 ) -> str | None:
     """Подпись по ФАКТИЧЕСКОЙ привязке существующей задачи (UF_CRM_TASK).
 
-    Сбой чтения → None: честнее промолчать про заявку, чем назвать сделку
-    из свежего разрешения, которое могло разойтись с привязкой задачи.
+    Сбой чтения самой задачи → None: честнее промолчать про заявку, чем
+    назвать сделку из свежего разрешения, которое могло разойтись с
+    привязкой задачи. Если же номер сделки уже достоверно прочитан, а упало
+    только обогащение (crm.deal.get/контакт) — подпись деградирует до
+    «№<id>», номер не теряется (ревью ULTRA).
     """
     try:
         async with asyncio.timeout(POST_DEAL_DEADLINE):
             task = await get_reminder_task(bitrix, task_id)
-            actual_id = task_deal_id(task) if task else None
-            if actual_id is None:
-                return None
-            deal = await get_deal(bitrix, actual_id)
     except Exception:
         log.warning(
             "Привязка существующей задачи %s не прочитана", task_id, exc_info=True
         )
         return None
-    if deal is None:
-        return f"№{actual_id}"
-    return await deal_binding_label(bitrix, deal)
+    actual_id = task_deal_id(task) if task else None
+    if actual_id is None:
+        return None
+    try:
+        async with asyncio.timeout(POST_DEAL_DEADLINE):
+            deal = await get_deal(bitrix, actual_id)
+            if deal is not None:
+                return await deal_binding_label(bitrix, deal)
+    except Exception:
+        log.warning("Заявка %s для подписи не прочитана", actual_id, exc_info=True)
+    return f"№{actual_id}"
 
 
 async def _create_reminder(
@@ -1247,6 +1259,14 @@ async def _create_reminder(
         # сделке, чем разрешилось сейчас (например, «последняя» успела
         # смениться к повтору). Правду знает сама задача (ревью R4).
         deal_label = await _actual_task_binding_label(bitrix, task_id)
+        # Уже стоящий пинг мог быть записан со старой подписью — иначе
+        # подтверждение и пинг называли бы разные заявки (ревью ULTRA).
+        try:
+            await db.update_task_reminder_text(
+                task_id, _task_ping_text(order, deal_label)
+            )
+        except Exception:
+            log.exception("Текст пинга задачи %s не обновлён", task_id)
     # Гарантированный канал: бот сам напишет в Telegram в момент срока.
     # Ставится на любом пути существования задачи (в т.ч. найденной сверкой
     # после потерянного ответа add) — вставка идемпотентна по задаче.

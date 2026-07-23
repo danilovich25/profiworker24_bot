@@ -1308,6 +1308,23 @@ class Database:
             await conn.commit()
             return cur.rowcount == 1
 
+    async def update_task_reminder_text(self, task_id: int, text: str) -> bool:
+        """Обновляет текст ОЖИДАЮЩЕГО пинга задачи (kind=task, pending).
+
+        Нужен идемпотентному повтору создания: существующая задача могла
+        быть привязана к другой сделке, чем разрешилось сейчас, и подпись
+        заявки в очереди обязана совпадать с фактической (и с ответом
+        пользователю). Отправленные/отменённые записи не трогаются.
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "UPDATE reminders SET text = ? "
+                "WHERE kind = 'task' AND entity_id = ? AND status = ?",
+                (text, task_id, REMINDER_PENDING),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
     async def cancelled_task_reminders(self, limit: int = 20) -> list[dict[str, Any]]:
         """Недавно отменённые пинги задач — кандидаты на воскрешение.
 

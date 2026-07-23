@@ -796,6 +796,213 @@ async def test_text_answer_with_prefix_finds_deal(flow, monkeypatch):
     assert await state_of(flow) is None
 
 
+# --- Правки по ревью Sol ULTRA -------------------------------------------
+
+
+def test_conflicting_inline_refs_are_not_guessed():
+    """«К заявке 154, нет, к заявке 155» — конфликт, а не привязка к 154."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к заявке 155 завтра в 8 позвонить"
+    )
+    assert ref is not None and ref.kind == "conflict"
+    _, ref = extract_inline_binding(
+        "к последней заявке, нет, к заявке 154 завтра в 8 позвонить"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+async def test_conflicting_refs_ask_question(flow, monkeypatch):
+    """Конфликт ссылок в кнопочном флоу приводит к явному вопросу."""
+    raw = "к заявке 154, нет, к заявке 155 через 2 часа позвонить заказчику"
+
+    async def fake(text: str):
+        return reminder_order("позвонить заказчику")
+
+    monkeypatch.setattr(llm, "parse_order", fake)
+    await send(flow, BTN_REMIND)
+    await send(flow, raw)
+
+    assert flow.bx.tasks == []
+    assert flow.session.sent_messages[-1].text == BIND_PROMPT
+    assert await state_of(flow) == ReminderFlow.binding.state
+
+
+def test_spaced_digits_deal_id():
+    """STT-пробелы в числе: «к заявке 123 456 789» → D_123456789."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding("к заявке 123 456 789 завтра в 8 позвонить")
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("deal_id", "123456789")
+
+
+def test_phone_does_not_swallow_following_date():
+    """«По телефону 89141234567 23 июля …» — телефон 11 цифр, дата цела."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону 89141234567 23 июля в 8 позвонить"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+    assert "23 июля" in clean
+
+
+def test_inline_forms_with_punctuation_and_po():
+    """«К заявке: 154», «к заявке номер: 154», «по заявке 154» — точный ID."""
+    from app.services.binding import extract_inline_binding
+
+    for raw in (
+        "к заявке: 154 завтра в 8 позвонить",
+        "к заявке номер: 154 завтра в 8 позвонить",
+        "по заявке 154 завтра в 8 позвонить",
+    ):
+        _, ref = extract_inline_binding(raw)
+        assert ref is not None, raw
+        assert (ref.kind, ref.value) == ("deal_id", "154"), raw
+
+
+def test_hyphenated_name_is_not_service_word():
+    """Ответ «К-12» — название, а не срез предлога до ID 12 (Sol ULTRA)."""
+    from app.services.binding import parse_binding_answer
+
+    ref = parse_binding_answer("К-12")
+    assert ref.kind == "text"
+    assert "К-12" in (ref.value or "")
+    assert parse_binding_answer("к 12").kind == "deal_id"
+
+
+async def test_failed_bind_prompt_does_not_trap_state(flow, monkeypatch):
+    """Сбой доставки вопроса о привязке не запирает чат в невидимом шаге.
+
+    Если BIND_PROMPT не ушёл, состояние обязано остаться в query: повтор
+    текста снова разбирается как напоминание, а не как название заявки.
+    """
+    from aiogram.methods import SendMessage
+
+    mock_parse(monkeypatch, {REMIND_TEXT: reminder_order("позвонить заказчику")})
+    await send(flow, BTN_REMIND)
+
+    orig = flow.session.make_request
+
+    async def failing(bot, method, timeout=None):
+        if isinstance(method, SendMessage) and method.text == BIND_PROMPT:
+            raise RuntimeError("сеть Telegram упала")
+        return await orig(bot, method, timeout)
+
+    monkeypatch.setattr(flow.session, "make_request", failing)
+    import contextlib
+
+    with contextlib.suppress(RuntimeError):
+        await send(flow, REMIND_TEXT)
+
+    assert await state_of(flow) == ReminderFlow.query.state
+    assert flow.bx.tasks == []
+
+    monkeypatch.setattr(flow.session, "make_request", orig)
+    await send(flow, REMIND_TEXT)
+    assert flow.session.sent_messages[-1].text == BIND_PROMPT
+    assert await state_of(flow) == ReminderFlow.binding.state
+
+
+async def test_stem_match_requires_confirmation(flow, monkeypatch):
+    """Совпадение по основе слова не привязывает молча — только кнопкой.
+
+    «Ромашке» находит сделку лишь основой «Ромашк» (COMMENTS «Организация:
+    Ромашка») — неточное совпадение показывается кнопкой на подтверждение.
+    """
+    await start_reminder(flow, monkeypatch)
+    await send(flow, "Ромашке")
+
+    assert flow.bx.tasks == []
+    assert await state_of(flow) == ReminderFlow.binding.state
+    data = bind_data(flow, "154")
+
+    await press(flow, data)
+    assert len(flow.bx.tasks) == 1
+    assert flow.bx.tasks[0]["UF_CRM_TASK"] == ["D_154"]
+
+
+async def test_actual_binding_survives_deal_read_failure(flow, monkeypatch):
+    """task.get дал D_155, а crm.deal.get упал: подпись хотя бы «№155»."""
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+    from app.services.tasks import _key_tag
+
+    key = "rem:sol-ultra-11"
+    flow.bx.tasks.append(
+        {"TITLE": "Позвонить", "UF_CRM_TASK": ["D_155"], "TAGS": [_key_tag(key)]}
+    )
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 77)
+    flow.bx.fail_methods.add("crm.deal.get")
+
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    created, label = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
+    )
+
+    assert created
+    assert label == "№155"
+
+
+async def test_reuse_updates_existing_ping_text(flow, monkeypatch):
+    """Reuse обновляет текст уже стоящего пинга на фактическую привязку.
+
+    Иначе подтверждение называло бы №155, а пинг из очереди — №154.
+    """
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+    from app.services.tasks import _key_tag
+
+    key = "rem:sol-ultra-12"
+    flow.bx.tasks.append(
+        {"TITLE": "Позвонить", "UF_CRM_TASK": ["D_155"], "TAGS": [_key_tag(key)]}
+    )
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 77)
+    future = int(time.time()) + 3600
+    await flow.db.add_reminder(
+        1, "позвонить (заявка №154 · чужая). Срок: скоро", future, "task", 77
+    )
+
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    created, label = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
+    )
+
+    assert created and label is not None and "№155" in label
+    rows = await flow.db.pending_task_reminders()
+    assert len(rows) == 1
+    assert "№155" in rows[0]["text"]
+    assert "№154" not in rows[0]["text"]
+
+
+def test_tail_strip_keeps_inner_srok():
+    """Régex хвоста режет только ПОСЛЕДНЕЕ «Срок:», внутреннее — текст."""
+    from app.handlers.reminders import _reminder_label
+
+    row = {
+        "text": "Проверить поле Срок: оплаты. Срок: 23.07.2026 08:00",
+        "due_ts": int(time.time()) + 3600,
+        "kind": "task",
+        "id": 1,
+    }
+    label = _reminder_label(row)
+    assert "Срок: оплаты" in label
+    assert "23.07.2026 08:00" not in label.split(" — ", 1)[1]
+
+
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
 
 
