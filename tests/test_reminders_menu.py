@@ -67,6 +67,15 @@ async def send(flow, text: str, user_id: int = 1, **extra) -> None:
     )
 
 
+async def skip_binding(flow, user_id: int = 1) -> None:
+    """Отвечает «Без привязки» на вопрос о заявке (шаг привязки)."""
+    from tests.conftest import make_callback_update
+
+    await flow.dp.feed_update(
+        flow.bot, make_callback_update(flow.bot, "rem:bind:none", user_id=user_id)
+    )
+
+
 async def state_of(flow, user_id: int = 1):
     context = flow.dp.fsm.get_context(bot=flow.bot, chat_id=user_id, user_id=user_id)
     return await context.get_state()
@@ -99,6 +108,7 @@ async def test_reminder_created_from_text(flow, monkeypatch):
     await send(flow, BTN_REMIND)
     before = int(time.time())
     await send(flow, text)
+    await skip_binding(flow)
 
     # Задача в Bitrix24 создана с заголовком из текста напоминания.
     assert len(flow.bx.tasks) == 1
@@ -140,6 +150,7 @@ async def test_reminder_llm_down_falls_back_to_raw_text(flow, monkeypatch):
     await send(flow, BTN_REMIND)
     before = int(time.time())
     await send(flow, "через 2 часа позвонить заказчику")
+    await skip_binding(flow)
 
     assert len(flow.bx.tasks) == 1
     rows = await flow.db.pending_task_reminders()
@@ -161,6 +172,7 @@ async def test_reminder_voice_creates(flow, monkeypatch):
 
     await send(flow, BTN_REMIND)
     await flow.dp.feed_update(flow.bot, make_voice_update(flow.bot))
+    await skip_binding(flow)
 
     assert len(flow.bx.tasks) == 1
     rows = await flow.db.pending_task_reminders()
@@ -359,6 +371,7 @@ async def test_reminder_ping_survives_lost_add_response(tmp_path, bot, session, 
         await send(flow, BTN_REMIND)
         before = int(time.time())
         await send(flow, text)
+        await skip_binding(flow)
 
         replies = "\n".join(flow.session.sent_texts)
         assert "задача №77" in replies  # сверка нашла созданную задачу

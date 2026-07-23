@@ -247,6 +247,23 @@ def _stem_search_query(query: str) -> str | None:
     return query[: match.start()] + stem
 
 
+def text_search_candidates(raw_query: str) -> list[str]:
+    """Варианты текстового запроса от точного к широкому, без дублей.
+
+    Общее ядро текстового поиска: исходная фраза, очищенная от служебных
+    слов, и основа последнего слова. Используется и «Найти», и привязкой
+    напоминаний к заявкам.
+    """
+    candidates = [raw_query]
+    query = clean_search_query(raw_query)
+    if query:
+        candidates.append(query)
+        stem = _stem_search_query(query)
+        if stem is not None:
+            candidates.append(stem)
+    return list(dict.fromkeys(candidates))
+
+
 # Кнопки меню срабатывают только в свободных состояниях и на карточке-превью
 # (её черновик уже сохранён в SQLite и переживёт поиск). Внутри активной
 # заявки команды и кнопки поиска перехватываются отдельными обработчиками:
@@ -396,13 +413,7 @@ async def _run_search(message: Message, bitrix: BitrixClient, query: str) -> boo
                     await message.answer(QUERY_TOO_SHORT)
                     return True
                 else:
-                    candidates = [raw_query, query]
-                    stem_query = _stem_search_query(query)
-                    if stem_query is not None:
-                        candidates.append(stem_query)
-                    candidates = list(dict.fromkeys(candidates))
-
-                    for candidate in candidates:
+                    for candidate in text_search_candidates(raw_query):
                         found = await search_deals_by_text(bitrix, candidate)
                         if found.deals or found.truncated:
                             break

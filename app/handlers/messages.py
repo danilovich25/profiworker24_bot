@@ -296,7 +296,11 @@ async def _schedule_deal_reminder(
 
 
 async def _schedule_task_reminder(
-    message: Message, db: Database, order: ParsedOrder, task_id: int
+    message: Message,
+    db: Database,
+    order: ParsedOrder,
+    task_id: int,
+    deal_label: str | None = None,
 ) -> None:
     """Telegram-напоминание к задаче-напоминанию (intent=reminder).
 
@@ -305,15 +309,21 @@ async def _schedule_task_reminder(
     нашла id» — раньше этот путь оставлял очередь пустой, хотя пользователю
     обещан пинг. Повторная доставка сообщения дубля не создаёт, отменённый
     пользователем пинг не воскрешает.
+
+    deal_label — подпись заявки для привязанного напоминания: пинг и список
+    «Мои напоминания» называют заявку, чтобы было ясно, о чём речь.
     """
     due_ts = dates.reminder_epoch(order.deadline)
     if due_ts is None or due_ts <= int(dates.now_local().timestamp()):
         return
+    body = order.problem
+    if deal_label:
+        body = f"{body} (заявка {deal_label})"
     try:
         await db.spawn_task_reminder(
             task_id,
             message.chat.id,
-            text=f"{order.problem}. Срок: {dates.format_deadline(order.deadline)}",
+            text=f"{body}. Срок: {dates.format_deadline(order.deadline)}",
             due_ts=due_ts,
         )
     except Exception:
@@ -959,9 +969,14 @@ async def _create_reminder(
     order: ParsedOrder,
     *,
     key: str,
+    deal_id: int | None = None,
+    deal_label: str | None = None,
     on_task_settled: Callable[[], None] | None = None,
 ) -> bool:
     """Идемпотентно создаёт задачу-напоминание в Bitrix24.
+
+    deal_id/deal_label — привязка к заявке: задача связывается со сделкой
+    (UF_CRM_TASK), а Telegram-пинг называет заявку по подписи.
 
     Тот же рисунок, что у сделок: ключ сообщения хранится в самой задаче
     (тегом, см. services/tasks.py), перед созданием выполняется предпроверка
@@ -1024,7 +1039,11 @@ async def _create_reminder(
                     else:
                         try:
                             task_id = await create_reminder_task(
-                                bitrix, title, deadline=order.deadline, key=key
+                                bitrix,
+                                title,
+                                deadline=order.deadline,
+                                deal_id=deal_id,
+                                key=key,
                             )
                         except Exception as exc:
                             if is_server_refusal(exc):
@@ -1076,7 +1095,7 @@ async def _create_reminder(
     # Гарантированный канал: бот сам напишет в Telegram в момент срока.
     # Ставится на любом пути существования задачи (в т.ч. найденной сверкой
     # после потерянного ответа add) — вставка идемпотентна по задаче.
-    await _schedule_task_reminder(message, db, order, task_id)
+    await _schedule_task_reminder(message, db, order, task_id, deal_label=deal_label)
     try:
         await message.answer(REMINDER_CREATED.format(task_id=task_id))
     except Exception:

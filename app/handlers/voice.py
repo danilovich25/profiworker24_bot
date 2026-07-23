@@ -44,7 +44,11 @@ from app.handlers.messages import (
     form_source_text_step,
     handle_order_text,
 )
-from app.handlers.reminders import ReminderFlow, handle_reminder_query
+from app.handlers.reminders import (
+    ReminderFlow,
+    handle_binding_answer,
+    handle_reminder_query,
+)
 from app.handlers.search import SearchFlow, handle_search_query
 from app.services import speech
 from app.services.bitrix import BitrixClient
@@ -140,6 +144,10 @@ async def _route_by_state(
         # Голосом можно и поставить отдельное напоминание: дата и текст
         # разбираются из распознанной речи тем же путём, что из текста.
         await handle_reminder_query(message, state, db, text, bitrix, dedup_key)
+        return
+    if current == ReminderFlow.binding.state:
+        # Ответ «к какой заявке привязать» тоже принимается голосом.
+        await handle_binding_answer(message, state, db, text, bitrix)
         return
     if current == DealEditFlow.typing.state:
         # Голосом можно продиктовать и новое значение поля при правке.
