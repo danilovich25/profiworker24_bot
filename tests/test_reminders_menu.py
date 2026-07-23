@@ -68,11 +68,22 @@ async def send(flow, text: str, user_id: int = 1, **extra) -> None:
 
 
 async def skip_binding(flow, user_id: int = 1) -> None:
-    """Отвечает «Без привязки» на вопрос о заявке (шаг привязки)."""
+    """Отвечает «Без привязки» на вопрос о заявке кнопкой из самого вопроса."""
     from tests.conftest import make_callback_update
 
+    data = None
+    for message in reversed(flow.session.sent_messages):
+        keyboard = getattr(message.reply_markup, "inline_keyboard", None)
+        if not keyboard:
+            continue
+        for row in keyboard:
+            for button in row:
+                if button.callback_data and button.callback_data.endswith(":none"):
+                    data = button.callback_data
+                    break
+    assert data is not None, "вопроса о привязке с кнопкой «Без привязки» не было"
     await flow.dp.feed_update(
-        flow.bot, make_callback_update(flow.bot, "rem:bind:none", user_id=user_id)
+        flow.bot, make_callback_update(flow.bot, data, user_id=user_id)
     )
 
 

@@ -39,7 +39,12 @@ from aiogram.types import (
 )
 
 from app.db import REMINDER_PENDING, Database
-from app.handlers.messages import _create_reminder
+from app.handlers.messages import (
+    REMIND_SCHEDULED_DEAL,
+    _create_reminder,
+    deal_binding_label,
+    find_ref_deals,
+)
 from app.handlers.search import (
     ACTIVE_ORDER_STATES,
     ACTIVE_ORDER_WARNING,
@@ -62,14 +67,7 @@ from app.handlers.start import (
 from app.schemas import Intent, ParsedOrder
 from app.services import binding, dates, llm
 from app.services.binding import BindingRef
-from app.services.bitrix import (
-    BitrixClient,
-    contact_names,
-    get_deal,
-    recent_deals,
-    search_deals_by_phone,
-    search_deals_by_text,
-)
+from app.services.bitrix import BitrixClient, search_deals_by_text
 from app.services.tasks import complete_reminder_task
 
 log = logging.getLogger("bot.reminders")
@@ -105,11 +103,6 @@ REMIND_PAST_DATE = (
 REMIND_SCHEDULED = (
     "Пришлю напоминание в телеграм {when}. Посмотреть или отменить: "
     "кнопка «Мои напоминания»."
-)
-
-REMIND_SCHEDULED_DEAL = (
-    "Пришлю напоминание в телеграм {when} по заявке {deal}. Посмотреть "
-    "или отменить: кнопка «Мои напоминания»."
 )
 
 REMIND_CANCELLED_FLOW = "Хорошо, без напоминания."
@@ -245,8 +238,15 @@ async def on_reminders_button(message: Message, db: Database) -> None:
     await _show_reminders(message, db)
 
 
-def _binding_keyboard(deals: list[dict] | None = None) -> InlineKeyboardMarkup:
-    """Кнопки шага привязки: выбор из найденных заявок и постоянные действия."""
+def _binding_keyboard(
+    nonce: str, deals: list[dict] | None = None
+) -> InlineKeyboardMarkup:
+    """Кнопки шага привязки: выбор из найденных заявок и постоянные действия.
+
+    nonce вшивается в callback_data: кнопка действует только на ТО
+    напоминание, к которому был задан вопрос. Старые кнопки от прошлых
+    вопросов отвечают «Уже неактуально» и ничего не создают.
+    """
     rows: list[list[InlineKeyboardButton]] = []
     for deal in deals or []:
         title = str(deal.get("TITLE") or "без названия")
@@ -254,17 +254,46 @@ def _binding_keyboard(deals: list[dict] | None = None) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text=f"№{deal['ID']} · {title}"[:60],
-                    callback_data=f"rem:bind:{deal['ID']}",
+                    callback_data=f"rem:bind:{nonce}:{deal['ID']}",
                 )
             ]
         )
-    last_row = [InlineKeyboardButton(text=BIND_BTN_NONE, callback_data="rem:bind:none")]
+    last_row = [
+        InlineKeyboardButton(text=BIND_BTN_NONE, callback_data=f"rem:bind:{nonce}:none")
+    ]
     if not deals:
         last_row.insert(
-            0, InlineKeyboardButton(text=BIND_BTN_LAST, callback_data="rem:bind:last")
+            0,
+            InlineKeyboardButton(
+                text=BIND_BTN_LAST, callback_data=f"rem:bind:{nonce}:last"
+            ),
         )
     rows.append(last_row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _peek_pending(state: FSMContext, nonce: str) -> dict | None:
+    """Ожидающее напоминание с этим nonce, если шаг привязки ещё жив."""
+    data = await state.get_data()
+    pending = data.get("rem_pending")
+    if isinstance(pending, dict) and pending.get("nonce") == nonce:
+        return pending
+    return None
+
+
+async def _consume_pending(state: FSMContext, nonce: str) -> dict | None:
+    """Атомарно забирает ожидающее напоминание перед созданием.
+
+    CAS по nonce: /cancel, второй параллельный выбор или новый вопрос уже
+    сняли или заменили pending — тогда None, и создавать ничего нельзя.
+    Потребление идёт непосредственно перед _finalize_reminder, чтобы решение,
+    принятое во время долгого похода в CRM, не пережило отмену.
+    """
+    pending = await _peek_pending(state, nonce)
+    if pending is None:
+        return None
+    await state.update_data(rem_pending=None)
+    return pending
 
 
 async def handle_reminder_query(
@@ -315,6 +344,7 @@ async def handle_reminder_query(
         "key": dedup_key or f"rem:{uuid4().hex}",
         "chat_id": message.chat.id,
         "user_id": message.from_user.id if message.from_user else message.chat.id,
+        "nonce": uuid4().hex[:12],
     }
     if bitrix is None:
         # CRM не подключена: вопрос о привязке бессмысленен, честный отказ
@@ -324,35 +354,14 @@ async def handle_reminder_query(
     if ref is not None and ref.kind == "none":
         await _finalize_reminder(message, state, db, bitrix, pending, None)
         return
-    if ref is not None:
-        await _resolve_binding(message, state, db, bitrix, pending, ref)
-        return
+    # Дальше шаг привязки: pending кладётся в FSM ДО похода в CRM, чтобы
+    # /cancel и кнопки меню честно снимали его даже посреди поиска.
     await state.set_state(ReminderFlow.binding)
     await state.update_data(rem_pending=pending)
-    await message.answer(BIND_PROMPT, reply_markup=_binding_keyboard())
-
-
-async def _deal_label(bitrix: BitrixClient | None, deal: dict) -> str:
-    """Подпись заявки для пинга и подтверждения: №, клиент, название.
-
-    Имя клиента — best-effort: сбой чтения контакта не должен ронять
-    постановку напоминания, подпись просто короче.
-    """
-    client = ""
-    try:
-        contact_id = int(deal.get("CONTACT_ID") or 0)
-    except (TypeError, ValueError):
-        contact_id = 0
-    if bitrix is not None and contact_id:
-        try:
-            async with asyncio.timeout(SEARCH_DEADLINE):
-                names = await contact_names(bitrix, [contact_id])
-            client = names.get(contact_id, "")
-        except Exception:
-            log.warning("Имя контакта заявки %s не прочитано", deal.get("ID"))
-    title = str(deal.get("TITLE") or "").strip()
-    parts = [f"№{deal.get('ID')}"] + [part for part in (client, title) if part]
-    return " · ".join(parts)
+    if ref is not None:
+        await _resolve_binding(message, state, db, bitrix, pending["nonce"], ref)
+        return
+    await message.answer(BIND_PROMPT, reply_markup=_binding_keyboard(pending["nonce"]))
 
 
 async def _finalize_reminder(
@@ -378,7 +387,7 @@ async def _finalize_reminder(
     deal_label = None
     if deal is not None:
         deal_id = int(deal["ID"])
-        deal_label = await _deal_label(bitrix, deal)
+        deal_label = await deal_binding_label(bitrix, deal)
     created = await _create_reminder(
         message,
         db,
@@ -398,36 +407,52 @@ async def _finalize_reminder(
         await message.answer(reply, reply_markup=main_menu_keyboard())
 
 
+async def _consume_and_finalize(
+    message: Message,
+    state: FSMContext,
+    db: Database,
+    bitrix: BitrixClient | None,
+    nonce: str,
+    deal: dict | None,
+) -> None:
+    """Забирает pending по nonce и создаёт напоминание; иначе — неактуально."""
+    pending = await _consume_pending(state, nonce)
+    if pending is None:
+        await message.answer(CANCEL_STALE)
+        return
+    await _finalize_reminder(message, state, db, bitrix, pending, deal)
+
+
 async def _reask_binding(
     message: Message,
     state: FSMContext,
-    pending: dict,
+    nonce: str,
     reply: str,
     deals: list[dict] | None = None,
 ) -> None:
-    """Оставляет шаг привязки открытым и переспрашивает."""
+    """Переспрашивает, если шаг привязки ещё жив; после отмены — молчит.
+
+    Живость проверяется по nonce: /cancel или новый вопрос уже сняли
+    pending, и переспрос воскресил бы отменённый сотрудником шаг.
+    """
+    if await _peek_pending(state, nonce) is None:
+        await message.answer(CANCEL_STALE)
+        return
     await state.set_state(ReminderFlow.binding)
-    await state.update_data(rem_pending=pending)
-    await message.answer(reply, reply_markup=_binding_keyboard(deals))
+    await message.answer(reply, reply_markup=_binding_keyboard(nonce, deals))
 
 
 async def _find_deals(
     bitrix: BitrixClient, ref: BindingRef
 ) -> tuple[list[dict], bool]:
     """Заявки по ссылке сотрудника: (совпадения, обрезана ли выборка)."""
-    if ref.kind == "last":
-        return await recent_deals(bitrix, 1), False
-    if ref.kind == "deal_id":
-        deal = await get_deal(bitrix, int(ref.value))
-        return ([deal] if deal else []), False
-    if ref.kind == "phone":
-        found = await search_deals_by_phone(bitrix, ref.value)
-        return found.deals, found.truncated
-    for candidate in text_search_candidates(ref.value or ""):
-        found = await search_deals_by_text(bitrix, candidate)
-        if found.deals or found.truncated:
-            return found.deals, found.truncated
-    return [], False
+    if ref.kind == "text":
+        for candidate in text_search_candidates(ref.value or ""):
+            found = await search_deals_by_text(bitrix, candidate)
+            if found.deals or found.truncated:
+                return found.deals, found.truncated
+        return [], False
+    return await find_ref_deals(bitrix, ref)
 
 
 async def _resolve_binding(
@@ -435,7 +460,7 @@ async def _resolve_binding(
     state: FSMContext,
     db: Database,
     bitrix: BitrixClient,
-    pending: dict,
+    nonce: str,
     ref: BindingRef,
 ) -> None:
     """Ищет заявку и создаёт напоминание либо уточняет выбор."""
@@ -444,27 +469,31 @@ async def _resolve_binding(
             deals, truncated = await _find_deals(bitrix, ref)
     except Exception:
         log.exception("Поиск заявки для привязки напоминания не удался")
-        await _reask_binding(message, state, pending, BIND_FAILED)
+        await _reask_binding(message, state, nonce, BIND_FAILED)
         return
     if truncated:
-        await _reask_binding(message, state, pending, BIND_TOO_BROAD)
+        await _reask_binding(message, state, nonce, BIND_TOO_BROAD)
         return
     if len(deals) == 1:
-        await _finalize_reminder(message, state, db, bitrix, pending, deals[0])
+        await _consume_and_finalize(message, state, db, bitrix, nonce, deals[0])
         return
     if not deals:
         if ref.kind == "last":
             # Заявок в CRM вообще нет: привязывать не к чему, ставим обычное.
+            pending = await _consume_pending(state, nonce)
+            if pending is None:
+                await message.answer(CANCEL_STALE)
+                return
             await message.answer(BIND_LAST_EMPTY)
             await _finalize_reminder(message, state, db, bitrix, pending, None)
             return
-        await _reask_binding(message, state, pending, BIND_NOT_FOUND)
+        await _reask_binding(message, state, nonce, BIND_NOT_FOUND)
         return
     shown = deals[:LIST_LIMIT]
     lines = [BIND_MANY] + [
         f"№{deal['ID']} · {str(deal.get('TITLE') or 'без названия')}" for deal in shown
     ]
-    await _reask_binding(message, state, pending, "\n".join(lines), shown)
+    await _reask_binding(message, state, nonce, "\n".join(lines), shown)
 
 
 async def handle_binding_answer(
@@ -477,19 +506,17 @@ async def handle_binding_answer(
     """Разбирает ответ на вопрос «к какой заявке привязать?»."""
     data = await state.get_data()
     pending = data.get("rem_pending")
-    if not isinstance(pending, dict):
+    if not isinstance(pending, dict) or not pending.get("nonce"):
         # Данные шага потеряны (например, рестарт со сменой хранилища FSM).
         await state.clear()
         await message.answer(BIND_LOST, reply_markup=main_menu_keyboard())
         return
+    nonce = str(pending["nonce"])
     ref = binding.parse_binding_answer(text)
-    if ref.kind == "none":
-        await _finalize_reminder(message, state, db, bitrix, pending, None)
+    if ref.kind == "none" or bitrix is None:
+        await _consume_and_finalize(message, state, db, bitrix, nonce, None)
         return
-    if bitrix is None:
-        await _finalize_reminder(message, state, db, bitrix, pending, None)
-        return
-    await _resolve_binding(message, state, db, bitrix, pending, ref)
+    await _resolve_binding(message, state, db, bitrix, nonce, ref)
 
 
 # Оба шага постановки напоминания: ввод текста и выбор привязки.
@@ -565,38 +592,40 @@ async def on_bind_choice(
 ) -> None:
     """Кнопки шага привязки: конкретная заявка, «последняя», «без привязки».
 
-    Кнопка живёт, пока в FSM лежит ожидающее напоминание ЭТОГО сотрудника в
-    ЭТОМ чате: чужое или устаревшее нажатие отвечает «Уже неактуально» и
-    ничего не создаёт.
+    Формат callback_data: rem:bind:<nonce>:<действие>. Кнопка живёт, пока в
+    FSM лежит ожидающее напоминание с ТЕМ ЖЕ nonce, того же сотрудника и
+    чата: старая кнопка от прошлого вопроса, чужое нажатие или кнопка без
+    nonce (до обновления) отвечают «Уже неактуально» и ничего не создают.
     """
+    parts = (callback.data or "").split(":")
+    if len(parts) != 4:
+        await callback.answer(CANCEL_STALE)
+        return
+    _, _, nonce, action = parts
     data = await state.get_data()
     pending = data.get("rem_pending")
     message = callback.message
     if (
         not isinstance(pending, dict)
         or message is None
+        or pending.get("nonce") != nonce
         or pending.get("chat_id") != message.chat.id
         or (callback.from_user and pending.get("user_id") != callback.from_user.id)
     ):
         await callback.answer(CANCEL_STALE)
         return
-    raw = (callback.data or "").rsplit(":", 1)[-1]
-    if raw == "none":
+    if action == "none" or bitrix is None:
         await callback.answer()
-        await _finalize_reminder(message, state, db, bitrix, pending, None)
+        await _consume_and_finalize(message, state, db, bitrix, nonce, None)
         return
-    if bitrix is None:
+    if action == "last":
         await callback.answer()
-        await _finalize_reminder(message, state, db, bitrix, pending, None)
+        await _resolve_binding(message, state, db, bitrix, nonce, BindingRef("last"))
         return
-    if raw == "last":
-        await callback.answer()
-        await _resolve_binding(message, state, db, bitrix, pending, BindingRef("last"))
-        return
-    if raw.isdecimal():
+    if action.isdecimal():
         await callback.answer()
         await _resolve_binding(
-            message, state, db, bitrix, pending, BindingRef("deal_id", raw)
+            message, state, db, bitrix, nonce, BindingRef("deal_id", action)
         )
         return
     await callback.answer(CANCEL_STALE)

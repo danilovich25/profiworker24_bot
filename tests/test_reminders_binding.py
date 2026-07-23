@@ -132,6 +132,19 @@ async def start_reminder(flow, monkeypatch, text: str = REMIND_TEXT) -> None:
     await send(flow, text)
 
 
+def bind_data(flow, suffix: str) -> str:
+    """callback_data кнопки привязки с последнего вопроса (несёт nonce)."""
+    for message in reversed(flow.session.sent_messages):
+        for text, data in buttons_of(message):
+            if data.startswith("rem:bind:") and data.endswith(":" + suffix):
+                return data
+    raise AssertionError(f"кнопки rem:bind:*:{suffix} нет в отправленных")
+
+
+async def press_bind(flow, suffix: str, user_id: int = 1) -> None:
+    await press(flow, bind_data(flow, suffix), user_id=user_id)
+
+
 # --- Вопрос о привязке ---------------------------------------------------
 
 
@@ -144,9 +157,8 @@ async def test_reminder_asks_binding_question(flow, monkeypatch):
     labels = [text for text, _ in buttons_of(msg)]
     assert BIND_BTN_LAST in labels
     assert BIND_BTN_NONE in labels
-    data = [d for _, d in buttons_of(msg)]
-    assert "rem:bind:last" in data
-    assert "rem:bind:none" in data
+    assert bind_data(flow, "last")
+    assert bind_data(flow, "none")
     assert flow.bx.tasks == []
     assert await state_of(flow) == ReminderFlow.binding.state
 
@@ -155,7 +167,7 @@ async def test_bind_none_creates_unbound(flow, monkeypatch):
     """«Без привязки» ставит обычное напоминание, как раньше."""
     await start_reminder(flow, monkeypatch)
     before = int(time.time())
-    await press(flow, "rem:bind:none")
+    await press_bind(flow, "none")
 
     assert len(flow.bx.tasks) == 1
     assert "UF_CRM_TASK" not in flow.bx.tasks[0]
@@ -170,7 +182,7 @@ async def test_bind_none_creates_unbound(flow, monkeypatch):
 async def test_bind_last_binds_to_latest_deal(flow, monkeypatch):
     """«К последней заявке» привязывает к самой новой сделке (ID выше)."""
     await start_reminder(flow, monkeypatch)
-    await press(flow, "rem:bind:last")
+    await press_bind(flow, "last")
 
     assert len(flow.bx.tasks) == 1
     assert flow.bx.tasks[0]["UF_CRM_TASK"] == ["D_155"]
@@ -213,13 +225,12 @@ async def test_bind_by_phone_many_matches_offers_choice(flow, monkeypatch):
     assert flow.bx.tasks == []
     msg = flow.session.sent_messages[-1]
     assert BIND_MANY in msg.text
-    data = [d for _, d in buttons_of(msg)]
-    assert "rem:bind:155" in data
-    assert "rem:bind:154" in data
-    assert "rem:bind:none" in data
+    assert bind_data(flow, "155")
+    assert bind_data(flow, "154")
+    assert bind_data(flow, "none")
     assert await state_of(flow) == ReminderFlow.binding.state
 
-    await press(flow, "rem:bind:154")
+    await press_bind(flow, "154")
     assert len(flow.bx.tasks) == 1
     assert flow.bx.tasks[0]["UF_CRM_TASK"] == ["D_154"]
     assert await state_of(flow) is None
@@ -234,7 +245,7 @@ async def test_bind_not_found_reasks_then_none_works(flow, monkeypatch):
     assert flow.bx.tasks == []
     assert await state_of(flow) == ReminderFlow.binding.state
 
-    await press(flow, "rem:bind:none")
+    await press_bind(flow, "none")
     assert len(flow.bx.tasks) == 1
     assert "UF_CRM_TASK" not in flow.bx.tasks[0]
 
@@ -336,7 +347,7 @@ async def test_stale_bind_callback_is_ignored(flow):
 async def test_foreign_bind_click_is_ignored(flow, monkeypatch):
     """Чужое нажатие кнопки привязки не создаёт напоминание автору."""
     await start_reminder(flow, monkeypatch)
-    await press(flow, "rem:bind:154", user_id=2)
+    await press_bind(flow, "last", user_id=2)
 
     assert flow.bx.tasks == []
     assert await state_of(flow) == ReminderFlow.binding.state
@@ -345,7 +356,7 @@ async def test_foreign_bind_click_is_ignored(flow, monkeypatch):
 async def test_my_reminders_shows_deal_binding(flow, monkeypatch):
     """Список «Мои напоминания» показывает, к какой заявке пинг."""
     await start_reminder(flow, monkeypatch)
-    await press(flow, "rem:bind:last")
+    await press_bind(flow, "last")
     await send(flow, BTN_MY_REMINDERS)
 
     listing = flow.session.sent_messages[-1]
@@ -355,7 +366,149 @@ async def test_my_reminders_shows_deal_binding(flow, monkeypatch):
 async def test_scheduled_deal_confirmation_mentions_deal(flow, monkeypatch):
     """Подтверждение называет заявку и дату (формат REMIND_SCHEDULED_DEAL)."""
     await start_reminder(flow, monkeypatch)
-    await press(flow, "rem:bind:last")
+    await press_bind(flow, "last")
 
     prefix = REMIND_SCHEDULED_DEAL.split("{when}")[0]
     assert any(t.startswith(prefix) for t in flow.session.sent_texts)
+
+
+# --- Правки по ревью Sol R1 ----------------------------------------------
+
+
+async def test_old_binding_buttons_do_not_bind_new_reminder(flow, monkeypatch):
+    """Кнопка от СТАРОГО вопроса не привязывает НОВОЕ напоминание (nonce).
+
+    Сценарий ревью: получить кнопки для напоминания A, начать напоминание B,
+    нажать старую кнопку A — задача не должна создаться вовсе, тем более с
+    привязкой из чужого вопроса.
+    """
+    await start_reminder(flow, monkeypatch)
+    stale_button = bind_data(flow, "last")
+
+    # Новое напоминание B: свой вопрос, свой nonce.
+    await send(flow, BTN_REMIND)
+    await send(flow, REMIND_TEXT)
+    fresh_button = bind_data(flow, "none")
+    assert fresh_button != stale_button
+
+    await press(flow, stale_button)
+    assert flow.bx.tasks == []
+    assert await state_of(flow) == ReminderFlow.binding.state
+
+    await press(flow, fresh_button)
+    assert len(flow.bx.tasks) == 1
+    assert "UF_CRM_TASK" not in flow.bx.tasks[0]
+
+
+async def test_legacy_format_bind_callback_is_stale(flow, monkeypatch):
+    """Колбэк без nonce (старый формат кнопки) не создаёт ничего."""
+    await start_reminder(flow, monkeypatch)
+    await press(flow, "rem:bind:none")
+    await press(flow, "rem:bind:154")
+
+    assert flow.bx.tasks == []
+    assert await state_of(flow) == ReminderFlow.binding.state
+
+
+async def test_pending_removed_during_search_prevents_creation(
+    tmp_path, bot, session, monkeypatch
+):
+    """Снятый во время CRM-поиска pending останавливает создание (Sol R1).
+
+    Через диспетчер такую гонку закрывает PruningEventIsolation (апдейты
+    одного пользователя сериализуются), поэтому контракт проверяется на
+    самой функции: пока ответ «сантехника» ждёт портал, pending снимается
+    (отмена с другого воркера, рестарт со сбросом FSM) — найденная после
+    этого сделка НЕ должна превращаться в созданную задачу.
+    """
+    import asyncio
+
+    from app.handlers.reminders import handle_binding_answer
+
+    class GatedBitrix(FakeBindingBitrix):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.gate = asyncio.Event()
+
+        async def _dispatch(self, method: str, params: dict):
+            if method == "crm.deal.list":
+                self.entered.set()
+                await self.gate.wait()
+            return await super()._dispatch(method, params)
+
+    db = Database(str(tmp_path / "gate.db"))
+    await db.init()
+    bx = GatedBitrix()
+    dp = create_dispatcher(db, bitrix=bx, allowed_ids=set(), allow_all=True)
+    flow = SimpleNamespace(dp=dp, bot=bot, session=session, db=db, bx=bx)
+    try:
+        await start_reminder(flow, monkeypatch)
+        context = dp.fsm.get_context(bot=bot, chat_id=1, user_id=1)
+        message = make_message_update(bot, "сантехника").message
+        answer_task = asyncio.create_task(
+            handle_binding_answer(message, context, db, "сантехника", bx)
+        )
+        await asyncio.wait_for(bx.entered.wait(), timeout=5)
+        await context.clear()
+        bx.gate.set()
+        await asyncio.wait_for(answer_task, timeout=5)
+
+        assert flow.bx.tasks == []
+        assert await flow.db.pending_task_reminders() == []
+        assert all("Пришлю" not in t for t in flow.session.sent_texts)
+    finally:
+        await dp.storage.close()
+
+
+async def test_answer_with_posledn_inside_name_is_text_search(flow, monkeypatch):
+    """«Последняя миля» — поисковый запрос, а не «последняя заявка» (Sol R1)."""
+    await start_reminder(flow, monkeypatch)
+    await send(flow, "Последняя миля")
+
+    # Ничего не привязано молча: совпадений нет, бот переспросил.
+    assert flow.bx.tasks == []
+    assert flow.session.sent_texts[-1] == BIND_NOT_FOUND
+    assert await state_of(flow) == ReminderFlow.binding.state
+
+
+def test_parse_binding_answer_last_forms():
+    from app.services.binding import parse_binding_answer
+
+    assert parse_binding_answer("последняя").kind == "last"
+    assert parse_binding_answer("к последней заявке").kind == "last"
+    assert parse_binding_answer("Последняя").kind == "last"
+    assert parse_binding_answer("ООО Последний шанс").kind == "text"
+    assert parse_binding_answer("Последняя миля").kind == "text"
+
+
+# --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
+
+
+async def test_free_text_inline_binding_binds(flow, monkeypatch):
+    """«Напомни к заявке 154 …» свободным текстом привязывает задачу."""
+    text = "напомни к заявке 154 завтра в 8 позвонить заказчику"
+    mock_parse(monkeypatch, {text: reminder_order("позвонить заказчику")})
+
+    await send(flow, text)
+
+    assert len(flow.bx.tasks) == 1
+    assert flow.bx.tasks[0]["UF_CRM_TASK"] == ["D_154"]
+    replies = "\n".join(flow.session.sent_texts)
+    assert "по заявке" in replies
+    assert "№154" in replies
+    assert await state_of(flow) is None
+
+
+async def test_free_text_inline_binding_miss_creates_unbound(flow, monkeypatch):
+    """Свободный текст с ненайденной заявкой ставит обычное и говорит об этом."""
+    from app.handlers.messages import BIND_INLINE_MISS
+
+    text = "напомни к заявке 999 завтра в 8 позвонить заказчику"
+    mock_parse(monkeypatch, {text: reminder_order("позвонить заказчику")})
+
+    await send(flow, text)
+
+    assert len(flow.bx.tasks) == 1
+    assert "UF_CRM_TASK" not in flow.bx.tasks[0]
+    assert BIND_INLINE_MISS in flow.session.sent_texts

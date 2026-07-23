@@ -64,7 +64,13 @@ _ANSWER_NONE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_ANSWER_LAST_RE = re.compile(r"последн", re.IGNORECASE)
+# «Последняя» как ссылка на заявку — только когда ответ ЦЕЛИКОМ об этом:
+# «последняя», «к последней заявке», «по последней». Вхождение слова внутри
+# названия («ООО Последний шанс», «Последняя миля») — поисковый запрос.
+_ANSWER_LAST_RE = re.compile(
+    r"^(?:(?:к|по|для)\s+)?(?:самой\s+)?последн\w*(?:\s+заявк\w*)?\s*[.!]*$",
+    re.IGNORECASE,
+)
 
 # Служебные слова в ответе перед самим идентификатором: «к заявке 154»,
 # «заявка №154», «по телефону 8914…» — отбрасываются перед разбором.
@@ -119,7 +125,7 @@ def parse_binding_answer(text: str) -> BindingRef:
     raw = (text or "").strip()
     if _ANSWER_NONE_RE.match(raw):
         return BindingRef("none")
-    if _ANSWER_LAST_RE.search(raw):
+    if _ANSWER_LAST_RE.match(raw):
         return BindingRef("last")
     bare = _ANSWER_PREFIX_RE.sub("", raw).strip()
     compact = re.sub(r"[\s()\-]", "", bare)
