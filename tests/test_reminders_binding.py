@@ -738,6 +738,64 @@ async def test_reused_task_keeps_actual_binding(flow, monkeypatch):
     assert "№156" not in rows[0]["text"]
 
 
+# --- Правки по ревью Sol R5 ----------------------------------------------
+
+
+def test_service_words_are_closed_forms():
+    """«Номерной 154» и «Телефонов» — смысловые слова, не служебные (Sol R5)."""
+    from app.services.binding import is_vague_query, parse_binding_answer
+
+    ref = parse_binding_answer("Номерной 154")
+    assert ref.kind == "text"
+    assert "Номерной" in (ref.value or "")
+    assert parse_binding_answer("Телефонов").kind == "text"
+    assert not is_vague_query("Телефонов")
+    # Настоящие падежные формы по-прежнему срезаются.
+    assert parse_binding_answer("номер заявки 154").kind == "deal_id"
+    assert parse_binding_answer("номером 154").kind == "deal_id"
+
+
+def test_ten_digit_phone_inline_binding():
+    """«К заявке 9141234567» — телефон без восьмёрки, а не пустая ссылка."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке 9141234567 завтра в 8 позвонить"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+    assert "9141234567" not in clean
+
+
+async def test_free_text_ten_digit_phone_ambiguous_warns(flow, monkeypatch):
+    """Свободный текст с 10-значным телефоном: неоднозначно — честный промах.
+
+    У контакта из фейка две сделки, однозначной привязки нет: напоминание
+    ставится обычным С предупреждением BIND_INLINE_MISS (раньше ссылка
+    вообще не распознавалась и промах молчал).
+    """
+    from app.handlers.messages import BIND_INLINE_MISS
+
+    text = "напомни к заявке 9141234567 завтра в 8 позвонить заказчику"
+    mock_parse(monkeypatch, {text: reminder_order("позвонить заказчику")})
+
+    await send(flow, text)
+
+    assert len(flow.bx.tasks) == 1
+    assert "UF_CRM_TASK" not in flow.bx.tasks[0]
+    assert BIND_INLINE_MISS in flow.session.sent_texts
+
+
+async def test_text_answer_with_prefix_finds_deal(flow, monkeypatch):
+    """«К заявке сантехника» ищет по ядру «сантехника» и привязывает."""
+    await start_reminder(flow, monkeypatch)
+    await send(flow, "к заявке сантехника")
+
+    assert len(flow.bx.tasks) == 1
+    assert flow.bx.tasks[0]["UF_CRM_TASK"] == ["D_154"]
+    assert await state_of(flow) is None
+
+
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
 
 
