@@ -340,8 +340,11 @@ async def _schedule_task_reminder(
     task_id: int,
     deal_label: str | None = None,
     due_override: int | None = None,
-) -> None:
+) -> int | None:
     """Telegram-напоминание к задаче-напоминанию (intent=reminder).
+
+    Возвращает срок, на который пинг РЕАЛЬНО записан этим вызовом, либо
+    None (срок пуст/прошёл, запись уже существовала или вставка упала).
 
     Идемпотентно по задаче (db.spawn_task_reminder): вызывается на ЛЮБОМ
     пути, где задача существует, включая «ответ task.add потерялся, сверка
@@ -360,9 +363,9 @@ async def _schedule_task_reminder(
         else dates.reminder_epoch(order.deadline)
     )
     if due_ts is None or due_ts <= int(dates.now_local().timestamp()):
-        return
+        return None
     try:
-        await db.spawn_task_reminder(
+        inserted = await db.spawn_task_reminder(
             task_id,
             message.chat.id,
             text=(
@@ -372,7 +375,11 @@ async def _schedule_task_reminder(
             due_ts=due_ts,
         )
     except Exception:
+        # Пинг НЕ записан: вызывающий не имеет права обещать «Пришлю…»
+        # (ревью ULTRA-5).
         log.exception("Telegram-напоминание для задачи %s не записано", task_id)
+        return None
+    return due_ts if inserted else None
 
 
 def _task_ping_body(order: ParsedOrder, deal_label: str | None) -> str:
@@ -1323,15 +1330,22 @@ async def _create_reminder(
         # сделке, чем разрешилось сейчас (например, «последняя» успела
         # смениться к повтору). Правду знает сама задача (ревью R4).
         state, deal_label, task_due = await _actual_task_binding(bitrix, task_id)
-        if state == "missing":
-            # Задача удалена: обещать пинг и «записано» нельзя, phantom-пинг
-            # не ставится; существующие записи снимет sync (ревью ULTRA-4).
-            await message.answer(REMINDER_TASK_GONE.format(task_id=task_id))
-            return ReminderOutcome(True, task_id=task_id, label_known=False)
-        if state == "done":
-            # Задача уже завершена: новый пинг тут же отменила бы сверка.
-            await message.answer(REMINDER_TASK_DONE.format(task_id=task_id))
-            return ReminderOutcome(True, task_id=task_id, deal_label=deal_label)
+        if state in ("missing", "done"):
+            # Задача удалена или закрыта: обещать пинг и «записано» нельзя,
+            # phantom-пинг не ставится, а УЖЕ стоящий снимается — иначе он
+            # выстрелил бы после ответа «не ставлю» (ревью ULTRA-4/5).
+            try:
+                await db.cancel_pending_task_reminder(task_id)
+            except Exception:
+                log.exception("Пинг терминальной задачи %s не снят", task_id)
+            reply = REMINDER_TASK_GONE if state == "missing" else REMINDER_TASK_DONE
+            await message.answer(reply.format(task_id=task_id))
+            return ReminderOutcome(
+                True,
+                task_id=task_id,
+                deal_label=deal_label if state == "done" else None,
+                label_known=state == "done",
+            )
         label_known = state == "ok"
         due_override = task_due
         if state == "ok":
@@ -1340,10 +1354,9 @@ async def _create_reminder(
             # Срок равняется на ФАКТИЧЕСКИЙ дедлайн задачи (не на повторный
             # разбор текста — его вернула бы назад синхронизация); хвост
             # «Срок:» в тексте строится от фактически записанного момента.
-            if task_due is not None and task_due <= int(
+            if due_override is not None and due_override <= int(
                 dates.now_local().timestamp()
             ):
-                task_due = None
                 due_override = None
             body = _task_ping_body(order, deal_label)
 
@@ -1351,11 +1364,14 @@ async def _create_reminder(
                 return f"{body}. Срок: {dates.format_epoch(ts)}"
 
             try:
-                # Промах CAS = параллельная сверка успела перенести запись:
-                # одна повторная попытка от свежего состояния (ревью ULTRA-4).
+                # Существующая строка обновляется TEXT-ONLY: срок пинга ведёт
+                # синхронизация (единственный владелец), и запись с прочитанным
+                # ранее — возможно уже устаревшим — дедлайном откатывала бы её
+                # свежий перенос (ревью ULTRA-5). Промах CAS = параллельный
+                # перенос: одна повторная попытка от свежего состояния.
                 for _attempt in range(2):
                     updated, row_due = await db.update_task_reminder(
-                        task_id, build_text, task_due
+                        task_id, build_text, None
                     )
                     if updated or row_due is None:
                         effective_due = row_due
@@ -1372,18 +1388,8 @@ async def _create_reminder(
     # Гарантированный канал: бот сам напишет в Telegram в момент срока.
     # Ставится на любом пути существования ЖИВОЙ задачи (в т.ч. найденной
     # сверкой после потерянного ответа add) — вставка идемпотентна по задаче.
-    if spawn_ping and effective_due is None:
-        effective_due = (
-            due_override
-            if due_override is not None
-            else dates.reminder_epoch(order.deadline)
-        )
-        if effective_due is not None and effective_due <= int(
-            dates.now_local().timestamp()
-        ):
-            effective_due = None
     if spawn_ping:
-        await _schedule_task_reminder(
+        spawned_due = await _schedule_task_reminder(
             message,
             db,
             order,
@@ -1391,6 +1397,8 @@ async def _create_reminder(
             deal_label=deal_label,
             due_override=due_override,
         )
+        if effective_due is None:
+            effective_due = spawned_due
     try:
         await message.answer(REMINDER_CREATED.format(task_id=task_id))
     except Exception:

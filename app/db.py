@@ -1308,6 +1308,23 @@ class Database:
             await conn.commit()
             return cur.rowcount == 1
 
+    async def cancel_pending_task_reminder(self, task_id: int) -> bool:
+        """Снимает ОЖИДАЮЩИЙ пинг задачи, которой больше нет или которая
+        уже закрыта (обратимая отмена, как у сверки: воскрешение возможно).
+
+        Вызывается идемпотентным повтором создания при terminal-состоянии
+        задачи: ответ «напоминание не ставлю» обязан снимать и уже стоящий
+        пинг, иначе он выстрелит после обещания обратного (ревью ULTRA-5).
+        """
+        async with aiosqlite.connect(self.path) as conn:
+            cur = await conn.execute(
+                "UPDATE reminders SET status = ?, cancelled_at = datetime('now') "
+                "WHERE kind = 'task' AND entity_id = ? AND status = ?",
+                (REMINDER_CANCELLED, task_id, REMINDER_PENDING),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
     async def update_task_reminder(
         self,
         task_id: int,
@@ -1340,7 +1357,7 @@ class Database:
             current_due = int(row[1])
             new_due = due_ts if due_ts is not None else current_due
             cur = await conn.execute(
-                "UPDATE reminders SET text = ?, due_ts = ? "
+                "UPDATE reminders SET text = ?, due_ts = ?, attempts = 0 "
                 "WHERE id = ? AND status = ? AND due_ts = ?",
                 (build_text(new_due), new_due, row[0], REMINDER_PENDING, current_due),
             )
@@ -1597,6 +1614,7 @@ class Database:
         text: str,
         activity_id: int | None,
         expected_due: int | None = None,
+        expected_text: str | None = None,
     ) -> bool:
         """Переносит неотправленное напоминание на новый срок (CAS по pending).
 
@@ -1616,7 +1634,7 @@ class Database:
                     "attempts = 0 WHERE id = ? AND status = ?",
                     (due_ts, text, activity_id, reminder_id, REMINDER_PENDING),
                 )
-            else:
+            elif expected_text is None:
                 cur = await conn.execute(
                     "UPDATE reminders SET due_ts = ?, text = ?, activity_id = ?, "
                     "attempts = 0 WHERE id = ? AND status = ? AND due_ts = ?",
@@ -1627,6 +1645,24 @@ class Database:
                         reminder_id,
                         REMINDER_PENDING,
                         expected_due,
+                    ),
+                )
+            else:
+                # CAS и по тексту: text-only согласование (reuse) при том же
+                # сроке не должно перетираться сверкой со старым снапшотом
+                # (ревью ULTRA-5).
+                cur = await conn.execute(
+                    "UPDATE reminders SET due_ts = ?, text = ?, activity_id = ?, "
+                    "attempts = 0 WHERE id = ? AND status = ? AND due_ts = ? "
+                    "AND text = ?",
+                    (
+                        due_ts,
+                        text,
+                        activity_id,
+                        reminder_id,
+                        REMINDER_PENDING,
+                        expected_due,
+                        expected_text,
                     ),
                 )
             await conn.commit()

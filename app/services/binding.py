@@ -55,16 +55,41 @@ _DATE_WORDS = (
 _DATE_WORD_RE = re.compile(r"^[\s.,:;—–-]*(?:%s)" % _DATE_WORDS, re.IGNORECASE)
 
 # Слова времени суток после числа — «к 15 вечера» это время, не заявка.
-_TIME_STOP_WORDS = _DATE_WORDS + r"|утр|вечер|дн[яеё]м?\b|ноч"
+# Формы закрытые: «ночной выезд», «утренний» — смысловые слова (ULTRA-5).
+_TIME_STOP_WORDS = (
+    _DATE_WORDS + r"|утр[ао]?\b|вечер(?:а|ом)?\b|дн[яеё]м?\b|ноч(?:и|ью)?\b"
+)
 
 # Начало ЧИСЛОВОЙ даты или времени сразу после группы цифр: «23.07», «15:00»,
 # «23/07» — группа принадлежит сроку, а не номеру (ревью ULTRA-3).
-_NUMERIC_DATE_RE = re.compile(r"^[.:/]\d")
+_NUMERIC_DATE_RE = re.compile(r"^[.:/\-]\d")
+
+# Следующая цифровая группа после уже захваченного идентификатора. Если она
+# не открывает дату/время — достоверно разобрать фразу нельзя, бот спрашивает
+# кнопками вместо угадайки (политика ревью ULTRA-5).
+_TRAILING_DIGITS_RE = re.compile(r"^\s+\(?(\d{1,4})")
+
+
+# Числовая дата целиком внутри цифровой группы («154 23-07-2026»,
+# «2026-07-23»): это «номер + дата», а не телефон. Телефонные дефисы
+# («123-45-67») не матчатся — перед их фрагментами нет границы слова.
+_EMBEDDED_DATE_RE = re.compile(
+    r"\b\d{1,2}[-./]\d{1,2}[-./]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b"
+)
+
+
+def _ambiguous_digit_tail(tail: str) -> bool:
+    """Цифры следом за идентификатором, которые не похожи на дату/время."""
+    match = _TRAILING_DIGITS_RE.match(tail)
+    if match is None:
+        return False
+    after = tail[match.end() :]
+    return not (_NUMERIC_DATE_RE.match(after) or _DATE_WORD_RE.match(after))
 
 # «К заявке по телефону 8914…» — телефон назван явно (тире тоже пунктуация).
 _PHONE_KEYWORD_RE = re.compile(
     _REF_PREFIX + r"(?:по\s+)?(?:телефону?|номеру\s+телефона)[\s.,:;—–-]*"
-    r"(\+?\d[\d\s()\-]{4,}\d)",
+    r"(\(?\+?[\d(][\d\s()\-]{4,}\d)",
     re.IGNORECASE,
 )
 
@@ -73,7 +98,7 @@ _PHONE_KEYWORD_RE = re.compile(
 # (без восьмёрки) — тоже штатная российская форма (normalize_phone),
 # поэтому минимум — 10 знаков (ревью R5).
 _PHONE_BARE_RE = re.compile(
-    _REF_PREFIX + r"(\+?\d[\d\s()\-]{8,}\d)", re.IGNORECASE
+    _REF_PREFIX + r"(\(?\+?[\d(][\d\s()\-]{8,}\d)", re.IGNORECASE
 )
 
 # «К заявке 154», «к заявке №154», «к заявке номер: 154». Захватывается
@@ -85,16 +110,22 @@ _DEAL_NUM_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Продолжение разбитого STT числа: короткая цифровая группа через пробел.
-_NUM_GROUP_RE = re.compile(r"^\s+(\d{1,4})(?=[\s.,;:!?)]|$)")
-
 # Самоисправление голосом без слова «заявка»: «…, нет, к 155», «нет — к
 # 155», «нет. к 155». Числа, похожие на время («к 15:00», «к 15 вечера»)
 # или дату («к 23 июля»), исправлением ПРИВЯЗКИ не считаются.
 _CORRECTION_RE = re.compile(
-    r"\bнет\b[\s,.:;—–-]*(?:лучше\s+)?(?:к|по|на)\s+"
+    r"\bнет\b[\s,.:;!?—–-]*(?:лучше\s+)?(?:к|по|на)\s+"
     r"(?:заявк[а-яё]*[\s.,:;—–-]*)?"
     r"(?:№\s*)?\d{1,9}(?![:.,]?\d)(?!\s*(?:%s))" % _TIME_STOP_WORDS,
+    re.IGNORECASE,
+)
+
+# Исправление с ЛЮБЫМ словом-маркером ссылки («нет, к последней…», «нет,
+# по телефону…», «нет, к номеру…») — всегда уточняем кнопками: угадать,
+# что имел в виду человек, нельзя (ревью ULTRA-5).
+_CORRECTION_KEYWORD_RE = re.compile(
+    r"\bнет\b[\s,.:;!?—–-]*(?:лучше\s+)?(?:(?:к|по|на|для)\s+)?"
+    r"(?:заявк|последн|телефон|номер|№)",
     re.IGNORECASE,
 )
 
@@ -159,7 +190,9 @@ def _normalize_ref_phone(raw: str) -> str | None:
     работает штатная российская нормализация.
     """
     text = (raw or "").strip()
-    if text.startswith("+"):
+    # Добавочный не входит в E.164 ни в одной форме («+7… доб. 12»).
+    text = re.split(r"доб|вн|ext|#", text, maxsplit=1)[0]
+    if text.lstrip(" 	(").startswith("+"):
         digits = re.sub(r"\D", "", text)
         return "+" + digits if 10 <= len(digits) <= 15 else None
     return normalize_phone(text)
@@ -182,7 +215,7 @@ def _trim_phone_span(group: str, tail: str) -> tuple[str | None, int]:
             group = group[:end]
     digits = re.sub(r"\D", "", group)
     limit = None
-    if group.lstrip().startswith("+"):
+    if group.lstrip(" 	(").startswith("+"):
         # Явный международный формат: длину страны угадывать нельзя,
         # обрезка только по маркерам даты выше (ревью ULTRA-3).
         limit = None
@@ -213,32 +246,28 @@ def _extract_one(text: str) -> tuple[str, BindingRef | None]:
     if match:
         return _cut(raw, match.start(), match.end()), BindingRef("last")
     match = _PHONE_KEYWORD_RE.search(raw) or _PHONE_BARE_RE.search(raw)
+    if match and _EMBEDDED_DATE_RE.search(match.group(1)):
+        # Внутри «телефона» числовая дата: это «номер + дата» — решает
+        # ветка номера ниже (ревью ULTRA-5).
+        match = None
     if match:
         phone, consumed = _trim_phone_span(match.group(1), raw[match.end(1) :])
         if phone is not None:
             end = match.start(1) + consumed
+            if _ambiguous_digit_tail(raw[end:]):
+                # За номером цифры, не похожие на дату/время: достоверной
+                # границы номера нет — уточняем кнопками (ревью ULTRA-5).
+                return raw, BindingRef("conflict")
             return _cut(raw, match.start(), end), BindingRef("phone", phone)
     match = _DEAL_NUM_RE.search(raw)
     if match:
         digits = match.group(1)
         end = match.end(1)
-        # Первая группа сама может быть номером, за которым идёт числовая
-        # дата/время («154 15:00») — такие группы не подклеиваются.
-        while True:
-            nxt = _NUM_GROUP_RE.match(raw[end:])
-            if nxt is None:
-                break
-            after = raw[end + nxt.end() :]
-            if _DATE_WORD_RE.match(after) or _NUMERIC_DATE_RE.match(after):
-                break
-            digits += nxt.group(1)
-            end += nxt.end()
-        if len(digits) <= MAX_DEAL_ID_DIGITS:
-            return _cut(raw, match.start(), end), BindingRef("deal_id", digits)
-        # 10-15 цифр — это телефон, названный без слова «телефон».
-        phone = _normalize_ref_phone(digits)
-        if phone is not None:
-            return _cut(raw, match.start(), end), BindingRef("phone", phone)
+        if _ambiguous_digit_tail(raw[end:]):
+            # «154 2 договора», «123 456 789…»: отличить разбитый номер от
+            # «номер + количество» нельзя — спрашиваем, а не гадаем.
+            return raw, BindingRef("conflict")
+        return _cut(raw, match.start(), end), BindingRef("deal_id", digits)
     return raw, None
 
 
@@ -259,6 +288,8 @@ def extract_inline_binding(text: str) -> tuple[str, BindingRef | None]:
     clean = (text or "").strip()
     while True:
         remainder, ref = _extract_one(clean)
+        if ref is not None and ref.kind == "conflict":
+            return (text or "").strip(), ref
         if ref is None or len(remainder) >= len(clean):
             # Каждая найденная ссылка строго укорачивает текст — второе
             # условие лишь страхует от зацикливания.
@@ -269,7 +300,7 @@ def extract_inline_binding(text: str) -> tuple[str, BindingRef | None]:
         return clean, None
     if len({(ref.kind, ref.value) for ref in refs}) > 1:
         return (text or "").strip(), BindingRef("conflict")
-    if _CORRECTION_RE.search(clean):
+    if _CORRECTION_KEYWORD_RE.search(clean) or _CORRECTION_RE.search(clean):
         return (text or "").strip(), BindingRef("conflict")
     return clean, refs[0]
 

@@ -838,13 +838,16 @@ async def test_conflicting_refs_ask_question(flow, monkeypatch):
     assert await state_of(flow) == ReminderFlow.binding.state
 
 
-def test_spaced_digits_deal_id():
-    """STT-пробелы в числе: «к заявке 123 456 789» → D_123456789."""
+def test_spaced_digits_ask_question():
+    """STT-пробелы в числе: «к заявке 123 456 789» — вопрос, не угадайка.
+
+    Политика ULTRA-5: достоверно отличить «разбитый номер» от «номер +
+    количество» нельзя — неоднозначный цифровой хвост уточняется кнопками.
+    """
     from app.services.binding import extract_inline_binding
 
     _, ref = extract_inline_binding("к заявке 123 456 789 завтра в 8 позвонить")
-    assert ref is not None
-    assert (ref.kind, ref.value) == ("deal_id", "123456789")
+    assert ref is not None and ref.kind == "conflict"
 
 
 def test_phone_does_not_swallow_following_date():
@@ -1044,13 +1047,6 @@ def test_deal_id_not_glued_with_date():
     assert (ref.kind, ref.value) == ("deal_id", "154")
     assert "23 июля" in clean
 
-    clean, ref = extract_inline_binding(
-        "к заявке 123 456 789 23 июля в 8 позвонить"
-    )
-    assert ref is not None
-    assert (ref.kind, ref.value) == ("deal_id", "123456789")
-    assert "23 июля" in clean
-
 
 def test_phone_day_split_for_any_form():
     """Городской и международный номер не съедают следующий день."""
@@ -1159,6 +1155,13 @@ async def test_reuse_updates_ping_due_ts(flow, monkeypatch):
     assert outcome.created
     rows = await flow.db.pending_task_reminders()
     assert len(rows) == 1
+    # Reuse согласует ТЕКСТ (подпись) сразу; срок ведёт синхронизация —
+    # она и доводит пинг до фактического дедлайна задачи (ревью ULTRA-5).
+    assert "№155" in rows[0]["text"]
+    from app.services import tasks as tasks_service
+
+    await tasks_service.sync_task_reminder(flow.bx, flow.db, rows[0])
+    rows = await flow.db.pending_task_reminders()
     assert abs(rows[0]["due_ts"] - int(new_deadline.timestamp())) <= 120
     assert "№155" in rows[0]["text"]
 
@@ -1352,6 +1355,12 @@ async def test_reuse_due_follows_task_deadline(flow, monkeypatch):
     assert outcome.created
     rows = await flow.db.pending_task_reminders()
     assert len(rows) == 1
+    # Повторный разбор (+1ч) НЕ записан в срок пинга: строка на старом месте.
+    assert abs(rows[0]["due_ts"] - (int(time.time()) + 600)) <= 120
+    from app.services import tasks as tasks_service
+
+    await tasks_service.sync_task_reminder(flow.bx, flow.db, rows[0])
+    rows = await flow.db.pending_task_reminders()
     assert abs(rows[0]["due_ts"] - int(task_due.timestamp())) <= 120
 
 
@@ -1470,8 +1479,8 @@ async def test_deleted_task_reuse_is_unknown(flow, monkeypatch):
     assert outcome.created
     assert outcome.deal_label is None
     assert outcome.label_known is False
-    rows = await flow.db.pending_task_reminders()
-    assert rows[0]["text"] == old_text
+    # Терминальная задача снимает и стоящий пинг (ревью ULTRA-5).
+    assert await flow.db.pending_task_reminders() == []
 
 
 # --- Правки по ревью Sol ULTRA-4 ------------------------------------------
@@ -1493,15 +1502,14 @@ def test_plus_phone_never_ru_normalized():
     assert (answer.kind, answer.value) == ("phone", "+4512345678")
 
 
-def test_hour_adjective_does_not_stop_gluing():
-    """«Часовой пояс» — не стоп-слово: «123 456» склеивается в D_123456."""
+def test_hour_adjective_ambiguous_asks():
+    """«123 456 часовой пояс…» — неоднозначно, бот спрашивает (ULTRA-5)."""
     from app.services.binding import extract_inline_binding
 
     _, ref = extract_inline_binding(
         "к заявке 123 456 часовой пояс клиента уточнить 23.07.2027"
     )
-    assert ref is not None
-    assert (ref.kind, ref.value) == ("deal_id", "123456")
+    assert ref is not None and ref.kind == "conflict"
 
 
 def test_correction_with_dash_or_dot():
@@ -1568,8 +1576,11 @@ async def test_reuse_outcome_reports_actual_due(flow, monkeypatch):
     )
 
     assert outcome.created
+    # Outcome называет момент, на который пинг РЕАЛЬНО стоит (текущая
+    # запись очереди); повторный разбор T2 не утверждается (ревью ULTRA-4/5).
     assert outcome.due_ts is not None
-    assert abs(outcome.due_ts - int(t1.timestamp())) <= 120
+    rows = await flow.db.pending_task_reminders()
+    assert outcome.due_ts == rows[0]["due_ts"]
 
 
 async def test_reschedule_cas_by_expected_due(flow):
@@ -1650,6 +1661,202 @@ async def test_completed_task_reuse_no_new_ping(flow, monkeypatch):
     assert outcome.due_ts is None
     assert await flow.db.pending_task_reminders() == []
     assert REMINDER_TASK_DONE.format(task_id=77) in flow.session.sent_texts
+
+
+# --- Правки по ревью Sol ULTRA-5 ------------------------------------------
+
+
+def test_unclassified_digit_tail_asks_instead_of_guessing():
+    """Цифры после номера без явной даты — вопрос, а не склейка/угадайка."""
+    from app.services.binding import extract_inline_binding
+
+    # «2 договора» — не дата: гадать между D_1542 и D_154 нельзя.
+    _, ref = extract_inline_binding("к заявке 154 2 договора завтра в 8")
+    assert ref is not None and ref.kind == "conflict"
+    # STT-разбиение длинного числа тоже не угадывается — спросим.
+    _, ref = extract_inline_binding("к заявке 123 456 789 23 июля в 8")
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_numeric_dash_dates_preserved():
+    """«154 23-07-2026» и «154 2026-07-23» — это ID и дата, не телефон."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding("к заявке 154 23-07-2026 в 8 позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+    assert "23-07-2026" in clean
+
+    clean, ref = extract_inline_binding("к заявке 154 2026-07-23 в 8 позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+    assert "2026-07-23" in clean
+
+
+def test_correction_with_keyword_reference():
+    """«нет, к последней…», «нет, по телефону…», «нет! к 155» — конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    for raw in (
+        "к заявке 154, нет, к последней заявке завтра в 8",
+        "к заявке 154, нет, по телефону 89141234567 завтра",
+        "к заявке 154, нет, к номеру 155 завтра",
+        "к заявке 154, нет! к 155 завтра",
+    ):
+        _, ref = extract_inline_binding(raw)
+        assert ref is not None and ref.kind == "conflict", raw
+
+
+def test_daypart_adjectives_do_not_suppress_correction():
+    """«ночной выезд» после исправления не глушит конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 155 ночной выезд завтра в 8"
+    )
+    assert ref is not None and ref.kind == "conflict"
+    # А настоящее время суток — по-прежнему не конфликт.
+    _, ref = extract_inline_binding("к заявке 154, нет, к 15 ночи позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+
+
+def test_plus_phone_with_parens_and_extension():
+    """«(+45)…» не RU-нормализуется, «+7… доб. 12» без добавочного."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону (+45) 12 34 56 78 завтра позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+4512345678")
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +7 914 123-45-67 доб. 12 завтра позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+
+
+def test_paren_phone_keyword_form():
+    """«по телефону (914) 123-45-67» распознаётся."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону (914) 123-45-67 завтра позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+
+
+async def test_missing_task_cancels_existing_ping(flow, monkeypatch):
+    """«Задачи нет» отменяет и уже стоящий пинг — обещание снято целиком."""
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+
+    key = "rem:ultra5-cancel"
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 990)
+    await flow.db.add_reminder(
+        1, "позвонить (заявка №155). Срок: скоро", int(time.time()) + 3600, "task", 990
+    )
+
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    outcome = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
+    )
+
+    assert outcome.created
+    assert await flow.db.pending_task_reminders() == []
+
+
+async def test_due_promise_matches_actual_spawn(flow, monkeypatch):
+    """Сбой записи пинга не даёт обещания «Пришлю…» (due_ts=None)."""
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+
+    async def broken_spawn(*args, **kwargs):
+        raise RuntimeError("sqlite залочен")
+
+    monkeypatch.setattr(flow.db, "spawn_task_reminder", broken_spawn)
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    message = make_message_update(flow.bot, "свежее").message
+    outcome = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", deadline),
+        key="rem:ultra5-spawnfail",
+    )
+
+    assert outcome.created
+    assert outcome.due_ts is None
+
+
+async def test_retry_does_not_roll_back_synced_due(flow, monkeypatch):
+    """Повторная CAS-попытка reuse не откатывает срок, свежесдвинутый синком."""
+
+
+    t0 = int(time.time()) + 600
+    t1 = int(time.time()) + 7200
+    rid = await flow.db.add_reminder(1, "позвонить. Срок: T0", t0, "task", 77)
+    # Синк успел перенести на свежий T1 между чтением задачи и CAS reuse.
+    moved = await flow.db.reschedule_reminder(
+        rid,
+        t1,
+        "позвонить. Срок: T1",
+        None,
+        expected_due=t0,
+    )
+    assert moved
+    # Reuse работает TEXT-ONLY (боевой контракт): срок строки не трогается,
+    # свежий перенос синка не откатывается.
+    updated, row_due = await flow.db.update_task_reminder(
+        77, lambda ts: f"позвонить. Срок: {ts}", None
+    )
+    assert updated
+    assert row_due == t1
+    rows = await flow.db.pending_task_reminders()
+    assert rows[0]["due_ts"] == t1
+
+
+async def test_sync_text_cas_protects_same_due_rewrite(flow):
+    """Sync не возвращает старую подпись при неизменном сроке (CAS по тексту)."""
+    now = int(time.time())
+    rid = await flow.db.add_reminder(
+        1, "позвонить (заявка №155 · новая). Срок: X", now + 600, "task", 77
+    )
+    ok = await flow.db.reschedule_reminder(
+        rid,
+        now + 7200,
+        "позвонить (заявка №154 · старая). Срок: Y",
+        None,
+        expected_due=now + 600,
+        expected_text="позвонить (заявка №154 · устаревший снапшот). Срок: X",
+    )
+    assert not ok
+    rows = await flow.db.pending_task_reminders()
+    assert "№155" in rows[0]["text"]
+
+
+async def test_update_task_reminder_resets_attempts(flow):
+    """Перенос reuse сбрасывает счётчик попыток — старые сбои не хоронят пинг."""
+    import aiosqlite
+
+    now = int(time.time())
+    rid = await flow.db.add_reminder(
+        1, "позвонить. Срок: X", now + 600, "task", 77
+    )
+    await flow.db.record_reminder_attempt(rid, 5)
+    await flow.db.record_reminder_attempt(rid, 5)
+
+    updated, _ = await flow.db.update_task_reminder(
+        77, lambda ts: f"позвонить. Срок: {ts}", now + 7200
+    )
+    assert updated
+    async with aiosqlite.connect(flow.db.path) as conn:
+        cur = await conn.execute(
+            "SELECT attempts FROM reminders WHERE id = ?", (rid,)
+        )
+        row = await cur.fetchone()
+    assert row[0] == 0
 
 
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------

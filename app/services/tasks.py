@@ -573,6 +573,7 @@ async def sync_task_reminder(
         text,
         reminder.get("activity_id"),
         expected_due=int(fresh["due_ts"]),
+        expected_text=str(fresh["text"]),
     ):
         # Запись не pending либо срок изменился параллельно (reuse успел
         # согласовать подпись/срок) — свежие данные не перетираются.
