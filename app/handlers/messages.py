@@ -827,13 +827,18 @@ async def _process_order_text(
             # ломало бы контент-дедуп (см. _mark_order_started). Не нашлась
             # заявка однозначно — честное обычное напоминание с пояснением.
             await state.clear()
-            _, ref = binding.extract_inline_binding(text)
-            cleaned_problem, problem_ref = binding.extract_inline_binding(
-                order.problem or ""
-            )
-            if problem_ref is not None and cleaned_problem:
-                # Фраза привязки — служебная, в заголовок задачи не идёт.
-                order = order.model_copy(update={"problem": cleaned_problem})
+            ref = None
+            if len(orders) == 1:
+                # Инлайн-привязка только для одиночного напоминания: при
+                # нескольких фраза «к заявке …» могла относиться к любому
+                # из них, а создаётся здесь только первое (ревью R3).
+                _, ref = binding.extract_inline_binding(text)
+                cleaned_problem, problem_ref = binding.extract_inline_binding(
+                    order.problem or ""
+                )
+                if problem_ref is not None and cleaned_problem:
+                    # Фраза привязки — служебная, в заголовок задачи не идёт.
+                    order = order.model_copy(update={"problem": cleaned_problem})
             deal_id = None
             deal_label = None
             inline_miss = False

@@ -351,6 +351,11 @@ async def handle_reminder_query(
         if (parsed.problem or "").strip():
             problem = parsed.problem.strip()
         llm_deadline = parsed.deadline
+    if len(orders) > 1:
+        # Несколько напоминаний в сообщении: фраза «к заявке …» могла
+        # относиться к любому из них — инлайн-привязка не угадывается,
+        # шаг привязки спросит явно (ревью R3).
+        ref = None
     now = dates.now_local()
     deadline = dates.resolve_deadline(llm_deadline, source, now)
     due_ts = dates.reminder_epoch(deadline)

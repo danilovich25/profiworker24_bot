@@ -482,6 +482,79 @@ def test_parse_binding_answer_last_forms():
     assert parse_binding_answer("Последняя миля").kind == "text"
 
 
+def test_parse_binding_answer_natural_forms():
+    """«Номер заявки 154», «по заявке 154» — это ID, а не текстовый поиск.
+
+    Иначе подстрочный поиск «154» мог бы молча привязать к чужой сделке
+    с «154» в названии (Sol R3).
+    """
+    from app.services.binding import parse_binding_answer
+
+    for answer in (
+        "номер заявки 154",
+        "по заявке 154",
+        "заявка 154",
+        "к заявке номер 154",
+        "заявка № 154",
+    ):
+        ref = parse_binding_answer(answer)
+        assert (ref.kind, ref.value) == ("deal_id", "154"), answer
+    phone = parse_binding_answer("номер телефона 89141234567")
+    assert (phone.kind, phone.value) == ("phone", "+79141234567")
+    # Название, начинающееся со служебного слова, остаётся текстовым поиском.
+    assert parse_binding_answer("Номерной фонд").kind == "text"
+
+
+async def test_multi_reminder_message_does_not_inline_bind(flow, monkeypatch):
+    """Два напоминания в одном сообщении: ссылка из второго не привязывает первое.
+
+    Sol R3: напоминание берётся из orders[0], а «к заявке 154» может
+    относиться ко второму фрагменту — инлайн-привязка при многоэлементном
+    вводе игнорируется, кнопочный флоу задаёт вопрос явно.
+    """
+    raw = "к заявке 154 через 2 часа позвонить и завтра в 9 отправить смету"
+    cleaned = "через 2 часа позвонить и завтра в 9 отправить смету"
+
+    async def fake(text: str):
+        if text.lower() == cleaned:
+            return [
+                reminder_order("позвонить"),
+                reminder_order("отправить смету"),
+            ]
+        return None
+
+    monkeypatch.setattr(llm, "parse_order", fake)
+    await send(flow, BTN_REMIND)
+    await send(flow, raw)
+
+    assert flow.bx.tasks == []
+    assert flow.session.sent_messages[-1].text == BIND_PROMPT
+    assert await state_of(flow) == ReminderFlow.binding.state
+
+
+async def test_free_text_multi_reminder_does_not_inline_bind(flow, monkeypatch):
+    """Свободный текст с двумя напоминаниями не привязывается по ссылке."""
+    from app.handlers.messages import BIND_INLINE_MISS
+
+    raw = "напомни к заявке 154 завтра в 8 позвонить и завтра в 9 смета"
+
+    async def fake(text: str):
+        if text.lower() == raw:
+            return [
+                reminder_order("позвонить"),
+                reminder_order("смета"),
+            ]
+        return None
+
+    monkeypatch.setattr(llm, "parse_order", fake)
+    await send(flow, raw)
+
+    assert len(flow.bx.tasks) == 1
+    assert "UF_CRM_TASK" not in flow.bx.tasks[0]
+    # Привязка не заявлялась надёжно: ни привязки, ни жалобы на промах.
+    assert BIND_INLINE_MISS not in flow.session.sent_texts
+
+
 def test_parse_binding_answer_stt_punctuation():
     """Автопунктуация STT не превращает номер заявки в текстовый запрос."""
     from app.services.binding import parse_binding_answer

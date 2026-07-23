@@ -72,12 +72,25 @@ _ANSWER_LAST_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Служебные слова в ответе перед самим идентификатором: «к заявке 154»,
-# «заявка №154», «по телефону 8914…» — отбрасываются перед разбором.
-_ANSWER_PREFIX_RE = re.compile(
-    r"^(?:к\s+)?(?:заявк\w*\s+)?(?:по\s+)?(?:телефону?\s+|номер[ау]?\s+|№\s*)?",
+# Служебные слова перед идентификатором в ответе: «к заявке номер 154»,
+# «номер заявки 154», «по телефону 8914…», «№154». Порядок свободный (так
+# диктуют голосом), поэтому срезаются итеративно по одному. Буквенные
+# хвосты — только кириллица: \w съедал бы цифры самого номера, а «заявки154»
+# слитно остаётся текстовым запросом.
+_SERVICE_WORD_RE = re.compile(
+    r"^(?:(?:к|по|для|заявк[а-яё]*|номер[а-яё]*|телефон[а-яё]*)(?:\s+|$)|№\s*)",
     re.IGNORECASE,
 )
+
+
+def _strip_service_words(text: str) -> str:
+    """Снимает ведущие служебные слова ответа: «к заявке номер …» → «…»."""
+    rest = text
+    while True:
+        match = _SERVICE_WORD_RE.match(rest)
+        if match is None or match.end() == 0:
+            return rest
+        rest = rest[match.end() :]
 
 
 def _cut(text: str, start: int, end: int) -> str:
@@ -130,7 +143,7 @@ def parse_binding_answer(text: str) -> BindingRef:
         return BindingRef("none")
     if _ANSWER_LAST_RE.match(raw):
         return BindingRef("last")
-    bare = _ANSWER_PREFIX_RE.sub("", raw).strip()
+    bare = _strip_service_words(raw).strip()
     compact = re.sub(r"[\s()\-]", "", bare)
     if compact.isdecimal() and len(compact) <= MAX_DEAL_ID_DIGITS:
         return BindingRef("deal_id", compact)
