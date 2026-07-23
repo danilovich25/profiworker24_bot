@@ -558,7 +558,15 @@ async def sync_task_reminder(
         return reminder
     if abs(due_ts - int(reminder["due_ts"])) < SYNC_TOLERANCE_SECONDS:
         return reminder
-    text = _text_with_deadline(str(reminder["text"]), due_ts)
+    # Текст строится от СВЕЖЕЙ записи, а не от снапшота пачки: подпись
+    # заявки могла быть согласована с фактической привязкой между чтением
+    # пачки и этим переносом (ревью ULTRA-3).
+    fresh = await db.get_reminder(int(reminder["id"]))
+    if fresh is None or fresh.get("status") != REMINDER_PENDING:
+        return reminder
+    if abs(due_ts - int(fresh["due_ts"])) < SYNC_TOLERANCE_SECONDS:
+        return {**reminder, "due_ts": int(fresh["due_ts"]), "text": fresh["text"]}
+    text = _text_with_deadline(str(fresh["text"]), due_ts)
     if not await db.reschedule_reminder(
         reminder["id"], due_ts, text, reminder.get("activity_id")
     ):

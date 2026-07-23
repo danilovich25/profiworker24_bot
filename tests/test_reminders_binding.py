@@ -720,7 +720,7 @@ async def test_reused_task_keeps_actual_binding(flow, monkeypatch):
     order = reminder_order("позвонить", deadline)
     message = make_message_update(flow.bot, "повтор").message
 
-    created, label = await _create_reminder(
+    created, label, _known = await _create_reminder(
         message,
         flow.db,
         flow.bx,
@@ -952,7 +952,7 @@ async def test_actual_binding_survives_deal_read_failure(flow, monkeypatch):
 
     deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
     message = make_message_update(flow.bot, "повтор").message
-    created, label = await _create_reminder(
+    created, label, _known = await _create_reminder(
         message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
     )
 
@@ -985,7 +985,7 @@ async def test_reuse_updates_existing_ping_text(flow, monkeypatch):
 
     deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
     message = make_message_update(flow.bot, "повтор").message
-    created, label = await _create_reminder(
+    created, label, _known = await _create_reminder(
         message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
     )
 
@@ -1128,8 +1128,14 @@ async def test_reuse_updates_ping_due_ts(flow, monkeypatch):
     from app.services.tasks import _key_tag
 
     key = "rem:ultra2-due"
+    new_deadline = dates.now_local() + timedelta(hours=2)
     flow.bx.tasks.append(
-        {"TITLE": "Позвонить", "UF_CRM_TASK": ["D_155"], "TAGS": [_key_tag(key)]}
+        {
+            "TITLE": "Позвонить",
+            "UF_CRM_TASK": ["D_155"],
+            "TAGS": [_key_tag(key)],
+            "DEADLINE": new_deadline.isoformat(),
+        }
     )
     await flow.db.get_or_create_task_fence(key)
     await flow.db.mark_task_fence_sent(key)
@@ -1139,9 +1145,8 @@ async def test_reuse_updates_ping_due_ts(flow, monkeypatch):
         1, "позвонить (заявка №154 · чужая). Срок: старый", old_due, "task", 77
     )
 
-    new_deadline = dates.now_local() + timedelta(hours=2)
     message = make_message_update(flow.bot, "повтор").message
-    created, _ = await _create_reminder(
+    created, *_ = await _create_reminder(
         message,
         flow.db,
         flow.bx,
@@ -1185,7 +1190,7 @@ async def test_task_read_failure_keeps_existing_ping_text(flow, monkeypatch):
 
     deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
     message = make_message_update(flow.bot, "повтор").message
-    created, label = await _create_reminder(
+    created, label, _known = await _create_reminder(
         message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
     )
 
@@ -1234,6 +1239,237 @@ async def test_scheduler_sends_fresh_text(flow):
     sent = "\n".join(flow.session.sent_texts)
     assert "№155" in sent
     assert "№154" not in sent
+
+
+# --- Правки по ревью Sol ULTRA-3 ------------------------------------------
+
+
+def test_plus_international_phone_not_truncated():
+    """«+971501234567» — явный международный, RU-эвристика не режет."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +971501234567 завтра позвонить"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("phone", "+971501234567")
+
+
+def test_numeric_date_and_time_not_glued():
+    """Числовая дата и время не приклеиваются к номеру/телефону."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding("к заявке 154 23.07.2026 в 8 позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+    assert "23.07.2026" in clean
+
+    clean, ref = extract_inline_binding("к заявке 154 15:00 позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+    assert "15:00" in clean
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону 4951234567 23.07 позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+74951234567")
+    assert "23.07" in clean
+
+
+def test_dash_after_phone_keyword():
+    """«По телефону — 8914…» с тире распознаётся, конфликт видит телефон."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону — 89141234567 завтра позвонить"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к заявке по телефону — 89141234567 завтра"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+async def test_cleaned_raw_is_soft_candidate(flow, monkeypatch):
+    """clean_search_query от ответа — мягкий кандидат, не точный.
+
+    «Телефон доверия» без полного совпадения НЕ автопривязывается к чужой
+    сделке с «доверия» в названии — только через кнопку подтверждения.
+    """
+    flow.bx.deals.append(
+        {
+            "ID": "157",
+            "TITLE": "кризис доверия",
+            "STAGE_ID": "NEW",
+            "DATE_CREATE": "2026-07-19T11:00:00+10:00",
+            "CONTACT_ID": "15",
+            "COMMENTS": "",
+        }
+    )
+    await start_reminder(flow, monkeypatch)
+    await send(flow, "Телефон доверия")
+
+    assert flow.bx.tasks == []
+    assert await state_of(flow) == ReminderFlow.binding.state
+    await press_bind(flow, "157")
+    assert len(flow.bx.tasks) == 1
+    assert flow.bx.tasks[0]["UF_CRM_TASK"] == ["D_157"]
+
+
+async def test_reuse_due_follows_task_deadline(flow, monkeypatch):
+    """Reuse берёт срок из ФАКТИЧЕСКОЙ задачи, а не из повторного разбора."""
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+    from app.services.tasks import _key_tag
+
+    key = "rem:ultra3-due"
+    task_due = dates.now_local() + timedelta(hours=5)
+    flow.bx.tasks.append(
+        {
+            "TITLE": "Позвонить",
+            "UF_CRM_TASK": ["D_155"],
+            "TAGS": [_key_tag(key)],
+            "DEADLINE": task_due.isoformat(),
+        }
+    )
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 77)
+    await flow.db.add_reminder(
+        1, "позвонить. Срок: старый", int(time.time()) + 600, "task", 77
+    )
+
+    retry_deadline = (dates.now_local() + timedelta(hours=1)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    created, *_ = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", retry_deadline), key=key
+    )
+
+    assert created
+    rows = await flow.db.pending_task_reminders()
+    assert len(rows) == 1
+    assert abs(rows[0]["due_ts"] - int(task_due.timestamp())) <= 120
+
+
+async def test_sync_uses_fresh_row_text(flow):
+    """Синк переноса срока строит текст от СВЕЖЕЙ записи, не от снапшота."""
+    from datetime import timedelta
+
+    from app.services import dates
+    from app.services import tasks as tasks_service
+
+    now = int(time.time())
+    crm_due = dates.now_local() + timedelta(hours=3)
+    rid = await flow.db.add_reminder(
+        1, "позвонить (заявка №155 · новая). Срок: старый", now + 600, "task", 77
+    )
+    flow.bx.tasks.append({"TITLE": "Позвонить", "DEADLINE": crm_due.isoformat()})
+    stale = {
+        "id": rid,
+        "chat_id": 1,
+        "text": "позвонить (заявка №154 · старая). Срок: старый",
+        "due_ts": now + 600,
+        "kind": "task",
+        "entity_id": 77,
+        "activity_id": None,
+        "attempts": 0,
+    }
+    await tasks_service.sync_task_reminder(flow.bx, flow.db, stale)
+
+    rows = await flow.db.pending_task_reminders()
+    assert len(rows) == 1
+    assert "№155" in rows[0]["text"]
+    assert "№154" not in rows[0]["text"]
+
+
+async def test_unknown_binding_suppresses_inline_miss(flow, monkeypatch):
+    """При недоступном tasks.task.get бот не утверждает «поставил обычное»."""
+    from datetime import timedelta
+
+    from app.handlers.messages import BIND_INLINE_MISS, _create_reminder
+    from app.services import dates
+    from app.services.tasks import _key_tag
+
+    key = "rem:ultra3-miss"
+    flow.bx.tasks.append(
+        {"TITLE": "Позвонить", "UF_CRM_TASK": ["D_155"], "TAGS": [_key_tag(key)]}
+    )
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 77)
+
+    orig = flow.bx._dispatch
+
+    async def failing(method, params):
+        if method == "tasks.task.get":
+            raise RuntimeError("Bitrix24 недоступен")
+        return await orig(method, params)
+
+    monkeypatch.setattr(flow.bx, "_dispatch", failing)
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    created, label, label_known = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
+    )
+
+    assert created
+    assert label is None
+    assert label_known is False
+    assert BIND_INLINE_MISS not in flow.session.sent_texts
+
+
+def test_correction_ignores_hour_words():
+    """«нет, к 15 часам» — исправление времени, не привязки."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 15 часам позвонить завтра"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+
+
+def test_sixth_differing_ref_is_conflict():
+    """Шестая отличающаяся ссылка после пяти дублей — всё ещё конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    raw = " ".join(["к заявке 154,"] * 5) + " нет, к заявке 155 завтра в 8"
+    _, ref = extract_inline_binding(raw)
+    assert ref is not None and ref.kind == "conflict"
+
+
+async def test_deleted_task_reuse_is_unknown(flow, monkeypatch):
+    """Удалённая задача (пустой result) не считается «привязки нет».
+
+    Пинг не перезаписывается, подпись не утверждается.
+    """
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+
+    key = "rem:ultra3-deleted"
+    # fence указывает на задачу 990, которой в фейке нет: tasks.task.get
+    # вернёт пустой result — контракт «задача удалена».
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 990)
+    old_text = "позвонить (заявка №155 · важная). Срок: скоро"
+    await flow.db.add_reminder(1, old_text, int(time.time()) + 3600, "task", 990)
+
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    created, label, label_known = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
+    )
+
+    assert created
+    assert label is None
+    assert label_known is False
+    rows = await flow.db.pending_task_reminders()
+    assert rows[0]["text"] == old_text
 
 
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------

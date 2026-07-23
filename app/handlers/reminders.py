@@ -435,7 +435,7 @@ async def _finalize_reminder(
     if deal is not None:
         deal_id = int(deal["ID"])
         deal_label = await deal_binding_label(bitrix, deal)
-    created, final_label = await _create_reminder(
+    created, final_label, _label_known = await _create_reminder(
         message,
         db,
         bitrix,
@@ -499,27 +499,27 @@ async def _find_deals(
     подтверждения кнопкой (ревью ULTRA).
     """
     if ref.kind == "text":
+        # Точный ярус — ТОЛЬКО полный ответ как есть: любая очистка может
+        # выбросить смысловое слово («Телефон доверия» → «доверия»), и её
+        # совпадения не имеют права привязываться молча (ревью ULTRA-3).
         raw_query = (ref.value or "").strip()
+        found = await search_deals_by_text(bitrix, raw_query)
+        if found.deals or found.truncated:
+            return found.deals, found.truncated, False
+        # Мягкие кандидаты: без служебных слов краёв/префикса и основа
+        # последнего слова. Их совпадения подтверждаются кнопкой.
         cleaned = clean_search_query(raw_query)
-        exact = list(dict.fromkeys([raw_query] + ([cleaned] if cleaned else [])))
-        for candidate in exact:
-            found = await search_deals_by_text(bitrix, candidate)
-            if found.deals or found.truncated:
-                return found.deals, found.truncated, False
-        # Мягкие кандидаты: ядро без служебного префикса («к заявке
-        # Ромашка» → «Ромашка») и основа последнего слова. Их совпадения
-        # подтверждаются кнопкой, а не привязываются молча.
         core = binding.core_text_query(raw_query)
         soft = [
             candidate
             for candidate in dict.fromkeys(
-                [core, clean_search_query(core) if core else ""]
+                [cleaned, core, clean_search_query(core) if core else ""]
             )
-            if candidate and candidate not in exact
+            if candidate and candidate != raw_query
         ]
         stem_source = clean_search_query(core) or cleaned
         stem = stem_search_query(stem_source) if stem_source else None
-        if stem is not None and stem not in exact and stem not in soft:
+        if stem is not None and stem != raw_query and stem not in soft:
             soft.append(stem)
         for candidate in soft:
             found = await search_deals_by_text(bitrix, candidate)

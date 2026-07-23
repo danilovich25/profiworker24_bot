@@ -326,6 +326,7 @@ async def _schedule_task_reminder(
     order: ParsedOrder,
     task_id: int,
     deal_label: str | None = None,
+    due_override: int | None = None,
 ) -> None:
     """Telegram-напоминание к задаче-напоминанию (intent=reminder).
 
@@ -337,27 +338,36 @@ async def _schedule_task_reminder(
 
     deal_label — подпись заявки для привязанного напоминания: пинг и список
     «Мои напоминания» называют заявку, чтобы было ясно, о чём речь.
+    due_override — фактический срок существующей задачи (путь reuse):
+    пинг равняется на него, а не на повторно разобранный текст.
     """
-    due_ts = dates.reminder_epoch(order.deadline)
+    due_ts = (
+        due_override
+        if due_override is not None
+        else dates.reminder_epoch(order.deadline)
+    )
     if due_ts is None or due_ts <= int(dates.now_local().timestamp()):
         return
     try:
         await db.spawn_task_reminder(
             task_id,
             message.chat.id,
-            text=_task_ping_text(order, deal_label),
+            text=(
+                f"{_task_ping_body(order, deal_label)}. "
+                f"Срок: {dates.format_epoch(due_ts)}"
+            ),
             due_ts=due_ts,
         )
     except Exception:
         log.exception("Telegram-напоминание для задачи %s не записано", task_id)
 
 
-def _task_ping_text(order: ParsedOrder, deal_label: str | None) -> str:
-    """Текст Telegram-пинга отдельного напоминания (с подписью заявки)."""
+def _task_ping_body(order: ParsedOrder, deal_label: str | None) -> str:
+    """Тело пинга без хвоста срока (подпись заявки включена)."""
     body = order.problem
     if deal_label:
         body = f"{body} (заявка {deal_label})"
-    return f"{body}. Срок: {dates.format_deadline(order.deadline)}"
+    return body
 
 
 async def _freeze_draft_unknown(db: Database, draft_id: str, token: str, key: str) -> bool:
@@ -866,7 +876,7 @@ async def _process_order_text(
                     deal_label = await deal_binding_label(bitrix, deal)
                 else:
                     inline_miss = True
-            created, final_label = await _create_reminder(
+            created, final_label, label_known = await _create_reminder(
                 message,
                 db,
                 bitrix,
@@ -884,7 +894,9 @@ async def _process_order_text(
                             when=dates.format_epoch(due_ts), deal=final_label
                         )
                     )
-            elif created and inline_miss:
+            elif created and inline_miss and label_known:
+                # При непрочитанной привязке (label_known=False) молчим:
+                # задача могла быть привязана, «поставил обычное» — ложь.
                 await message.answer(BIND_INLINE_MISS)
             return created
 
@@ -1085,14 +1097,16 @@ async def deal_binding_label(bitrix: BitrixClient | None, deal: dict) -> str:
 
 async def _actual_task_binding_label(
     bitrix: BitrixClient, task_id: int
-) -> tuple[bool, str | None]:
-    """(привязка достоверно известна, подпись) существующей задачи.
+) -> tuple[bool, str | None, int | None]:
+    """(привязка известна, подпись, срок задачи) существующей задачи.
 
-    Первый элемент отличает «задача прочитана, привязки нет» (known=True,
-    label=None — подпись можно честно убрать) от «портал не ответил»
-    (known=False — правды нет, уже записанный пинг трогать нельзя;
-    ревью ULTRA-2). Если номер сделки прочитан, а упало только обогащение
-    (crm.deal.get/контакт) — подпись деградирует до «№<id>».
+    known отличает «задача прочитана, привязки нет» (True, None — подпись
+    можно честно убрать) от «портал не ответил» и от «задача удалена»
+    (False — правды нет, уже записанный пинг трогать нельзя; ревью
+    ULTRA-2/3). Срок — фактический DEADLINE самой задачи: пинг при reuse
+    равняется на него, а не на повторно разобранный текст (иначе очередная
+    синхронизация вернула бы его назад). Если номер сделки прочитан, а
+    упало только обогащение (crm.deal.get/контакт) — подпись «№<id>».
     """
     try:
         async with asyncio.timeout(POST_DEAL_DEADLINE):
@@ -1101,18 +1115,23 @@ async def _actual_task_binding_label(
         log.warning(
             "Привязка существующей задачи %s не прочитана", task_id, exc_info=True
         )
-        return False, None
-    actual_id = task_deal_id(task) if task else None
+        return False, None, None
+    if task is None:
+        # Задача удалена: утверждать «привязки нет» по ней нельзя, пинг
+        # снимет штатная сверка удалённых (sync_task_reminder).
+        return False, None, None
+    task_due = dates.bitrix_deadline_epoch(task.get("deadline"))
+    actual_id = task_deal_id(task)
     if actual_id is None:
-        return True, None
+        return True, None, task_due
     try:
         async with asyncio.timeout(POST_DEAL_DEADLINE):
             deal = await get_deal(bitrix, actual_id)
             if deal is not None:
-                return True, await deal_binding_label(bitrix, deal)
+                return True, await deal_binding_label(bitrix, deal), task_due
     except Exception:
         log.warning("Заявка %s для подписи не прочитана", actual_id, exc_info=True)
-    return True, f"№{actual_id}"
+    return True, f"№{actual_id}", task_due
 
 
 async def _create_reminder(
@@ -1125,13 +1144,17 @@ async def _create_reminder(
     deal_id: int | None = None,
     deal_label: str | None = None,
     on_task_settled: Callable[[], None] | None = None,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, bool]:
     """Идемпотентно создаёт задачу-напоминание в Bitrix24.
 
     deal_id/deal_label — привязка к заявке: задача связывается со сделкой
     (UF_CRM_TASK), а Telegram-пинг называет заявку по подписи.
 
-    Возвращает (обработка завершена, фактическая подпись заявки | None).
+    Возвращает (обработка завершена, фактическая подпись заявки | None,
+    привязка достоверно известна). Последний флаг False на путях, где
+    задача может существовать с непрочитанной привязкой (потерянный ответ
+    add, недоступный tasks.task.get, удалённая задача): вызывающий не имеет
+    права утверждать «поставил обычное напоминание» (ревью ULTRA-3).
     Подпись берётся из переданной привязки только для СВЕЖЕ-созданной
     задачи; переиспользованная идемпотентным путём задача (fence done,
     предпроверка, сверка) могла быть привязана к другой сделке — тогда
@@ -1161,7 +1184,7 @@ async def _create_reminder(
     """
     if bitrix is None:
         await message.answer(REMINDER_NO_CRM)
-        return False, None
+        return False, None, True
     title = (order.problem or "").strip()
     # Первая буква — заглавная: заголовок задачи читается как фраза.
     title = title[:1].upper() + title[1:] if title else "Напоминание"
@@ -1181,7 +1204,7 @@ async def _create_reminder(
                 task_id = await _reconcile(lambda: find_reminder_task(bitrix, key))
                 if task_id is None:
                     await message.answer(REMINDER_UNKNOWN_TEXT)
-                    return True, None
+                    return True, None, False
             else:
             # Предпроверка идемпотентности: задача с этим ключом могла быть
             # создана раньше (повторная доставка после сбоя подтверждения).
@@ -1196,7 +1219,7 @@ async def _create_reminder(
                             if on_task_settled is not None:
                                 on_task_settled()
                             await message.answer(REMINDER_UNKNOWN_TEXT)
-                            return True, None
+                            return True, None, False
                     else:
                         try:
                             task_id = await create_reminder_task(
@@ -1233,7 +1256,7 @@ async def _create_reminder(
             # немедленный повтор безопасен.
             log.exception("Не удалось создать задачу-напоминание")
             await message.answer(REMINDER_FAILED)
-            return False, None
+            return False, None, True
         # task.add отправлен, ответа нет (таймаут, обрыв): задача могла
         # записаться. Сверяемся по ключу-тегу, как сделки по UF-полю.
         log.warning(
@@ -1247,28 +1270,40 @@ async def _create_reminder(
         if task_id is None:
             # Задача МОГЛА записаться: захват фиксируется до ответа.
             await message.answer(REMINDER_UNKNOWN_TEXT)
-            return True, None
+            return True, None, False
         log.info("Задача id=%s нашлась при сверке после сбоя task.add", task_id)
     # Задача существует: захват фиксируется ДО отправки подтверждения, чтобы
     # ни сбой локального fence, ни отмена на нём/answer не освободили его.
     if on_task_settled is not None:
         on_task_settled()
     await asyncio.shield(db.complete_task_fence(key, task_id))
+    label_known = True
+    due_override = None
     if not created_fresh:
         # Задача существовала до этого вызова: её могли привязать к другой
         # сделке, чем разрешилось сейчас (например, «последняя» успела
         # смениться к повтору). Правду знает сама задача (ревью R4).
-        known, deal_label = await _actual_task_binding_label(bitrix, task_id)
+        known, deal_label, task_due = await _actual_task_binding_label(
+            bitrix, task_id
+        )
+        label_known = known
+        due_override = task_due
         if known:
             # Уже стоящий пинг мог быть записан со старой подписью и сроком —
             # иначе подтверждение и пинг называли бы разное (ревью ULTRA-2).
-            # Пинг с наступившим/пустым сроком не переносится.
-            due_ts = dates.reminder_epoch(order.deadline)
-            if due_ts is not None and due_ts <= int(dates.now_local().timestamp()):
-                due_ts = None
+            # Срок равняется на ФАКТИЧЕСКИЙ дедлайн задачи (не на повторный
+            # разбор текста — его вернула бы назад синхронизация); хвост
+            # «Срок:» в тексте строится от фактически записанного момента.
+            if task_due is not None and task_due <= int(
+                dates.now_local().timestamp()
+            ):
+                task_due = None
+            body = _task_ping_body(order, deal_label)
             try:
                 await db.update_task_reminder(
-                    task_id, _task_ping_text(order, deal_label), due_ts
+                    task_id,
+                    lambda ts: f"{body}. Срок: {dates.format_epoch(ts)}",
+                    task_due,
                 )
             except Exception:
                 log.exception("Пинг задачи %s не обновлён", task_id)
@@ -1277,7 +1312,9 @@ async def _create_reminder(
     # Гарантированный канал: бот сам напишет в Telegram в момент срока.
     # Ставится на любом пути существования задачи (в т.ч. найденной сверкой
     # после потерянного ответа add) — вставка идемпотентна по задаче.
-    await _schedule_task_reminder(message, db, order, task_id, deal_label=deal_label)
+    await _schedule_task_reminder(
+        message, db, order, task_id, deal_label=deal_label, due_override=due_override
+    )
     try:
         await message.answer(REMINDER_CREATED.format(task_id=task_id))
     except Exception:
@@ -1285,7 +1322,7 @@ async def _create_reminder(
         # контент-хэша, иначе повтор текста молча создал бы вторую задачу.
         # Повтор того же текста ответит предупреждением о вероятном дубле.
         log.exception("Ответ о созданном напоминании не отправлен")
-    return True, deal_label
+    return True, deal_label, label_known
 
 
 @router.callback_query(F.data.startswith("dup:force:"))

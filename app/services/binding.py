@@ -47,13 +47,17 @@ _REF_PREFIX = r"\b(?:к|по|для)\s+заявк[а-яё]*[\s.,:;—–-]*"
 # принадлежит дате, а не номеру заявки или телефону («154 23 июля»).
 _DATE_WORDS = (
     r"январ|феврал|март|апрел|ма[яй]|июн|июл|август|сентябр|октябр|ноябр|"
-    r"декабр|числ|год"
+    r"декабр|числ|год|час|минут"
 )
 _DATE_WORD_RE = re.compile(r"^[\s.,:;—–-]*(?:%s)" % _DATE_WORDS, re.IGNORECASE)
 
-# «К заявке по телефону 8914…» — телефон назван явно.
+# Начало ЧИСЛОВОЙ даты или времени сразу после группы цифр: «23.07», «15:00»,
+# «23/07» — группа принадлежит сроку, а не номеру (ревью ULTRA-3).
+_NUMERIC_DATE_RE = re.compile(r"^[.:/]\d")
+
+# «К заявке по телефону 8914…» — телефон назван явно (тире тоже пунктуация).
 _PHONE_KEYWORD_RE = re.compile(
-    _REF_PREFIX + r"(?:по\s+)?(?:телефону?|номеру\s+телефона)[\s.,:;-]*"
+    _REF_PREFIX + r"(?:по\s+)?(?:телефону?|номеру\s+телефона)[\s.,:;—–-]*"
     r"(\+?\d[\d\s()\-]{4,}\d)",
     re.IGNORECASE,
 )
@@ -120,7 +124,7 @@ _SERVICE_WORD_RE = re.compile(
 )
 
 # Пунктуация-разделитель между служебными словами и идентификатором.
-_SERVICE_SEP = " \t.,:;-—"
+_SERVICE_SEP = " \t.,:;-—–"
 
 
 def _strip_service_words(text: str) -> str:
@@ -149,14 +153,18 @@ def _trim_phone_span(group: str, tail: str) -> tuple[str | None, int]:
     8/7, 10 цифр с 9) — на случай приклеенного числа без слова даты.
     """
     end = len(group)
-    if _DATE_WORD_RE.match(tail):
+    if _DATE_WORD_RE.match(tail) or _NUMERIC_DATE_RE.match(tail):
         day = re.search(r"[\s.,;:()—–-]+\d{1,2}\s*$", group)
         if day is not None:
             end = day.start()
             group = group[:end]
     digits = re.sub(r"\D", "", group)
     limit = None
-    if len(digits) > 11 and digits[0] in "78":
+    if group.lstrip().startswith("+"):
+        # Явный международный формат: длину страны угадывать нельзя,
+        # обрезка только по маркерам даты выше (ревью ULTRA-3).
+        limit = None
+    elif len(digits) > 11 and digits[0] in "78":
         limit = 11
     elif len(digits) > 10 and digits[0] == "9":
         limit = 10
@@ -192,12 +200,14 @@ def _extract_one(text: str) -> tuple[str, BindingRef | None]:
     if match:
         digits = match.group(1)
         end = match.end(1)
-        # Подклейка STT-групп («123 456 789») с остановкой перед днём даты.
+        # Первая группа сама может быть номером, за которым идёт числовая
+        # дата/время («154 15:00») — такие группы не подклеиваются.
         while True:
             nxt = _NUM_GROUP_RE.match(raw[end:])
             if nxt is None:
                 break
-            if _DATE_WORD_RE.match(raw[end + nxt.end() :]):
+            after = raw[end + nxt.end() :]
+            if _DATE_WORD_RE.match(after) or _NUMERIC_DATE_RE.match(after):
                 break
             digits += nxt.group(1)
             end += nxt.end()
@@ -225,9 +235,11 @@ def extract_inline_binding(text: str) -> tuple[str, BindingRef | None]:
     """
     refs: list[BindingRef] = []
     clean = (text or "").strip()
-    while len(refs) < 5:
+    while True:
         remainder, ref = _extract_one(clean)
-        if ref is None:
+        if ref is None or len(remainder) >= len(clean):
+            # Каждая найденная ссылка строго укорачивает текст — второе
+            # условие лишь страхует от зацикливания.
             break
         refs.append(ref)
         clean = remainder
