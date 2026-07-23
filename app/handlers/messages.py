@@ -170,6 +170,22 @@ BIND_INLINE_MISS = (
     "заявке можно через кнопку «Напоминание»."
 )
 
+# В свободном тексте несколько разных упоминаний заявки (или голосовое
+# самоисправление): вопрос в одношаговом пути не задаётся — честное
+# объяснение вместо угадайки (ревью ULTRA-6).
+BIND_INLINE_CONFLICT = (
+    "В сообщении несколько упоминаний заявки, не угадываю: поставил "
+    "обычное напоминание. Привязать к нужной можно через кнопку "
+    "«Напоминание»."
+)
+
+# Снятие старого пинга терминальной задачи не удалось: честное предупреждение
+# вместо молчаливого «не ставлю» при, возможно, живом напоминании.
+REMINDER_PING_MAYBE_LEFT = (
+    "Старое напоминание могло остаться в очереди, проверьте кнопку "
+    "«Мои напоминания»."
+)
+
 MULTIPLE_ORDERS_TEXT = (
     "В сообщении несколько заявок, я взял первую (клиент {client}). "
     "Остальные пришлите по одной, так каждая точно попадёт в CRM."
@@ -876,13 +892,25 @@ async def _process_order_text(
                 cleaned_problem, problem_ref = binding.extract_inline_binding(
                     order.problem or ""
                 )
-                if problem_ref is not None and cleaned_problem:
+                if (
+                    problem_ref is not None
+                    and problem_ref.kind != "conflict"
+                    and cleaned_problem
+                ):
                     # Фраза привязки — служебная, в заголовок задачи не идёт.
                     order = order.model_copy(update={"problem": cleaned_problem})
             deal_id = None
             deal_label = None
             inline_miss = False
-            if bitrix is not None and ref is not None and ref.kind != "none":
+            # Конфликт ссылок: в одношаговом пути вопрос не задаётся —
+            # обычное напоминание с ЧЕСТНЫМ объяснением, без поиска-угадайки
+            # (ревью ULTRA-6).
+            inline_conflict = ref is not None and ref.kind == "conflict"
+            if (
+                bitrix is not None
+                and ref is not None
+                and ref.kind not in ("none", "conflict")
+            ):
                 deal = None
                 try:
                     async with asyncio.timeout(POST_DEAL_DEADLINE):
@@ -916,13 +944,15 @@ async def _process_order_text(
                 )
             elif (
                 outcome.created
-                and inline_miss
+                and (inline_miss or inline_conflict)
                 and outcome.label_known
                 and outcome.due_ts is not None
             ):
                 # При непрочитанной привязке или без реального пинга молчим:
                 # «поставил обычное напоминание» было бы ложью.
-                await message.answer(BIND_INLINE_MISS)
+                await message.answer(
+                    BIND_INLINE_CONFLICT if inline_conflict else BIND_INLINE_MISS
+                )
             return outcome.created
 
         if order.phone:
@@ -1334,12 +1364,19 @@ async def _create_reminder(
             # Задача удалена или закрыта: обещать пинг и «записано» нельзя,
             # phantom-пинг не ставится, а УЖЕ стоящий снимается — иначе он
             # выстрелил бы после ответа «не ставлю» (ревью ULTRA-4/5).
+            cancel_ok = True
             try:
                 await db.cancel_pending_task_reminder(task_id)
             except Exception:
+                cancel_ok = False
                 log.exception("Пинг терминальной задачи %s не снят", task_id)
             reply = REMINDER_TASK_GONE if state == "missing" else REMINDER_TASK_DONE
-            await message.answer(reply.format(task_id=task_id))
+            reply = reply.format(task_id=task_id)
+            if not cancel_ok:
+                # «Не ставлю» при, возможно, живом пинге — честно предупредить
+                # (ревью ULTRA-6).
+                reply = f"{reply} {REMINDER_PING_MAYBE_LEFT}"
+            await message.answer(reply)
             return ReminderOutcome(
                 True,
                 task_id=task_id,
@@ -1380,6 +1417,11 @@ async def _create_reminder(
                     log.warning("Пинг задачи %s не обновлён (гонка CAS)", task_id)
             except Exception:
                 log.exception("Пинг задачи %s не обновлён", task_id)
+            if due_override is None:
+                # Живая задача БЕЗ дедлайна: спавнить отсутствующую строку по
+                # повторно разобранному сроку нельзя — у задачи такого срока
+                # нет (ревью ULTRA-6). Существующая строка уже обновлена.
+                spawn_ping = False
         else:
             # Портал не ответил: правды о привязке и живости задачи нет —
             # записанный пинг не трогаем, новый не ставим, заявку в
