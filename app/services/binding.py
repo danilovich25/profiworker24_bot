@@ -78,21 +78,14 @@ _TIME_STOP_WORDS = (
 )
 
 # Начало ЧИСЛОВОЙ даты или времени сразу после группы цифр: «23.07», «15:00»,
-# «23/07», «23–07» — группа принадлежит сроку, а не номеру (ревью ULTRA-3/9).
-_NUMERIC_DATE_RE = re.compile(r"^\s*[.:/\-—–]\s*\d")
+# «23/07», «23 – 07». Точка — только слитно: «. 23» после номера — это конец
+# предложения, а не дата (ревью ULTRA-3/9/10).
+_NUMERIC_DATE_RE = re.compile(r"^\s*[:/\-—–]\s*\d|^\.\d")
 
 # Следующая цифровая группа после уже захваченного идентификатора. Если она
 # не открывает дату/время — достоверно разобрать фразу нельзя, бот спрашивает
 # кнопками вместо угадайки (политика ревью ULTRA-5).
 _TRAILING_DIGITS_RE = re.compile(r"^\s+\(?(\d{1,4})")
-
-
-# Числовая дата целиком внутри цифровой группы («154 23-07-2026»,
-# «2026-07-23»): это «номер + дата», а не телефон. Телефонные дефисы
-# («123-45-67») не матчатся — перед их фрагментами нет границы слова.
-_EMBEDDED_DATE_RE = re.compile(
-    r"\b\d{1,2}[-./—–]\d{1,2}[-./—–]\d{2,4}\b|\b\d{4}[-—–]\d{2}[-—–]\d{2}\b"
-)
 
 
 def _tail_group_is_dateish(num: str, after: str) -> bool:
@@ -130,8 +123,11 @@ _PHONE_KEYWORD_RE = re.compile(
 # телефон, а не номер сделки (тот короче MAX_DEAL_ID_DIGITS). Десять цифр
 # (без восьмёрки) — тоже штатная российская форма (normalize_phone),
 # поэтому минимум — 10 знаков (ревью R5).
+# Голая форма начинается только с телефонного старта (7/8/9 или «+»):
+# «к заявке 154 23-07-2026» — это номер заявки с датой, не телефон
+# (ревью ULTRA-10).
 _PHONE_BARE_RE = re.compile(
-    _REF_PREFIX + r"(\(?\+?[\d(][\d\s()—–\-]{8,}\d)", re.IGNORECASE
+    _REF_PREFIX + r"((?:\+|\(?[789])[\d\s()—–\-]{8,}\d)", re.IGNORECASE
 )
 
 # Инлайн-добавочный сразу после номера: вырезается из текста напоминания
@@ -158,16 +154,49 @@ _DEAL_NUM_RE = re.compile(
 # или дату («к 23 июля»), исправлением ПРИВЯЗКИ не считаются.
 # Слово времени глушит исправление только для чисел, похожих на время
 # (1-2 цифры): «к 155 вечером» — номер заявки, не 155 часов (ревью ULTRA-7).
-# Пауза-тире после предлога («нет, к — 155») тоже пунктуация; подавление
-# по времени/дате пропускает запятую и числовые формы «23/07»
-# (ревью ULTRA-8).
+# Пауза-тире после предлога («нет, к — 155») тоже пунктуация. Захватывается
+# ЧИСЛО кандидата-исправления; согласование со временем/датой решает код
+# (_correction_conflict) — регэксп-lookahead на это уже дважды пробивался
+# бэктрекингом (ревью ULTRA-8/9/10).
 _CORRECTION_RE = re.compile(
     r"\bнет\b[\s,.:;!?—–-]*(?:лучше\s+)?(?:к|по|на)[\s,—–-]+"
     r"(?:заявк[а-яё]*[\s.,:;—–-]*)?"
-    r"(?:№\s*)?(?:\d{3,9}(?!\s*[:.,/—–-]?\s*\d)"
-    r"|\d{1,2}(?!\s*[:.,/—–-]?\s*\d)(?![\s,.;:—–-]*(?:%s)))" % _TIME_STOP_WORDS,
+    r"(?:№\s*)?(\d{1,9})(?![.,:/—–-]?\d)",
     re.IGNORECASE,
 )
+
+# Слово времени/суток (с широкой пунктуацией перед ним) после числа.
+_TIME_SUPPRESS_RE = re.compile(
+    r"^[\s,.;:!?()—–-]*(?:%s)" % _TIME_STOP_WORDS, re.IGNORECASE
+)
+_YEAR_SUPPRESS_RE = re.compile(
+    r"^[\s,.;:!?()—–-]*(?:%s)" % _YEAR_WORDS, re.IGNORECASE
+)
+
+
+def _correction_conflict(clean: str) -> bool:
+    """Есть ли в остатке текста самоисправление привязки.
+
+    Число глушится временем/датой только при СОГЛАСОВАНИИ: 1-2 цифры —
+    словом времени/суток или числовой датой (в т.ч. с пробелами «23 / 07»),
+    4 цифры — словом «год». «К 155 вечером» и «к 155 23 июля» — номера
+    заявок (ревью ULTRA-7/10).
+    """
+    if _CORRECTION_KEYWORD_RE.search(clean):
+        return True
+    match = _CORRECTION_RE.search(clean)
+    if match is None:
+        return False
+    num = match.group(1)
+    rest = clean[match.end() :]
+    if len(num) <= 2 and (
+        _TIME_SUPPRESS_RE.match(rest)
+        or re.match(r"^\s*[(\s]*[:/.\-—–]\s*\d", rest)
+    ):
+        return False
+    if len(num) == 4 and _YEAR_SUPPRESS_RE.match(rest):
+        return False
+    return True
 
 # Исправление с ЛЮБЫМ словом-маркером ссылки («нет, к последней…», «нет,
 # по телефону…», «нет, к номеру…») — всегда уточняем кнопками: угадать,
@@ -252,43 +281,68 @@ def _normalize_ref_phone(raw: str) -> str | None:
     return normalize_phone(text)
 
 
-def _trim_phone_span(group: str, tail: str) -> tuple[str | None, int]:
-    """Телефон из захваченной группы и длина реально потреблённой части.
+def _digit_prefix_end(group: str, need: int) -> int:
+    """Позиция сразу после need-й цифры группы."""
+    count = 0
+    for index, char in enumerate(group):
+        if char.isdigit():
+            count += 1
+            if count == need:
+                return index + 1
+    return len(group)
 
-    STT может приклеить к номеру следующую дату («89141234567 23 июля»,
-    «+375291234567 23 июля»): если сразу за захватом идёт слово даты,
-    последняя короткая цифровая группа — это день, он возвращается тексту.
-    Для российских форм дополнительно работает штатная длина (11 цифр с
-    8/7, 10 цифр с 9) — на случай приклеенного числа без слова даты.
+
+def _rest_is_dateish(rest: str, tail: str) -> bool:
+    """Остаток захвата после номера — согласованная дата, а не чужие цифры."""
+    match = re.match(r"^[\s.,;:()—–-]*(\d{1,4})(.*)$", rest, re.S)
+    if match is None:
+        return False
+    num, after = match.group(1), match.group(2)
+    if _NUMERIC_DATE_RE.match(after):
+        return True
+    return _tail_group_is_dateish(num, after if after.strip() else tail)
+
+
+def _resolve_phone_span(group: str, tail: str) -> tuple[str | None, int, bool]:
+    """(телефон, потреблено, вопрос?) для захваченной цифровой группы.
+
+    Детерминированная схема вместо эвристик разнотипности (ревью ULTRA-10):
+    - российские формы (старт 7/8 → 11 цифр, иначе → 10; «+7» → 11):
+      длина носителя известна, остаток-цифры допустимы ТОЛЬКО как
+      согласованная дата («23 июля», «23-07-2026», «2026 года») — иначе
+      граница номера недостоверна и бот спрашивает;
+    - прочие «+»-номера: длину страны угадать нельзя — номер валиден
+      целиком; пробельно-отделённый цифровой хвост при валидном префиксе —
+      дата (срезается) или вопрос.
     """
-    end = len(group)
-    day = re.search(r"[\s.,;:()—–-]+(\d{1,4})\s*$", group)
-    if day is not None and _tail_group_is_dateish(day.group(1), tail):
-        # Хвостовая группа принадлежит сроку, только если СОГЛАСУЕТСЯ со
-        # словом после захвата: «2026 года» (4 цифры + год), «23 июля»
-        # (день ≤31 + месяц), числовая дата. Иначе «67» из «…-45-67, год
-        # выпуска» — часть номера, резать её нельзя (ревью ULTRA-8/9).
-        end = day.start()
-        group = group[:end]
-    digits = re.sub(r"\D", "", group)
-    limit = None
-    if group.lstrip(" 	(").startswith("+"):
-        # Явный международный формат: длину страны угадывать нельзя,
-        # обрезка только по маркерам даты выше (ревью ULTRA-3).
-        limit = None
-    elif len(digits) > 11 and digits[0] in "78":
-        limit = 11
-    elif len(digits) > 10 and digits[0] == "9":
-        limit = 10
-    if limit is not None:
-        count = 0
-        for index, char in enumerate(group):
-            if char.isdigit():
-                count += 1
-                if count == limit:
-                    end = index + 1
-                    break
-    return _normalize_ref_phone(group[:end]), end
+    digits_all = re.sub(r"\D", "", group)
+    if not digits_all:
+        return None, 0, False
+    plus = group.lstrip(" \t(").startswith("+")
+    if plus and digits_all[0] != "7":
+        parts = list(re.finditer(r"\S+", group))
+        if len(parts) >= 2:
+            last = parts[-1]
+            prefix = group[: last.start()].rstrip(" .,;:()—–-")
+            prefix_digits = re.sub(r"\D", "", prefix)
+            if 10 <= len(prefix_digits) <= 15:
+                if _rest_is_dateish(group[len(prefix) :], tail):
+                    return _normalize_ref_phone(prefix), len(prefix), False
+                return None, 0, True
+        if 10 <= len(digits_all) <= 15:
+            return _normalize_ref_phone(group), len(group), False
+        return None, 0, True
+    # Российские формы (включая «+7...»).
+    need = 11 if digits_all[0] in "78" or plus else 10
+    if len(digits_all) < need:
+        return None, 0, False
+    end = _digit_prefix_end(group, need)
+    rest = group[end:]
+    if re.search(r"\d", rest):
+        if not _rest_is_dateish(rest, tail):
+            return None, 0, True
+    phone = _normalize_ref_phone(group[:end])
+    return phone, end, False
 
 
 def _extract_one(text: str) -> tuple[str, BindingRef | None]:
@@ -303,42 +357,14 @@ def _extract_one(text: str) -> tuple[str, BindingRef | None]:
     if match:
         return _cut(raw, match.start(), match.end()), BindingRef("last")
     match = _PHONE_KEYWORD_RE.search(raw) or _PHONE_BARE_RE.search(raw)
-    if match and _EMBEDDED_DATE_RE.search(match.group(1)):
-        # Внутри «телефона» числовая дата: это «номер + дата» — решает
-        # ветка номера ниже (ревью ULTRA-5).
-        match = None
     if match:
         group = match.group(1)
         after_group = raw[match.end(1) :]
-        # Хвостовая короткая группа ВНУТРИ захвата («+7 914 123-45-67 2»):
-        # подозрительна, когда её разделитель РАЗНОТИПЕН с предыдущим
-        # («…-67 2», «…-67 (2)», «…-67-2» одной цифрой) — однотипные
-        # продолжения («…123 45 67», «+7 9 1 4…», «…-45-67») принадлежат
-        # номеру (ревью ULTRA-6/8). Полный и без хвоста номер + не дата
-        # после — уточняем кнопками.
-        trail = re.search(r"([\s(—–-][\s()—–-]*)(\d{1,4})\)?$", group)
-        if trail is not None:
-            sep_dash = bool(re.search(r"[—–-]", trail.group(1)))
-            num = trail.group(2)
-            prefix = group[: trail.start()]
-            prev = next((c for c in reversed(prefix) if not c.isdigit()), "")
-            prev_dash = prev in "—–-"
-            # Сплошной номер без внутренних разделителей: однотипность
-            # хвоста неопределима — полный prefix делает его подозрительным
-            # (ревью ULTRA-9).
-            solid = prev in "+(" or prev == ""
-            suspicious = (
-                solid
-                or (sep_dash and (len(num) == 1 or not prev_dash))
-                or (not sep_dash and prev_dash)
-            )
-            if (
-                suspicious
-                and not _tail_group_is_dateish(num, after_group)
-                and _normalize_ref_phone(prefix) is not None
-            ):
-                return raw, BindingRef("conflict")
-        phone, consumed = _trim_phone_span(group, after_group)
+        phone, consumed, ask = _resolve_phone_span(group, after_group)
+        if ask:
+            # Граница номера недостоверна (чужие цифры вплотную к номеру):
+            # уточняем кнопками, а не гадаем (ревью ULTRA-5/10).
+            return raw, BindingRef("conflict")
         if phone is not None:
             end = match.start(1) + consumed
             ext = _INLINE_EXTENSION_RE.match(raw[end:])
@@ -391,7 +417,7 @@ def extract_inline_binding(text: str) -> tuple[str, BindingRef | None]:
         return clean, None
     if len({(ref.kind, ref.value) for ref in refs}) > 1:
         return (text or "").strip(), BindingRef("conflict")
-    if _CORRECTION_KEYWORD_RE.search(clean) or _CORRECTION_RE.search(clean):
+    if _correction_conflict(clean):
         return (text or "").strip(), BindingRef("conflict")
     return clean, refs[0]
 

@@ -2323,6 +2323,85 @@ def test_answer_unicode_dash_phone():
     assert (ref.kind, ref.value) == ("phone", "+375291234567")
 
 
+# --- Правки по ревью Sol ULTRA-10 -----------------------------------------
+
+
+def test_sentence_dot_before_date_keeps_phone_whole():
+    """«…-67. 23 июля» — точка конца предложения не режет номер."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону +375 (29) 123-45-67. 23 июля позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+375291234567")
+    assert "23 июля" in clean
+
+
+def test_correction_number_before_date_still_conflicts():
+    """«нет, к 155 23 июля» — исправление привязки с датой: конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 155 23 июля позвонить"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_spaced_dash_date_after_deal_id():
+    """«154 23 – 07 – 2026» — дата с пробелами вокруг тире, ID цел."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке 154 23 – 07 – 2026 в 8 позвонить"
+    )
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+    assert "23 – 07 – 2026" in clean
+
+
+def test_code_parens_do_not_defeat_tail_guard():
+    """«+375(29)1234567 2 договора» — хвост после полного номера: вопрос."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +375(29)1234567 2 договора завтра"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_long_amount_tail_not_swallowed():
+    """«+4512345678 10000 рублей» — сумма не входит в номер: вопрос."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +4512345678 10000 рублей завтра"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_phone_before_full_numeric_date():
+    """«по телефону 89141234567 23-07-2026» — телефон и дата, без вопроса."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону 89141234567 23-07-2026 в 8 позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+    assert "23-07-2026" in clean
+
+
+def test_correction_suppress_year_and_punct():
+    """«нет, к 2027 году», «к 15! вечером», «к 23 (июля)» — не конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    for raw in (
+        "к заявке 154, нет, к 2027 году перенести",
+        "к заявке 154, нет, к 15! вечером позвонить",
+        "к заявке 154, нет, к 23 (июля) позвонить",
+    ):
+        _, ref = extract_inline_binding(raw)
+        assert (ref.kind, ref.value) == ("deal_id", "154"), raw
+
+
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
 
 
