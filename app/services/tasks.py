@@ -771,9 +771,12 @@ async def send_due_reminders(
             log.exception("Напоминание id=%s не отправлено", reminder["id"])
             await db.record_reminder_attempt(reminder["id"], REMINDER_MAX_ATTEMPTS)
             continue
-        # CAS и по сроку: если параллельная сверка успела перенести запись,
-        # отметка промахнётся и напоминание уйдёт по новой дате отдельно.
-        marked = await db.mark_reminder_sent(reminder["id"], int(reminder["due_ts"]))
+        # CAS по сроку И отправленному тексту: параллельный перенос или
+        # text-only согласование подписи не должны терминально теряться —
+        # промах оставляет запись pending (ревью ULTRA-8).
+        marked = await db.mark_reminder_sent(
+            reminder["id"], int(reminder["due_ts"]), sent_text=str(fresh["text"])
+        )
         sent += 1
         if marked and bitrix is not None and reminder.get("kind") == "deal":
             # Перевооружение сразу после пинга: следующее дело сделки (само

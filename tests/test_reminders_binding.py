@@ -2152,6 +2152,107 @@ def test_large_number_not_suppressed_by_daypart():
     assert ref is not None and ref.kind == "conflict"
 
 
+# --- Правки по ревью Sol ULTRA-8 ------------------------------------------
+
+
+def test_correction_with_pause_dash_after_preposition():
+    """«нет, к — 155 вечером» — исправление с паузой: конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к — 155 вечером позвонить"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_year_word_does_not_cut_valid_phone():
+    """«+375 (29) 123-45-67, год выпуска» — номер цел, «год» — текст."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону +375 (29) 123-45-67, год выпуска проверить"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("phone", "+375291234567")
+    assert "год выпуска" in clean
+
+
+def test_unicode_dashes_in_phone_capture():
+    """Юникод-тире внутри номера и хвоста работают как ASCII-дефис."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +375 (29) 123-45–67 завтра позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+375291234567")
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +7 914 123-45-67–2 договора завтра"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_homogeneous_separators_not_conflict():
+    """«+375 29 123-45-67» и «+7 9 1 4 1 2 3 4 5 6 7» — телефоны, не вопрос."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +375 29 123-45-67 завтра позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+375291234567")
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +7 9 1 4 1 2 3 4 5 6 7 завтра позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+
+
+def test_time_suppress_allows_punctuation():
+    """«нет, к 15, вечером» и «нет, к 23/07» — время/дата, не конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 15, вечером позвонить"
+    )
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+    _, ref = extract_inline_binding("к заявке 154, нет, к 23/07 позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+
+
+def test_inline_extension_removed_from_text():
+    """«доб. 12» вырезается из текста напоминания вместе с номером."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону +7 914 123-45-67 доб. 12 завтра позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+    assert "доб" not in clean.lower()
+    assert "12" not in clean
+    assert "завтра позвонить" in clean
+
+
+async def test_send_marks_sent_only_for_sent_text(flow):
+    """Отметка «отправлено» промахивается, если текст сменился в полёте.
+
+    Отправили B, но запись уже C: C не должен терминально потеряться —
+    промах отметки оставляет его pending (дубль лучше молчания).
+    """
+    now = int(time.time())
+    rid = await flow.db.add_reminder(
+        1, "позвонить (№155 · C). Срок: X", now - 5, "task", 77
+    )
+    marked = await flow.db.mark_reminder_sent(
+        rid, now - 5, sent_text="позвонить (№154 · B). Срок: X"
+    )
+    assert not marked
+    rows = await flow.db.pending_task_reminders()
+    assert len(rows) == 1 and "· C" in rows[0]["text"]
+
+    marked = await flow.db.mark_reminder_sent(
+        rid, now - 5, sent_text="позвонить (№155 · C). Срок: X"
+    )
+    assert marked
+
+
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
 
 

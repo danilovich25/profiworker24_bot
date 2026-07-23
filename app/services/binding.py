@@ -53,14 +53,22 @@ _REF_PREFIX = r"\b(?:к|по|для)\s+заявк[а-яё]*[\s.,:;—–-]*"
 # «годовой отчёт» — смысловые слова, а не срок (ревью ULTRA-4).
 # Все корни — закрытыми словоформами с границей: «мартовских договоров» и
 # «числовых полей» — смысловые слова, а не дата (ревью ULTRA-6).
-_DATE_WORDS = (
+# Семейства раздельно: у «года» и у «июля» разные ожидания о числе перед
+# ними — год 4-значный, день/час 1-2-значные (ревью ULTRA-8).
+_MONTHDAY_WORDS = (
     r"январ(?:ь|я|е|ю)\b|феврал(?:ь|я|е|ю)\b|март(?:а|е|у)?\b|"
     r"апрел(?:ь|я|е|ю)\b|ма(?:й|я|е|ю)\b|июн(?:ь|я|е|ю)\b|июл(?:ь|я|е|ю)\b|"
     r"август(?:а|е|у)?\b|сентябр(?:ь|я|е|ю)\b|октябр(?:ь|я|е|ю)\b|"
     r"ноябр(?:ь|я|е|ю)\b|декабр(?:ь|я|е|ю)\b|числ(?:а|е|у|о)?\b|"
-    r"год(?:а|у|ов|ам)?\b|час(?:а|у|ов|ам|ах)?\b|минут(?:а|ы|у|ам|ах)?\b"
+    r"час(?:а|у|ов|ам|ах)?\b|минут(?:а|ы|у|ам|ах)?\b"
 )
+_YEAR_WORDS = r"год(?:а|у|ов|ам)?\b"
+_DATE_WORDS = _MONTHDAY_WORDS + "|" + _YEAR_WORDS
 _DATE_WORD_RE = re.compile(r"^[\s.,:;—–-]*(?:%s)" % _DATE_WORDS, re.IGNORECASE)
+_MONTHDAY_WORD_RE = re.compile(
+    r"^[\s.,:;—–-]*(?:%s)" % _MONTHDAY_WORDS, re.IGNORECASE
+)
+_YEAR_WORD_RE = re.compile(r"^[\s.,:;—–-]*(?:%s)" % _YEAR_WORDS, re.IGNORECASE)
 
 # Слова времени суток после числа — «к 15 вечера» это время, не заявка.
 # Формы закрытые: «ночной выезд», «утренний» — смысловые слова (ULTRA-5).
@@ -95,10 +103,11 @@ def _ambiguous_digit_tail(tail: str) -> bool:
     after = tail[match.end() :]
     return not (_NUMERIC_DATE_RE.match(after) or _DATE_WORD_RE.match(after))
 
-# «К заявке по телефону 8914…» — телефон назван явно (тире тоже пунктуация).
+# «К заявке по телефону 8914…» — телефон назван явно; в записи допустимы
+# и типографские тире (ревью ULTRA-8).
 _PHONE_KEYWORD_RE = re.compile(
     _REF_PREFIX + r"(?:по\s+)?(?:телефону?|номеру\s+телефона)[\s.,:;—–-]*"
-    r"(\(?\+?[\d(][\d\s()\-]{4,}\d)",
+    r"(\(?\+?[\d(][\d\s()—–\-]{4,}\d)",
     re.IGNORECASE,
 )
 
@@ -107,7 +116,13 @@ _PHONE_KEYWORD_RE = re.compile(
 # (без восьмёрки) — тоже штатная российская форма (normalize_phone),
 # поэтому минимум — 10 знаков (ревью R5).
 _PHONE_BARE_RE = re.compile(
-    _REF_PREFIX + r"(\(?\+?[\d(][\d\s()\-]{8,}\d)", re.IGNORECASE
+    _REF_PREFIX + r"(\(?\+?[\d(][\d\s()—–\-]{8,}\d)", re.IGNORECASE
+)
+
+# Инлайн-добавочный сразу после номера: вырезается из текста напоминания
+# вместе с номером («…-67 доб. 12 завтра» → «завтра»; ревью ULTRA-8).
+_INLINE_EXTENSION_RE = re.compile(
+    r"^[\s.,]*(?:доб|вн|extension|ext|x|#)[\s.,:]*\d{0,7}", re.IGNORECASE
 )
 
 # «К заявке 154», «к заявке №154», «к заявке номер: 154». Захватывается
@@ -124,10 +139,13 @@ _DEAL_NUM_RE = re.compile(
 # или дату («к 23 июля»), исправлением ПРИВЯЗКИ не считаются.
 # Слово времени глушит исправление только для чисел, похожих на время
 # (1-2 цифры): «к 155 вечером» — номер заявки, не 155 часов (ревью ULTRA-7).
+# Пауза-тире после предлога («нет, к — 155») тоже пунктуация; подавление
+# по времени/дате пропускает запятую и числовые формы «23/07»
+# (ревью ULTRA-8).
 _CORRECTION_RE = re.compile(
-    r"\bнет\b[\s,.:;!?—–-]*(?:лучше\s+)?(?:к|по|на)\s+"
+    r"\bнет\b[\s,.:;!?—–-]*(?:лучше\s+)?(?:к|по|на)[\s,—–-]+"
     r"(?:заявк[а-яё]*[\s.,:;—–-]*)?"
-    r"(?:№\s*)?(?:\d{3,9}(?![:.,]?\d)|\d{1,2}(?![:.,]?\d)(?!\s*(?:%s)))"
+    r"(?:№\s*)?(?:\d{3,9}(?![:.,/-]?\d)|\d{1,2}(?![:.,/-]?\d)(?![\s,]*(?:%s)))"
     % _TIME_STOP_WORDS,
     re.IGNORECASE,
 )
@@ -225,11 +243,24 @@ def _trim_phone_span(group: str, tail: str) -> tuple[str | None, int]:
     8/7, 10 цифр с 9) — на случай приклеенного числа без слова даты.
     """
     end = len(group)
-    if _DATE_WORD_RE.match(tail) or _NUMERIC_DATE_RE.match(tail):
-        # До 4 цифр: за номером может идти и день («23 июля»), и год
-        # («2026 года») — обе группы принадлежат сроку (ревью ULTRA-7).
-        day = re.search(r"[\s.,;:()—–-]+\d{1,4}\s*$", group)
-        if day is not None:
+    day = re.search(r"[\s.,;:()—–-]+(\d{1,4})\s*$", group)
+    if day is not None:
+        # Хвостовая группа принадлежит сроку, только если СОГЛАСУЕТСЯ со
+        # словом после захвата: «2026 года» (4 цифры + год), «23 июля»
+        # (день ≤31 + месяц), числовая дата. Иначе «67» из «…-45-67, год
+        # выпуска» — часть номера, резать её нельзя (ревью ULTRA-8).
+        num = day.group(1)
+        cut = _NUMERIC_DATE_RE.match(tail) is not None
+        if not cut and _YEAR_WORD_RE.match(tail) and len(num) == 4:
+            cut = True
+        if (
+            not cut
+            and _MONTHDAY_WORD_RE.match(tail)
+            and len(num) <= 2
+            and int(num) <= 31
+        ):
+            cut = True
+        if cut:
             end = day.start()
             group = group[:end]
     digits = re.sub(r"\D", "", group)
@@ -271,22 +302,38 @@ def _extract_one(text: str) -> tuple[str, BindingRef | None]:
         match = None
     if match:
         group = match.group(1)
-        # Хвостовая короткая группа ВНУТРИ захвата («+7 914 123-45-67 2»):
-        # если номер полон и без неё, а дальше не дата — граница номера
-        # недостоверна, уточняем кнопками (ревью ULTRA-6). Для номеров,
-        # неполных без хвоста («8 914 123 45 67»), группа — часть номера.
-        trail = re.search(r"(?:[\s(]+\d{1,4}\)?|[—–-]\d{1,2})$", group)
         after_group = raw[match.end(1) :]
-        if (
-            trail is not None
-            and not _DATE_WORD_RE.match(after_group)
-            and not _NUMERIC_DATE_RE.match(after_group)
-            and _normalize_ref_phone(group[: trail.start()]) is not None
-        ):
-            return raw, BindingRef("conflict")
+        # Хвостовая короткая группа ВНУТРИ захвата («+7 914 123-45-67 2»):
+        # подозрительна, когда её разделитель РАЗНОТИПЕН с предыдущим
+        # («…-67 2», «…-67 (2)», «…-67-2» одной цифрой) — однотипные
+        # продолжения («…123 45 67», «+7 9 1 4…», «…-45-67») принадлежат
+        # номеру (ревью ULTRA-6/8). Полный и без хвоста номер + не дата
+        # после — уточняем кнопками.
+        trail = re.search(r"([\s(—–-][\s()—–-]*)(\d{1,4})\)?$", group)
+        if trail is not None:
+            sep_dash = bool(re.search(r"[—–-]", trail.group(1)))
+            num = trail.group(2)
+            prefix = group[: trail.start()]
+            prev = next((c for c in reversed(prefix) if not c.isdigit()), "")
+            prev_dash = prev in "—–-"
+            suspicious = (
+                (sep_dash and (len(num) == 1 or not prev_dash))
+                or (not sep_dash and prev_dash)
+            )
+            if (
+                suspicious
+                and not _DATE_WORD_RE.match(after_group)
+                and not _NUMERIC_DATE_RE.match(after_group)
+                and _normalize_ref_phone(prefix) is not None
+            ):
+                return raw, BindingRef("conflict")
         phone, consumed = _trim_phone_span(group, after_group)
         if phone is not None:
             end = match.start(1) + consumed
+            ext = _INLINE_EXTENSION_RE.match(raw[end:])
+            if ext is not None:
+                # Добавочный — служебный хвост номера, тексту не принадлежит.
+                end += ext.end()
             if _ambiguous_digit_tail(raw[end:]):
                 # За номером цифры, не похожие на дату/время: достоверной
                 # границы номера нет — уточняем кнопками (ревью ULTRA-5).

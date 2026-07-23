@@ -987,19 +987,32 @@ class Database:
             for row in rows
         ]
 
-    async def mark_reminder_sent(self, reminder_id: int, due_ts: int) -> bool:
+    async def mark_reminder_sent(
+        self, reminder_id: int, due_ts: int, sent_text: str | None = None
+    ) -> bool:
         """Терминальная отметка «отправлено» (CAS по pending И сроку).
 
         Сверка по due_ts закрывает гонку с параллельным переносом: отправка
         шла по прочитанному сроку, и если запись успели перенести на новый,
         отметка обязана промахнуться — напоминание уйдёт и по новой дате.
+        sent_text — CAS и по фактически отправленному тексту: text-only
+        согласование (reuse) при том же сроке не должно терминально
+        теряться из-за отметки со старым содержимым; промах оставляет
+        запись pending — дубль лучше молчания (ревью ULTRA-8).
         """
         async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(
-                "UPDATE reminders SET status = ?, sent_at = datetime('now') "
-                "WHERE id = ? AND status = ? AND due_ts = ?",
-                (REMINDER_SENT, reminder_id, REMINDER_PENDING, due_ts),
-            )
+            if sent_text is None:
+                cur = await conn.execute(
+                    "UPDATE reminders SET status = ?, sent_at = datetime('now') "
+                    "WHERE id = ? AND status = ? AND due_ts = ?",
+                    (REMINDER_SENT, reminder_id, REMINDER_PENDING, due_ts),
+                )
+            else:
+                cur = await conn.execute(
+                    "UPDATE reminders SET status = ?, sent_at = datetime('now') "
+                    "WHERE id = ? AND status = ? AND due_ts = ? AND text = ?",
+                    (REMINDER_SENT, reminder_id, REMINDER_PENDING, due_ts, sent_text),
+                )
             await conn.commit()
             return cur.rowcount == 1
 
