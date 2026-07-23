@@ -133,6 +133,11 @@ BIND_FAILED = (
     "«Без привязки»."
 )
 
+BIND_QUERY_TOO_SHORT = (
+    "Слишком короткий запрос. Назовите номер заявки, название, организацию "
+    "или телефон, или нажмите «Без привязки»."
+)
+
 BIND_LAST_EMPTY = "Заявок пока нет, ставлю обычное напоминание."
 
 BIND_LOST = (
@@ -415,7 +420,7 @@ async def _finalize_reminder(
     if deal is not None:
         deal_id = int(deal["ID"])
         deal_label = await deal_binding_label(bitrix, deal)
-    created = await _create_reminder(
+    created, final_label = await _create_reminder(
         message,
         db,
         bitrix,
@@ -427,8 +432,8 @@ async def _finalize_reminder(
     if created:
         when = dates.format_epoch(due_ts)
         reply = (
-            REMIND_SCHEDULED_DEAL.format(when=when, deal=deal_label)
-            if deal_label
+            REMIND_SCHEDULED_DEAL.format(when=when, deal=final_label)
+            if final_label
             else REMIND_SCHEDULED.format(when=when)
         )
         await message.answer(reply, reply_markup=main_menu_keyboard())
@@ -491,6 +496,11 @@ async def _resolve_binding(
     ref: BindingRef,
 ) -> None:
     """Ищет заявку и создаёт напоминание либо уточняет выбор."""
+    if ref.kind == "text" and binding.is_vague_query(ref.value or ""):
+        # Односимвольный или чисто служебный ответ: широкий поиск по нему
+        # мог бы молча привязать к случайному совпадению (ревью R4).
+        await _reask_binding(message, state, nonce, BIND_QUERY_TOO_SHORT)
+        return
     try:
         async with asyncio.timeout(SEARCH_DEADLINE):
             deals, truncated = await _find_deals(bitrix, ref)

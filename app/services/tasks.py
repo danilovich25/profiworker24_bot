@@ -161,7 +161,7 @@ async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | 
         result = await call_once(
             bx,
             "tasks.task.get",
-            {"taskId": task_id, "select": ["ID", "DEADLINE", "STATUS"]},
+            {"taskId": task_id, "select": ["ID", "DEADLINE", "STATUS", "UF_CRM_TASK"]},
         )
     except Exception as exc:
         if is_server_refusal(exc) and _task_is_missing(str(exc)):
@@ -179,6 +179,19 @@ async def get_reminder_task(bx: BitrixClient, task_id: int) -> dict[str, Any] | 
     if not isinstance(result, dict):
         raise MalformedBitrixResponse("Bitrix вернул неверный result для tasks.task.get")
     return result
+
+
+def task_deal_id(task: dict[str, Any]) -> int | None:
+    """Сделка из фактической привязки задачи (UF_CRM_TASK, D_<id>) или None.
+
+    Поле в ответе tasks.task.get приходит как ufCrmTask; учитывается только
+    сделочная связь D_*, прочие типы CRM-связей привязкой заявки не считаются.
+    """
+    for item in task.get("ufCrmTask") or []:
+        match = re.fullmatch(r"D_(\d+)", str(item))
+        if match is not None:
+            return int(match.group(1))
+    return None
 
 
 async def complete_reminder_task(bx: BitrixClient, task_id: int) -> bool:

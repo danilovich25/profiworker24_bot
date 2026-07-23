@@ -63,6 +63,19 @@ class FakeBindingBitrix(FakeSearchBitrix):
         if method == "tasks.task.complete":
             self.completed.append(int(params["taskId"]))
             return {"task": True}
+        if method == "tasks.task.get":
+            index = int(params["taskId"]) - 77
+            if not 0 <= index < len(self.tasks):
+                return []
+            fields = self.tasks[index]
+            return {
+                "task": {
+                    "id": str(77 + index),
+                    "deadline": fields.get("DEADLINE"),
+                    "status": "2",
+                    "ufCrmTask": fields.get("UF_CRM_TASK") or [],
+                }
+            }
         return await super()._dispatch(method, params)
 
 
@@ -633,6 +646,96 @@ async def test_consume_pending_is_atomic(flow, monkeypatch):
     winners = [item for item in (first, second) if item is not None]
     assert len(winners) == 1
     assert winners[0]["nonce"] == nonce
+
+
+# --- Правки по ревью Sol R4 ----------------------------------------------
+
+
+def test_parse_binding_answer_inner_punctuation():
+    """«Номер заявки: 154» — точный ID, а не текстовый поиск (Sol R4)."""
+    from app.services.binding import parse_binding_answer
+
+    for answer in (
+        "номер заявки: 154",
+        "заявка: 154",
+        "к заявке - 154",
+        "номер, 154",
+    ):
+        ref = parse_binding_answer(answer)
+        assert (ref.kind, ref.value) == ("deal_id", "154"), answer
+    phone = parse_binding_answer("номер телефона: 89141234567")
+    assert (phone.kind, phone.value) == ("phone", "+79141234567")
+
+
+async def test_too_short_text_answer_reasks_without_search(flow, monkeypatch):
+    """Ответ «а» или из одних служебных слов не запускает широкий поиск."""
+    from app.handlers.reminders import BIND_QUERY_TOO_SHORT
+
+    await start_reminder(flow, monkeypatch)
+    calls: list[str] = []
+    orig = flow.bx._dispatch
+
+    async def counting(method, params):
+        calls.append(method)
+        return await orig(method, params)
+
+    monkeypatch.setattr(flow.bx, "_dispatch", counting)
+
+    await send(flow, "а")
+    assert flow.session.sent_texts[-1] == BIND_QUERY_TOO_SHORT
+    await send(flow, "к заявке")
+    assert flow.session.sent_texts[-1] == BIND_QUERY_TOO_SHORT
+
+    assert calls == []
+    assert flow.bx.tasks == []
+    assert await state_of(flow) == ReminderFlow.binding.state
+
+
+async def test_reused_task_keeps_actual_binding(flow, monkeypatch):
+    """Идемпотентный повтор называет ФАКТИЧЕСКУЮ привязку задачи (Sol R4).
+
+    Репро ревью: задача создана с D_155, fence done записан, подтверждение
+    оборвалось. К повтору «последней» стала другая сделка — но пинг и
+    подтверждение обязаны называть №155 (привязку задачи), а не свежую.
+    """
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+    from app.services.tasks import _key_tag
+
+    key = "rem:sol-r4"
+    flow.bx.tasks.append(
+        {
+            "TITLE": "Позвонить",
+            "UF_CRM_TASK": ["D_155"],
+            "TAGS": [_key_tag(key)],
+        }
+    )
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 77)
+
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    order = reminder_order("позвонить", deadline)
+    message = make_message_update(flow.bot, "повтор").message
+
+    created, label = await _create_reminder(
+        message,
+        flow.db,
+        flow.bx,
+        order,
+        key=key,
+        deal_id=156,
+        deal_label="№156 · чужая сделка",
+    )
+
+    assert created
+    assert label is not None and "№155" in label and "№156" not in label
+    rows = await flow.db.pending_task_reminders()
+    assert len(rows) == 1
+    assert "№155" in rows[0]["text"]
+    assert "№156" not in rows[0]["text"]
 
 
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
