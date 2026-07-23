@@ -78,8 +78,8 @@ _TIME_STOP_WORDS = (
 )
 
 # Начало ЧИСЛОВОЙ даты или времени сразу после группы цифр: «23.07», «15:00»,
-# «23/07» — группа принадлежит сроку, а не номеру (ревью ULTRA-3).
-_NUMERIC_DATE_RE = re.compile(r"^[.:/\-]\d")
+# «23/07», «23–07» — группа принадлежит сроку, а не номеру (ревью ULTRA-3/9).
+_NUMERIC_DATE_RE = re.compile(r"^\s*[.:/\-—–]\s*\d")
 
 # Следующая цифровая группа после уже захваченного идентификатора. Если она
 # не открывает дату/время — достоверно разобрать фразу нельзя, бот спрашивает
@@ -91,8 +91,24 @@ _TRAILING_DIGITS_RE = re.compile(r"^\s+\(?(\d{1,4})")
 # «2026-07-23»): это «номер + дата», а не телефон. Телефонные дефисы
 # («123-45-67») не матчатся — перед их фрагментами нет границы слова.
 _EMBEDDED_DATE_RE = re.compile(
-    r"\b\d{1,2}[-./]\d{1,2}[-./]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b"
+    r"\b\d{1,2}[-./—–]\d{1,2}[-./—–]\d{2,4}\b|\b\d{4}[-—–]\d{2}[-—–]\d{2}\b"
 )
+
+
+def _tail_group_is_dateish(num: str, after: str) -> bool:
+    """Хвостовая цифровая группа согласована со сроком после неё.
+
+    «Год» требует 4-значное число, месяц/число/час — день ≤31; числовая
+    дата («23.07», «–07–2026») согласована сама по себе. Несогласованное
+    («2 года гарантии») датой НЕ считается (ревью ULTRA-8/9).
+    """
+    if _NUMERIC_DATE_RE.match(after):
+        return True
+    if _YEAR_WORD_RE.match(after):
+        return len(num) == 4
+    if _MONTHDAY_WORD_RE.match(after):
+        return len(num) <= 2 and int(num) <= 31
+    return False
 
 
 def _ambiguous_digit_tail(tail: str) -> bool:
@@ -100,8 +116,7 @@ def _ambiguous_digit_tail(tail: str) -> bool:
     match = _TRAILING_DIGITS_RE.match(tail)
     if match is None:
         return False
-    after = tail[match.end() :]
-    return not (_NUMERIC_DATE_RE.match(after) or _DATE_WORD_RE.match(after))
+    return not _tail_group_is_dateish(match.group(1), tail[match.end() :])
 
 # «К заявке по телефону 8914…» — телефон назван явно; в записи допустимы
 # и типографские тире (ревью ULTRA-8).
@@ -121,8 +136,12 @@ _PHONE_BARE_RE = re.compile(
 
 # Инлайн-добавочный сразу после номера: вырезается из текста напоминания
 # вместе с номером («…-67 доб. 12 завтра» → «завтра»; ревью ULTRA-8).
+# Маркеру нужна граница слова и ХОТЯ БЫ одна цифра добавочного: «внести»
+# и «добавить» — обычные слова, не маркеры (ревью ULTRA-9).
 _INLINE_EXTENSION_RE = re.compile(
-    r"^[\s.,]*(?:доб|вн|extension|ext|x|#)[\s.,:]*\d{0,7}", re.IGNORECASE
+    r"^[\s.,]*(?:(?:доб|вн|extension|ext)(?![a-zа-яё])|[x#])"
+    r"[\s.,:]*\d{1,7}\b",
+    re.IGNORECASE,
 )
 
 # «К заявке 154», «к заявке №154», «к заявке номер: 154». Захватывается
@@ -145,8 +164,8 @@ _DEAL_NUM_RE = re.compile(
 _CORRECTION_RE = re.compile(
     r"\bнет\b[\s,.:;!?—–-]*(?:лучше\s+)?(?:к|по|на)[\s,—–-]+"
     r"(?:заявк[а-яё]*[\s.,:;—–-]*)?"
-    r"(?:№\s*)?(?:\d{3,9}(?![:.,/-]?\d)|\d{1,2}(?![:.,/-]?\d)(?![\s,]*(?:%s)))"
-    % _TIME_STOP_WORDS,
+    r"(?:№\s*)?(?:\d{3,9}(?!\s*[:.,/—–-]?\s*\d)"
+    r"|\d{1,2}(?!\s*[:.,/—–-]?\s*\d)(?![\s,.;:—–-]*(?:%s)))" % _TIME_STOP_WORDS,
     re.IGNORECASE,
 )
 
@@ -244,25 +263,13 @@ def _trim_phone_span(group: str, tail: str) -> tuple[str | None, int]:
     """
     end = len(group)
     day = re.search(r"[\s.,;:()—–-]+(\d{1,4})\s*$", group)
-    if day is not None:
+    if day is not None and _tail_group_is_dateish(day.group(1), tail):
         # Хвостовая группа принадлежит сроку, только если СОГЛАСУЕТСЯ со
         # словом после захвата: «2026 года» (4 цифры + год), «23 июля»
         # (день ≤31 + месяц), числовая дата. Иначе «67» из «…-45-67, год
-        # выпуска» — часть номера, резать её нельзя (ревью ULTRA-8).
-        num = day.group(1)
-        cut = _NUMERIC_DATE_RE.match(tail) is not None
-        if not cut and _YEAR_WORD_RE.match(tail) and len(num) == 4:
-            cut = True
-        if (
-            not cut
-            and _MONTHDAY_WORD_RE.match(tail)
-            and len(num) <= 2
-            and int(num) <= 31
-        ):
-            cut = True
-        if cut:
-            end = day.start()
-            group = group[:end]
+        # выпуска» — часть номера, резать её нельзя (ревью ULTRA-8/9).
+        end = day.start()
+        group = group[:end]
     digits = re.sub(r"\D", "", group)
     limit = None
     if group.lstrip(" 	(").startswith("+"):
@@ -316,14 +323,18 @@ def _extract_one(text: str) -> tuple[str, BindingRef | None]:
             prefix = group[: trail.start()]
             prev = next((c for c in reversed(prefix) if not c.isdigit()), "")
             prev_dash = prev in "—–-"
+            # Сплошной номер без внутренних разделителей: однотипность
+            # хвоста неопределима — полный prefix делает его подозрительным
+            # (ревью ULTRA-9).
+            solid = prev in "+(" or prev == ""
             suspicious = (
-                (sep_dash and (len(num) == 1 or not prev_dash))
+                solid
+                or (sep_dash and (len(num) == 1 or not prev_dash))
                 or (not sep_dash and prev_dash)
             )
             if (
                 suspicious
-                and not _DATE_WORD_RE.match(after_group)
-                and not _NUMERIC_DATE_RE.match(after_group)
+                and not _tail_group_is_dateish(num, after_group)
                 and _normalize_ref_phone(prefix) is not None
             ):
                 return raw, BindingRef("conflict")
@@ -420,9 +431,12 @@ def parse_binding_answer(text: str) -> BindingRef:
     if compact.isdecimal() and len(compact) <= MAX_DEAL_ID_DIGITS:
         return BindingRef("deal_id", compact)
     # Телефоном считается только ответ, ЦЕЛИКОМ являющийся номером: фраза
-    # с цифрами внутри — поисковый запрос, а не телефон.
-    if extract_bare_phone(bare) is not None:
-        phone = _normalize_ref_phone(bare)
+    # с цифрами внутри — поисковый запрос, а не телефон. Юникод-тире
+    # приводятся к дефису до проверки — ядро (extract_bare_phone) знает
+    # только ASCII-пунктуацию (ревью ULTRA-9).
+    bare_norm = re.sub(r"[—–]", "-", bare)
+    if extract_bare_phone(bare_norm) is not None:
+        phone = _normalize_ref_phone(bare_norm)
         if phone is not None:
             return BindingRef("phone", phone)
     # Текстовый поиск получает ПОЛНЫЙ ответ: настоящее название может

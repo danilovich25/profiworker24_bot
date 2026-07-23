@@ -2253,6 +2253,76 @@ async def test_send_marks_sent_only_for_sent_text(flow):
     assert marked
 
 
+# --- Правки по ревью Sol ULTRA-9 ------------------------------------------
+
+
+def test_unicode_dash_numeric_dates():
+    """«154 23–07–2026» с юникод-тире — ID и дата, не телефон."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding("к заявке 154 23–07–2026 в 8 позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+    assert "23–07–2026" in clean
+
+
+def test_solid_phone_with_tail_asks():
+    """«+375291234567 2 договора» — сплошной номер + хвост: вопрос."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +375291234567 2 договора завтра"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_uncoordinated_date_word_still_guards():
+    """«2 года гарантии» — «2» не год (не 4 цифры): вопрос, не телефон."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +375 (29) 123-45-67 2 года гарантии завтра"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_extension_needs_digits_and_boundary():
+    """«внести оплату» и «добавить» после номера — текст, не добавочный."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону 89141234567 внести оплату завтра"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+    assert "внести оплату" in clean
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону 89141234567 добавить свет завтра"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+    assert "добавить свет" in clean
+
+
+def test_time_suppress_wide_punctuation():
+    """«нет, к 15 — вечером», «к 23; июля», «к 23 / 07» — не конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    for raw in (
+        "к заявке 154, нет, к 15 — вечером позвонить",
+        "к заявке 154, нет, к 23; июля позвонить",
+        "к заявке 154, нет, к 23 / 07 позвонить",
+    ):
+        _, ref = extract_inline_binding(raw)
+        assert (ref.kind, ref.value) == ("deal_id", "154"), raw
+
+
+def test_answer_unicode_dash_phone():
+    """Ответ «+375 (29) 123-45–67» с юникод-тире — телефон, не текст."""
+    from app.services.binding import parse_binding_answer
+
+    ref = parse_binding_answer("+375 (29) 123-45–67")
+    assert (ref.kind, ref.value) == ("phone", "+375291234567")
+
+
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
 
 
