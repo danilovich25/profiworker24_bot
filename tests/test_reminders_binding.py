@@ -525,13 +525,18 @@ async def test_multi_reminder_message_does_not_inline_bind(flow, monkeypatch):
     относиться ко второму фрагменту — инлайн-привязка при многоэлементном
     вводе игнорируется, кнопочный флоу задаёт вопрос явно.
     """
+    from datetime import timedelta
+
+    from app.services import dates
+
     raw = "к заявке 154 через 2 часа позвонить и завтра в 9 отправить смету"
     cleaned = "через 2 часа позвонить и завтра в 9 отправить смету"
+    first_deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
 
     async def fake(text: str):
         if text.lower() == cleaned:
             return [
-                reminder_order("позвонить"),
+                reminder_order("позвонить", first_deadline),
                 reminder_order("отправить смету"),
             ]
         return None
@@ -2400,6 +2405,118 @@ def test_correction_suppress_year_and_punct():
     ):
         _, ref = extract_inline_binding(raw)
         assert (ref.kind, ref.value) == ("deal_id", "154"), raw
+
+
+# --- Правки по ревью Sol ULTRA-11 -----------------------------------------
+
+
+def test_short_id_with_date_not_phone():
+    """«к заявке 91 23-07-2026» — это ID 91 и дата, не телефон."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding("к заявке 91 23-07-2026 в 8 позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "91")
+    assert "23-07-2026" in clean
+
+
+def test_plus_multitoken_date_split():
+    """«+45 12 34 56 78 23 – 07-2026» — номер 10 цифр, дата цела."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону +45 12 34 56 78 23 – 07-2026 позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+4512345678")
+    assert "07-2026" in clean
+
+
+def test_second_correction_still_conflicts():
+    """Серийное исправление: подавленное время не прячет второе «нет, к 155»."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 15 вечера, нет, к 155 позвонить"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_year_word_does_not_suppress_short_number():
+    """«нет, к 15. Год выпуска…» — 15 не год: конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 15. Год выпуска проверить"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_numeric_tail_requires_plausible_first_group():
+    """«123 456-789» — 456 не день и не год: вопрос, не D_123."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding("к заявке 123 456-789 завтра позвонить")
+    assert ref is not None and ref.kind == "conflict"
+
+
+async def test_multi_reminder_keeps_first_deadline(flow, monkeypatch):
+    """Срок второго фрагмента не перекрывает дедлайн первого напоминания."""
+    from datetime import timedelta
+
+    from app.services import dates
+
+    raw = "завтра в 9 позвонить Ивану и через 2 часа оплатить счёт"
+    first_deadline = (
+        dates.now_local().replace(hour=9, minute=0, second=0, microsecond=0)
+        + timedelta(days=1)
+    )
+
+    async def fake(text: str):
+        return [
+            reminder_order("позвонить Ивану", first_deadline.isoformat()),
+            reminder_order("оплатить счёт"),
+        ]
+
+    monkeypatch.setattr(llm, "parse_order", fake)
+    await send(flow, BTN_REMIND)
+    await send(flow, raw)
+    await press_bind(flow, "none")
+
+    rows = await flow.db.pending_task_reminders()
+    assert len(rows) == 1
+    assert abs(rows[0]["due_ts"] - int(first_deadline.timestamp())) <= 120
+
+
+async def test_inline_miss_reported_without_deadline_ping(flow, monkeypatch):
+    """«напомни к заявке 999 позвонить» без срока: промах привязки сообщается."""
+    from app.handlers.messages import BIND_INLINE_MISS
+
+    text = "напомни к заявке 999 позвонить заказчику"
+    mock_parse(monkeypatch, {text: reminder_order("позвонить заказчику")})
+
+    await send(flow, text)
+
+    assert len(flow.bx.tasks) == 1
+    assert "UF_CRM_TASK" not in flow.bx.tasks[0]
+    assert BIND_INLINE_MISS in flow.session.sent_texts
+
+
+def test_paren_month_after_deal_id():
+    """«154 23 (июля)» — дата в скобках, ID цел, без лишнего вопроса."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding("к заявке 154 23 (июля) позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+
+
+def test_dotted_international_phone():
+    """«+1.212.555.0123» — точки внутри номера поддерживаются."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +1.212.555.0123 завтра позвонить"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("phone", "+12125550123")
 
 
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------

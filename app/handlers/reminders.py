@@ -371,7 +371,11 @@ async def handle_reminder_query(
         # выбор задаёт явный вопрос (ревью ULTRA).
         ref = None
     now = dates.now_local()
-    deadline = dates.resolve_deadline(llm_deadline, source, now)
+    # При нескольких напоминаниях в сообщении общий текст в разбор срока не
+    # передаётся: срок ВТОРОГО фрагмента не должен перекрывать deadline
+    # первого (ревью ULTRA-11; тот же приём, что в свободном тексте).
+    deadline_source = source if len(orders) <= 1 else ""
+    deadline = dates.resolve_deadline(llm_deadline, deadline_source, now)
     due_ts = dates.reminder_epoch(deadline)
     if due_ts is None:
         await message.answer(REMIND_NO_DATE, reply_markup=_prompt_markup())

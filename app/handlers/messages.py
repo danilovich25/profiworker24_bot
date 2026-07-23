@@ -946,10 +946,12 @@ async def _process_order_text(
                 outcome.created
                 and (inline_miss or inline_conflict)
                 and outcome.label_known
-                and outcome.due_ts is not None
+                and not outcome.terminal
             ):
-                # При непрочитанной привязке или без реального пинга молчим:
-                # «поставил обычное напоминание» было бы ложью.
+                # Промах/конфликт привязки сообщается и без Telegram-пинга
+                # (задача без срока — тоже «поставил обычное»; ревью
+                # ULTRA-11); молчание только при непрочитанной привязке и
+                # терминальных задачах — там свои честные ответы.
                 await message.answer(
                     BIND_INLINE_CONFLICT if inline_conflict else BIND_INLINE_MISS
                 )
@@ -1168,6 +1170,9 @@ class ReminderOutcome:
     deal_label: str | None = None
     label_known: bool = True
     due_ts: int | None = None
+    # Терминальное состояние задачи (удалена/завершена): специальный ответ
+    # уже отправлен, пояснения о привязке неуместны (ревью ULTRA-11).
+    terminal: bool = False
 
 
 async def _actual_task_binding(
@@ -1382,6 +1387,7 @@ async def _create_reminder(
                 task_id=task_id,
                 deal_label=deal_label if state == "done" else None,
                 label_known=state == "done",
+                terminal=True,
             )
         label_known = state == "ok"
         due_override = task_due

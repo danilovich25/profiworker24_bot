@@ -64,11 +64,15 @@ _MONTHDAY_WORDS = (
 )
 _YEAR_WORDS = r"год(?:а|у|ов|ам)?\b"
 _DATE_WORDS = _MONTHDAY_WORDS + "|" + _YEAR_WORDS
-_DATE_WORD_RE = re.compile(r"^[\s.,:;—–-]*(?:%s)" % _DATE_WORDS, re.IGNORECASE)
-_MONTHDAY_WORD_RE = re.compile(
-    r"^[\s.,:;—–-]*(?:%s)" % _MONTHDAY_WORDS, re.IGNORECASE
+_DATE_WORD_RE = re.compile(
+    r"^[\s.,:;()—–-]*(?:%s)" % _DATE_WORDS, re.IGNORECASE
 )
-_YEAR_WORD_RE = re.compile(r"^[\s.,:;—–-]*(?:%s)" % _YEAR_WORDS, re.IGNORECASE)
+_MONTHDAY_WORD_RE = re.compile(
+    r"^[\s.,:;()—–-]*(?:%s)" % _MONTHDAY_WORDS, re.IGNORECASE
+)
+_YEAR_WORD_RE = re.compile(
+    r"^[\s.,:;()—–-]*(?:%s)" % _YEAR_WORDS, re.IGNORECASE
+)
 
 # Слова времени суток после числа — «к 15 вечера» это время, не заявка.
 # Формы закрытые: «ночной выезд», «утренний» — смысловые слова (ULTRA-5).
@@ -96,7 +100,9 @@ def _tail_group_is_dateish(num: str, after: str) -> bool:
     («2 года гарантии») датой НЕ считается (ревью ULTRA-8/9).
     """
     if _NUMERIC_DATE_RE.match(after):
-        return True
+        # Первая группа обязана быть днём (≤31) или годом (4 цифры):
+        # «456-789» — не дата (ревью ULTRA-11).
+        return (len(num) <= 2 and int(num) <= 31) or len(num) == 4
     if _YEAR_WORD_RE.match(after):
         return len(num) == 4
     if _MONTHDAY_WORD_RE.match(after):
@@ -115,7 +121,7 @@ def _ambiguous_digit_tail(tail: str) -> bool:
 # и типографские тире (ревью ULTRA-8).
 _PHONE_KEYWORD_RE = re.compile(
     _REF_PREFIX + r"(?:по\s+)?(?:телефону?|номеру\s+телефона)[\s.,:;—–-]*"
-    r"(\(?\+?[\d(][\d\s()—–\-]{4,}\d)",
+    r"(\(?\+?[\d(][\d\s()./—–\-]{4,}\d)",
     re.IGNORECASE,
 )
 
@@ -127,7 +133,7 @@ _PHONE_KEYWORD_RE = re.compile(
 # «к заявке 154 23-07-2026» — это номер заявки с датой, не телефон
 # (ревью ULTRA-10).
 _PHONE_BARE_RE = re.compile(
-    _REF_PREFIX + r"((?:\+|\(?[789])[\d\s()—–\-]{8,}\d)", re.IGNORECASE
+    _REF_PREFIX + r"((?:\+|\(?[789])[\d\s()./—–\-]{8,}\d)", re.IGNORECASE
 )
 
 # Инлайн-добавочный сразу после номера: вырезается из текста напоминания
@@ -166,8 +172,13 @@ _CORRECTION_RE = re.compile(
 )
 
 # Слово времени/суток (с широкой пунктуацией перед ним) после числа.
+# БЕЗ «года»: 1-2-значное число годом быть не может (ревью ULTRA-11).
+_SHORT_TIME_WORDS = (
+    _MONTHDAY_WORDS
+    + r"|утр[ао]?м?\b|вечер(?:а|у|ом)?\b|дн[яеё]м?\b|ноч(?:и|ью)?\b"
+)
 _TIME_SUPPRESS_RE = re.compile(
-    r"^[\s,.;:!?()—–-]*(?:%s)" % _TIME_STOP_WORDS, re.IGNORECASE
+    r"^[\s,.;:!?()—–-]*(?:%s)" % _SHORT_TIME_WORDS, re.IGNORECASE
 )
 _YEAR_SUPPRESS_RE = re.compile(
     r"^[\s,.;:!?()—–-]*(?:%s)" % _YEAR_WORDS, re.IGNORECASE
@@ -184,19 +195,18 @@ def _correction_conflict(clean: str) -> bool:
     """
     if _CORRECTION_KEYWORD_RE.search(clean):
         return True
-    match = _CORRECTION_RE.search(clean)
-    if match is None:
-        return False
-    num = match.group(1)
-    rest = clean[match.end() :]
-    if len(num) <= 2 and (
-        _TIME_SUPPRESS_RE.match(rest)
-        or re.match(r"^\s*[(\s]*[:/.\-—–]\s*\d", rest)
-    ):
-        return False
-    if len(num) == 4 and _YEAR_SUPPRESS_RE.match(rest):
-        return False
-    return True
+    for match in _CORRECTION_RE.finditer(clean):
+        num = match.group(1)
+        rest = clean[match.end() :]
+        if len(num) <= 2 and (
+            _TIME_SUPPRESS_RE.match(rest)
+            or re.match(r"^\s*[(\s]*[:/.\-—–]\s*\d", rest)
+        ):
+            continue
+        if len(num) == 4 and _YEAR_SUPPRESS_RE.match(rest):
+            continue
+        return True
+    return False
 
 # Исправление с ЛЮБЫМ словом-маркером ссылки («нет, к последней…», «нет,
 # по телефону…», «нет, к номеру…») — всегда уточняем кнопками: угадать,
@@ -320,15 +330,22 @@ def _resolve_phone_span(group: str, tail: str) -> tuple[str | None, int, bool]:
         return None, 0, False
     plus = group.lstrip(" \t(").startswith("+")
     if plus and digits_all[0] != "7":
+        # Перебор разрезов по границам токенов ОТ НАИМЕНЬШЕГО валидного
+        # префикса: «+45 12 34 56 78 23 – 07-2026» — номер 10 цифр, остаток
+        # целиком согласованная дата (ревью ULTRA-11). Валидный префикс с
+        # несогласованным цифровым остатком — вопрос.
         parts = list(re.finditer(r"\S+", group))
-        if len(parts) >= 2:
-            last = parts[-1]
-            prefix = group[: last.start()].rstrip(" .,;:()—–-")
+        prefix_valid_seen = False
+        for index in range(1, len(parts)):
+            prefix = group[: parts[index - 1].end()].rstrip(" .,;:()—–-")
             prefix_digits = re.sub(r"\D", "", prefix)
-            if 10 <= len(prefix_digits) <= 15:
-                if _rest_is_dateish(group[len(prefix) :], tail):
-                    return _normalize_ref_phone(prefix), len(prefix), False
-                return None, 0, True
+            if not 10 <= len(prefix_digits) <= 15:
+                continue
+            prefix_valid_seen = True
+            if _rest_is_dateish(group[len(prefix) :], tail):
+                return _normalize_ref_phone(prefix), len(prefix), False
+        if prefix_valid_seen:
+            return None, 0, True
         if 10 <= len(digits_all) <= 15:
             return _normalize_ref_phone(group), len(group), False
         return None, 0, True
@@ -356,7 +373,16 @@ def _extract_one(text: str) -> tuple[str, BindingRef | None]:
     match = _LAST_RE.search(raw)
     if match:
         return _cut(raw, match.start(), match.end()), BindingRef("last")
-    match = _PHONE_KEYWORD_RE.search(raw) or _PHONE_BARE_RE.search(raw)
+    keyword_match = _PHONE_KEYWORD_RE.search(raw)
+    match = keyword_match or _PHONE_BARE_RE.search(raw)
+    if match is not None and keyword_match is None:
+        # Голая форма: если ПЕРВАЯ цифровая группа сама валидный ID (≤9
+        # цифр), телефон складывается только вместе с датой — это «номер
+        # заявки + срок», решает ветка номера («к заявке 91 23-07-2026»;
+        # ревью ULTRA-11).
+        first = re.match(r"[\s(+]*(\d+)", match.group(1))
+        if first is not None and len(first.group(1)) <= MAX_DEAL_ID_DIGITS:
+            match = None
     if match:
         group = match.group(1)
         after_group = raw[match.end(1) :]
