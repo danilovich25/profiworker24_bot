@@ -40,6 +40,19 @@ class FakeReminderBitrix(FakeBitrix):
         if method == "tasks.task.complete":
             self.completed.append(int(params["taskId"]))
             return {"task": True}
+        if method == "tasks.task.get":
+            index = int(params["taskId"]) - 77
+            if not 0 <= index < len(self.tasks):
+                return []
+            fields = self.tasks[index]
+            return {
+                "task": {
+                    "id": str(77 + index),
+                    "deadline": fields.get("DEADLINE"),
+                    "status": str(fields.get("STATUS", "2")),
+                    "ufCrmTask": fields.get("UF_CRM_TASK") or [],
+                }
+            }
         return await super()._dispatch(method, params)
 
 

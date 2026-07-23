@@ -1313,7 +1313,7 @@ class Database:
         task_id: int,
         build_text: Callable[[int], str],
         due_ts: int | None = None,
-    ) -> bool:
+    ) -> tuple[bool, int | None]:
         """Обновляет ОЖИДАЮЩИЙ пинг задачи (kind=task, pending).
 
         Нужен идемпотентному повтору создания: существующая задача могла
@@ -1324,6 +1324,9 @@ class Database:
         хвост «Срок:» никогда не расходится с датой отправки (ревью
         ULTRA-3). CAS по прочитанному сроку: параллельный перенос или
         отправка промахнут запись, а не перетрут её.
+
+        Возвращает (обновлено, фактический срок записи | None): срок нужен
+        вызывающему для честного подтверждения времени пользователю.
         """
         async with aiosqlite.connect(self.path) as conn:
             cur = await conn.execute(
@@ -1333,7 +1336,7 @@ class Database:
             )
             row = await cur.fetchone()
             if row is None:
-                return False
+                return False, None
             current_due = int(row[1])
             new_due = due_ts if due_ts is not None else current_due
             cur = await conn.execute(
@@ -1342,7 +1345,7 @@ class Database:
                 (build_text(new_due), new_due, row[0], REMINDER_PENDING, current_due),
             )
             await conn.commit()
-            return cur.rowcount == 1
+            return cur.rowcount == 1, new_due
 
     async def cancelled_task_reminders(self, limit: int = 20) -> list[dict[str, Any]]:
         """Недавно отменённые пинги задач — кандидаты на воскрешение.
@@ -1588,20 +1591,44 @@ class Database:
             return cur.rowcount == 1
 
     async def reschedule_reminder(
-        self, reminder_id: int, due_ts: int, text: str, activity_id: int | None
+        self,
+        reminder_id: int,
+        due_ts: int,
+        text: str,
+        activity_id: int | None,
+        expected_due: int | None = None,
     ) -> bool:
         """Переносит неотправленное напоминание на новый срок (CAS по pending).
 
         Вызывается сверкой CRM → бот: «назначенную дату» перенесли в Bitrix24,
         очередь догоняет. Счётчик попыток сбрасывается — это новый срок.
         Отправленные и отменённые напоминания не трогаются.
+
+        expected_due — CAS по прочитанному сроку: если запись успели
+        перенести параллельно (reuse согласовал подпись и срок), перенос со
+        старого снимка обязан промахнуться, а не перетереть свежие данные
+        (ревью ULTRA-4).
         """
         async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(
-                "UPDATE reminders SET due_ts = ?, text = ?, activity_id = ?, "
-                "attempts = 0 WHERE id = ? AND status = ?",
-                (due_ts, text, activity_id, reminder_id, REMINDER_PENDING),
-            )
+            if expected_due is None:
+                cur = await conn.execute(
+                    "UPDATE reminders SET due_ts = ?, text = ?, activity_id = ?, "
+                    "attempts = 0 WHERE id = ? AND status = ?",
+                    (due_ts, text, activity_id, reminder_id, REMINDER_PENDING),
+                )
+            else:
+                cur = await conn.execute(
+                    "UPDATE reminders SET due_ts = ?, text = ?, activity_id = ?, "
+                    "attempts = 0 WHERE id = ? AND status = ? AND due_ts = ?",
+                    (
+                        due_ts,
+                        text,
+                        activity_id,
+                        reminder_id,
+                        REMINDER_PENDING,
+                        expected_due,
+                    ),
+                )
             await conn.commit()
             return cur.rowcount == 1
 

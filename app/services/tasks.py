@@ -568,9 +568,14 @@ async def sync_task_reminder(
         return {**reminder, "due_ts": int(fresh["due_ts"]), "text": fresh["text"]}
     text = _text_with_deadline(str(fresh["text"]), due_ts)
     if not await db.reschedule_reminder(
-        reminder["id"], due_ts, text, reminder.get("activity_id")
+        reminder["id"],
+        due_ts,
+        text,
+        reminder.get("activity_id"),
+        expected_due=int(fresh["due_ts"]),
     ):
-        # Запись уже не pending (параллельная отправка/отмена) — как есть.
+        # Запись не pending либо срок изменился параллельно (reuse успел
+        # согласовать подпись/срок) — свежие данные не перетираются.
         return reminder
     log.info("Пинг id=%s перенесён за задачей %s", reminder["id"], task_id)
     return {**reminder, "due_ts": due_ts, "text": text}

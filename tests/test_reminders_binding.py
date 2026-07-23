@@ -72,7 +72,7 @@ class FakeBindingBitrix(FakeSearchBitrix):
                 "task": {
                     "id": str(77 + index),
                     "deadline": fields.get("DEADLINE"),
-                    "status": "2",
+                    "status": str(fields.get("STATUS", "2")),
                     "ufCrmTask": fields.get("UF_CRM_TASK") or [],
                 }
             }
@@ -720,7 +720,7 @@ async def test_reused_task_keeps_actual_binding(flow, monkeypatch):
     order = reminder_order("позвонить", deadline)
     message = make_message_update(flow.bot, "повтор").message
 
-    created, label, _known = await _create_reminder(
+    outcome = await _create_reminder(
         message,
         flow.db,
         flow.bx,
@@ -730,8 +730,9 @@ async def test_reused_task_keeps_actual_binding(flow, monkeypatch):
         deal_label="№156 · чужая сделка",
     )
 
-    assert created
-    assert label is not None and "№155" in label and "№156" not in label
+    assert outcome.created
+    assert outcome.deal_label is not None
+    assert "№155" in outcome.deal_label and "№156" not in outcome.deal_label
     rows = await flow.db.pending_task_reminders()
     assert len(rows) == 1
     assert "№155" in rows[0]["text"]
@@ -952,12 +953,12 @@ async def test_actual_binding_survives_deal_read_failure(flow, monkeypatch):
 
     deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
     message = make_message_update(flow.bot, "повтор").message
-    created, label, _known = await _create_reminder(
+    outcome = await _create_reminder(
         message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
     )
 
-    assert created
-    assert label == "№155"
+    assert outcome.created
+    assert outcome.deal_label == "№155"
 
 
 async def test_reuse_updates_existing_ping_text(flow, monkeypatch):
@@ -985,11 +986,12 @@ async def test_reuse_updates_existing_ping_text(flow, monkeypatch):
 
     deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
     message = make_message_update(flow.bot, "повтор").message
-    created, label, _known = await _create_reminder(
+    outcome = await _create_reminder(
         message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
     )
 
-    assert created and label is not None and "№155" in label
+    assert outcome.created
+    assert outcome.deal_label is not None and "№155" in outcome.deal_label
     rows = await flow.db.pending_task_reminders()
     assert len(rows) == 1
     assert "№155" in rows[0]["text"]
@@ -1146,7 +1148,7 @@ async def test_reuse_updates_ping_due_ts(flow, monkeypatch):
     )
 
     message = make_message_update(flow.bot, "повтор").message
-    created, *_ = await _create_reminder(
+    outcome = await _create_reminder(
         message,
         flow.db,
         flow.bx,
@@ -1154,7 +1156,7 @@ async def test_reuse_updates_ping_due_ts(flow, monkeypatch):
         key=key,
     )
 
-    assert created
+    assert outcome.created
     rows = await flow.db.pending_task_reminders()
     assert len(rows) == 1
     assert abs(rows[0]["due_ts"] - int(new_deadline.timestamp())) <= 120
@@ -1190,12 +1192,12 @@ async def test_task_read_failure_keeps_existing_ping_text(flow, monkeypatch):
 
     deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
     message = make_message_update(flow.bot, "повтор").message
-    created, label, _known = await _create_reminder(
+    outcome = await _create_reminder(
         message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
     )
 
-    assert created
-    assert label is None
+    assert outcome.created
+    assert outcome.deal_label is None
     rows = await flow.db.pending_task_reminders()
     assert rows[0]["text"] == old_text
 
@@ -1343,11 +1345,11 @@ async def test_reuse_due_follows_task_deadline(flow, monkeypatch):
 
     retry_deadline = (dates.now_local() + timedelta(hours=1)).isoformat()
     message = make_message_update(flow.bot, "повтор").message
-    created, *_ = await _create_reminder(
+    outcome = await _create_reminder(
         message, flow.db, flow.bx, reminder_order("позвонить", retry_deadline), key=key
     )
 
-    assert created
+    assert outcome.created
     rows = await flow.db.pending_task_reminders()
     assert len(rows) == 1
     assert abs(rows[0]["due_ts"] - int(task_due.timestamp())) <= 120
@@ -1410,13 +1412,13 @@ async def test_unknown_binding_suppresses_inline_miss(flow, monkeypatch):
     monkeypatch.setattr(flow.bx, "_dispatch", failing)
     deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
     message = make_message_update(flow.bot, "повтор").message
-    created, label, label_known = await _create_reminder(
+    outcome = await _create_reminder(
         message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
     )
 
-    assert created
-    assert label is None
-    assert label_known is False
+    assert outcome.created
+    assert outcome.deal_label is None
+    assert outcome.label_known is False
     assert BIND_INLINE_MISS not in flow.session.sent_texts
 
 
@@ -1461,15 +1463,193 @@ async def test_deleted_task_reuse_is_unknown(flow, monkeypatch):
 
     deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
     message = make_message_update(flow.bot, "повтор").message
-    created, label, label_known = await _create_reminder(
+    outcome = await _create_reminder(
         message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
     )
 
-    assert created
-    assert label is None
-    assert label_known is False
+    assert outcome.created
+    assert outcome.deal_label is None
+    assert outcome.label_known is False
     rows = await flow.db.pending_task_reminders()
     assert rows[0]["text"] == old_text
+
+
+# --- Правки по ревью Sol ULTRA-4 ------------------------------------------
+
+
+def test_plus_phone_never_ru_normalized():
+    """Явный «+» — номер как есть, без российской нормализации."""
+    from app.services.binding import extract_inline_binding, parse_binding_answer
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +45 12 34 56 78 завтра позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+4512345678")
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +81312345678 завтра позвонить"
+    )
+    assert (ref.kind, ref.value) == ("phone", "+81312345678")
+    answer = parse_binding_answer("+45 12 34 56 78")
+    assert (answer.kind, answer.value) == ("phone", "+4512345678")
+
+
+def test_hour_adjective_does_not_stop_gluing():
+    """«Часовой пояс» — не стоп-слово: «123 456» склеивается в D_123456."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 123 456 часовой пояс клиента уточнить 23.07.2027"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("deal_id", "123456")
+
+
+def test_correction_with_dash_or_dot():
+    """«нет — к 155» и «нет. к 155» — тоже самоисправление (конфликт)."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding("к заявке 154, нет — к 155 завтра в 8")
+    assert ref is not None and ref.kind == "conflict"
+    _, ref = extract_inline_binding("к заявке 154. нет. к 155 завтра в 8")
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_correction_ignores_daypart_words():
+    """«нет, к 15 вечера/утра/дня/ночи» — время, не привязка."""
+    from app.services.binding import extract_inline_binding
+
+    for tail in ("вечера", "утра", "дня", "ночи"):
+        _, ref = extract_inline_binding(
+            f"к заявке 154, нет, к 15 {tail} позвонить"
+        )
+        assert ref is not None, tail
+        assert (ref.kind, ref.value) == ("deal_id", "154"), tail
+
+
+def test_service_lookahead_accepts_dashes():
+    """«заявке—154» и «по телефону–8914…» без пробелов разбираются точно."""
+    from app.services.binding import parse_binding_answer
+
+    ref = parse_binding_answer("заявке—154")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+    ref = parse_binding_answer("по телефону–89141234567")
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+
+
+async def test_reuse_outcome_reports_actual_due(flow, monkeypatch):
+    """Outcome несёт ФАКТИЧЕСКИЙ срок (T1 задачи), а не повторный разбор T2."""
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+    from app.services.tasks import _key_tag
+
+    key = "rem:ultra4-due"
+    t1 = dates.now_local() + timedelta(hours=5)
+    flow.bx.tasks.append(
+        {
+            "TITLE": "Позвонить",
+            "UF_CRM_TASK": ["D_155"],
+            "TAGS": [_key_tag(key)],
+            "DEADLINE": t1.isoformat(),
+        }
+    )
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 77)
+    await flow.db.add_reminder(
+        1, "позвонить. Срок: старый", int(time.time()) + 600, "task", 77
+    )
+
+    t2 = (dates.now_local() + timedelta(hours=1)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    outcome = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", t2), key=key
+    )
+
+    assert outcome.created
+    assert outcome.due_ts is not None
+    assert abs(outcome.due_ts - int(t1.timestamp())) <= 120
+
+
+async def test_reschedule_cas_by_expected_due(flow):
+    """reschedule_reminder промахивается, если срок записи уже изменён."""
+    now = int(time.time())
+    rid = await flow.db.add_reminder(
+        1, "позвонить (заявка №155 · новая). Срок: X", now + 600, "task", 77
+    )
+    # Параллельный reuse успел перенести запись на другой срок.
+    moved = await flow.db.reschedule_reminder(
+        rid, now + 7200, "позвонить (заявка №155 · новая). Срок: Y", None,
+        expected_due=now + 600,
+    )
+    assert moved
+    # Синк со СТАРЫМ прочитанным сроком обязан промахнуться.
+    stale_attempt = await flow.db.reschedule_reminder(
+        rid, now + 9000, "позвонить (заявка №154 · старая). Срок: Z", None,
+        expected_due=now + 600,
+    )
+    assert not stale_attempt
+    rows = await flow.db.pending_task_reminders()
+    assert "№155" in rows[0]["text"]
+
+
+async def test_deleted_task_reuse_no_phantom_ping(flow, monkeypatch):
+    """Fence на удалённую задачу: честный ответ, БЕЗ phantom-пинга."""
+    from datetime import timedelta
+
+    from app.handlers.messages import REMINDER_TASK_GONE, _create_reminder
+    from app.services import dates
+
+    key = "rem:ultra4-gone"
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 990)
+
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    outcome = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
+    )
+
+    assert outcome.created
+    assert await flow.db.pending_task_reminders() == []
+    replies = flow.session.sent_texts
+    assert REMINDER_TASK_GONE.format(task_id=990) in replies
+    assert all("Напоминание записано" not in reply for reply in replies)
+
+
+async def test_completed_task_reuse_no_new_ping(flow, monkeypatch):
+    """Fence на завершённую задачу (status=5): пинг не обещается и не ставится."""
+    from datetime import timedelta
+
+    from app.handlers.messages import REMINDER_TASK_DONE, _create_reminder
+    from app.services import dates
+    from app.services.tasks import _key_tag
+
+    key = "rem:ultra4-done"
+    flow.bx.tasks.append(
+        {
+            "TITLE": "Позвонить",
+            "UF_CRM_TASK": ["D_155"],
+            "TAGS": [_key_tag(key)],
+            "STATUS": "5",
+        }
+    )
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 77)
+
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    outcome = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
+    )
+
+    assert outcome.created
+    assert outcome.due_ts is None
+    assert await flow.db.pending_task_reminders() == []
+    assert REMINDER_TASK_DONE.format(task_id=77) in flow.session.sent_texts
 
 
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------

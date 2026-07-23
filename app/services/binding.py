@@ -45,11 +45,17 @@ _REF_PREFIX = r"\b(?:к|по|для)\s+заявк[а-яё]*[\s.,:;—–-]*"
 
 # Слова, начинающие дату/срок сразу после числа: следующая цифровая группа
 # принадлежит дате, а не номеру заявки или телефону («154 23 июля»).
+# «Час/минута/год» — закрытыми словоформами с границей: «часовой пояс» и
+# «годовой отчёт» — смысловые слова, а не срок (ревью ULTRA-4).
 _DATE_WORDS = (
     r"январ|феврал|март|апрел|ма[яй]|июн|июл|август|сентябр|октябр|ноябр|"
-    r"декабр|числ|год|час|минут"
+    r"декабр|числ|год(?:а|у|ов|ам)?\b|час(?:а|у|ов|ам|ах)?\b|"
+    r"минут(?:а|ы|у|ам|ах)?\b"
 )
 _DATE_WORD_RE = re.compile(r"^[\s.,:;—–-]*(?:%s)" % _DATE_WORDS, re.IGNORECASE)
+
+# Слова времени суток после числа — «к 15 вечера» это время, не заявка.
+_TIME_STOP_WORDS = _DATE_WORDS + r"|утр|вечер|дн[яеё]м?\b|ноч"
 
 # Начало ЧИСЛОВОЙ даты или времени сразу после группы цифр: «23.07», «15:00»,
 # «23/07» — группа принадлежит сроку, а не номеру (ревью ULTRA-3).
@@ -82,12 +88,13 @@ _DEAL_NUM_RE = re.compile(
 # Продолжение разбитого STT числа: короткая цифровая группа через пробел.
 _NUM_GROUP_RE = re.compile(r"^\s+(\d{1,4})(?=[\s.,;:!?)]|$)")
 
-# Самоисправление голосом без слова «заявка»: «…, нет, к 155». Числа,
-# похожие на время («к 15:00») или дату («к 23 июля»), исправлением
-# ПРИВЯЗКИ не считаются.
+# Самоисправление голосом без слова «заявка»: «…, нет, к 155», «нет — к
+# 155», «нет. к 155». Числа, похожие на время («к 15:00», «к 15 вечера»)
+# или дату («к 23 июля»), исправлением ПРИВЯЗКИ не считаются.
 _CORRECTION_RE = re.compile(
-    r"\bнет\b[\s,]*(?:лучше\s+)?(?:к|по|на)\s+(?:заявк[а-яё]*[\s.,:;—–-]*)?"
-    r"(?:№\s*)?\d{1,9}(?![:.,]?\d)(?!\s*(?:%s))" % _DATE_WORDS,
+    r"\bнет\b[\s,.:;—–-]*(?:лучше\s+)?(?:к|по|на)\s+"
+    r"(?:заявк[а-яё]*[\s.,:;—–-]*)?"
+    r"(?:№\s*)?\d{1,9}(?![:.,]?\d)(?!\s*(?:%s))" % _TIME_STOP_WORDS,
     re.IGNORECASE,
 )
 
@@ -113,13 +120,14 @@ _ANSWER_LAST_RE = re.compile(
 # съедал бы смысловые слова («Номерной», «Телефонов» — это названия,
 # а не служебные слова; ревью R5).
 # Однобуквенные предлоги срезаются только перед ПРОБЕЛОМ: «К-12» — это
-# название, а не «к» + номер 12 (ревью ULTRA).
+# название, а не «к» + номер 12 (ревью ULTRA). Существительные принимают
+# и типографские тире («заявке—154», «телефону–8914…»).
 _SERVICE_WORD_RE = re.compile(
     r"^(?:(?:к|по|для)(?=\s)"
     r"|(?:заявк(?:а|и|е|у|ой|ою)?"
     r"|номер(?:а|у|е|ом)?"
     r"|телефон(?:а|у|е|ом)?"
-    r")(?=[\s.,:;№\d-]|$)|№)",
+    r")(?=[\s.,:;№\d—–-]|$)|№)",
     re.IGNORECASE,
 )
 
@@ -141,6 +149,20 @@ def _cut(text: str, start: int, end: int) -> str:
     """Вырезает совпадение и схлопывает оставшиеся пробелы."""
     rest = (text[:start] + " " + text[end:]).strip()
     return re.sub(r"\s+", " ", rest)
+
+
+def _normalize_ref_phone(raw: str) -> str | None:
+    """Телефон ссылки: явный «+» уважается как есть (E.164), без RU-догадок.
+
+    normalize_phone превращает «+45 12 34 56 78» (10 цифр) в «+7451…» —
+    для явных международных номеров это ложь (ревью ULTRA-4). Без «+»
+    работает штатная российская нормализация.
+    """
+    text = (raw or "").strip()
+    if text.startswith("+"):
+        digits = re.sub(r"\D", "", text)
+        return "+" + digits if 10 <= len(digits) <= 15 else None
+    return normalize_phone(text)
 
 
 def _trim_phone_span(group: str, tail: str) -> tuple[str | None, int]:
@@ -176,7 +198,7 @@ def _trim_phone_span(group: str, tail: str) -> tuple[str | None, int]:
                 if count == limit:
                     end = index + 1
                     break
-    return normalize_phone(group[:end]), end
+    return _normalize_ref_phone(group[:end]), end
 
 
 def _extract_one(text: str) -> tuple[str, BindingRef | None]:
@@ -214,7 +236,7 @@ def _extract_one(text: str) -> tuple[str, BindingRef | None]:
         if len(digits) <= MAX_DEAL_ID_DIGITS:
             return _cut(raw, match.start(), end), BindingRef("deal_id", digits)
         # 10-15 цифр — это телефон, названный без слова «телефон».
-        phone = normalize_phone(digits)
+        phone = _normalize_ref_phone(digits)
         if phone is not None:
             return _cut(raw, match.start(), end), BindingRef("phone", phone)
     return raw, None
@@ -288,9 +310,10 @@ def parse_binding_answer(text: str) -> BindingRef:
         return BindingRef("deal_id", compact)
     # Телефоном считается только ответ, ЦЕЛИКОМ являющийся номером: фраза
     # с цифрами внутри — поисковый запрос, а не телефон.
-    phone = extract_bare_phone(bare)
-    if phone is not None:
-        return BindingRef("phone", phone)
+    if extract_bare_phone(bare) is not None:
+        phone = _normalize_ref_phone(bare)
+        if phone is not None:
+            return BindingRef("phone", phone)
     # Текстовый поиск получает ПОЛНЫЙ ответ: настоящее название может
     # начинаться со служебного слова («Телефон доверия»), и точное
     # совпадение полным ответом обязано победить поиск по ядру (ревью
