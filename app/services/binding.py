@@ -123,6 +123,9 @@ def parse_binding_answer(text: str) -> BindingRef:
     организация, имя клиента): решает то же ядро, что и «Найти».
     """
     raw = (text or "").strip()
+    # STT автоматически ставит точку/запятую в конце реплики: «154.»,
+    # «Без привязки.» — завершающая пунктуация не меняет смысла ответа.
+    raw = raw.rstrip(" .,!?;:")
     if _ANSWER_NONE_RE.match(raw):
         return BindingRef("none")
     if _ANSWER_LAST_RE.match(raw):

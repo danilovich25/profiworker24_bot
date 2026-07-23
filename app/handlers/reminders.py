@@ -185,7 +185,11 @@ async def protect_active_order(message: Message) -> None:
 
 @router.message(Command("remind"))
 async def on_remind(message: Message, state: FSMContext) -> None:
+    # Новый ввод убивает ожидающий шаг привязки прошлого напоминания:
+    # иначе его старая кнопка оставалась бы живой до записи нового pending
+    # и могла бы создать уже брошенное напоминание (ревью R2).
     await state.set_state(ReminderFlow.query)
+    await state.update_data(rem_pending=None)
     await message.answer(REMIND_PROMPT, reply_markup=_prompt_markup())
 
 
@@ -281,19 +285,37 @@ async def _peek_pending(state: FSMContext, nonce: str) -> dict | None:
     return None
 
 
+# Взаимное исключение потребителей pending по FSM-ключу (чат+пользователь):
+# у хранилищ aiogram нет условной записи, и чтение+затирание двумя
+# конкурентными потребителями иначе прошло бы у обоих (ревью R2). Локи
+# процесс-локальные — как и MemoryStorage самого бота; словарь растёт не
+# больше числа сотрудников, объект лока копеечный.
+_consume_locks: dict[str, asyncio.Lock] = {}
+
+
+def _consume_lock(state: FSMContext) -> asyncio.Lock:
+    key = f"{state.key.chat_id}:{state.key.user_id}"
+    lock = _consume_locks.get(key)
+    if lock is None:
+        lock = _consume_locks[key] = asyncio.Lock()
+    return lock
+
+
 async def _consume_pending(state: FSMContext, nonce: str) -> dict | None:
     """Атомарно забирает ожидающее напоминание перед созданием.
 
-    CAS по nonce: /cancel, второй параллельный выбор или новый вопрос уже
-    сняли или заменили pending — тогда None, и создавать ничего нельзя.
-    Потребление идёт непосредственно перед _finalize_reminder, чтобы решение,
-    принятое во время долгого похода в CRM, не пережило отмену.
+    Проверка nonce и затирание — под локом: /cancel, второй параллельный
+    выбор или новый вопрос уже сняли или заменили pending — тогда None, и
+    создавать ничего нельзя. Потребление идёт непосредственно перед
+    _finalize_reminder, чтобы решение, принятое во время долгого похода в
+    CRM, не пережило отмену.
     """
-    pending = await _peek_pending(state, nonce)
-    if pending is None:
-        return None
-    await state.update_data(rem_pending=None)
-    return pending
+    async with _consume_lock(state):
+        pending = await _peek_pending(state, nonce)
+        if pending is None:
+            return None
+        await state.update_data(rem_pending=None)
+        return pending
 
 
 async def handle_reminder_query(
@@ -602,6 +624,11 @@ async def on_bind_choice(
         await callback.answer(CANCEL_STALE)
         return
     _, _, nonce, action = parts
+    if await state.get_state() != ReminderFlow.binding.state:
+        # Шаг привязки уже покинут (рестарт ввода, /find, /cancel): кнопка
+        # мертва, даже если pending ещё не перезаписан (ревью R2).
+        await callback.answer(CANCEL_STALE)
+        return
     data = await state.get_data()
     pending = data.get("rem_pending")
     message = callback.message

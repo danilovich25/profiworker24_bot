@@ -482,6 +482,86 @@ def test_parse_binding_answer_last_forms():
     assert parse_binding_answer("Последняя миля").kind == "text"
 
 
+def test_parse_binding_answer_stt_punctuation():
+    """Автопунктуация STT не превращает номер заявки в текстовый запрос."""
+    from app.services.binding import parse_binding_answer
+
+    assert parse_binding_answer("154.").kind == "deal_id"
+    assert parse_binding_answer("154.").value == "154"
+    assert parse_binding_answer("№154,").kind == "deal_id"
+    assert parse_binding_answer("К заявке 154.").kind == "deal_id"
+    assert parse_binding_answer("Последняя.").kind == "last"
+    assert parse_binding_answer("Без привязки.").kind == "none"
+
+
+# --- Правки по ревью Sol R2 ----------------------------------------------
+
+
+async def test_restarted_flow_kills_old_binding_button(flow, monkeypatch):
+    """«Напоминание» заново снимает pending: старая кнопка мертва СРАЗУ.
+
+    Окно ревью R2: вопрос A → «Напоминание» (новый ввод) → до текста B
+    нажать старую кнопку A. Раньше pending A ещё лежал в FSM, nonce
+    совпадал — и отменённое рестартом A создавалось.
+    """
+    await start_reminder(flow, monkeypatch)
+    stale_button = bind_data(flow, "last")
+
+    await send(flow, BTN_REMIND)
+    assert await state_of(flow) == ReminderFlow.query.state
+
+    await press(flow, stale_button)
+    assert flow.bx.tasks == []
+    assert await flow.db.pending_task_reminders() == []
+    # Рестарт не сломан: ввод B работает дальше.
+    assert await state_of(flow) == ReminderFlow.query.state
+
+
+async def test_bind_callback_requires_binding_state(flow, monkeypatch):
+    """Кнопка привязки вне шага привязки — «Уже неактуально», не создание."""
+    await start_reminder(flow, monkeypatch)
+    stale_button = bind_data(flow, "last")
+    await send(flow, BTN_FIND)
+    assert await state_of(flow) == SearchFlow.query.state
+
+    await press(flow, stale_button)
+    assert flow.bx.tasks == []
+    assert await state_of(flow) == SearchFlow.query.state
+
+
+async def test_consume_pending_is_atomic(flow, monkeypatch):
+    """Два конкурентных потребителя pending: побеждает ровно один (Sol R2).
+
+    MemoryStorage сам по себе не отдаёт управление между get и set; тест
+    вставляет точку переключения в get_data — без взаимного исключения оба
+    потребителя увидели бы pending и оба пошли бы создавать.
+    """
+    import asyncio
+
+    from app.handlers.reminders import _consume_pending
+
+    await start_reminder(flow, monkeypatch)
+    context = flow.dp.fsm.get_context(bot=flow.bot, chat_id=1, user_id=1)
+    pending = (await context.get_data())["rem_pending"]
+    nonce = pending["nonce"]
+
+    orig_get = flow.dp.storage.get_data
+
+    async def yielding_get(key):
+        data = await orig_get(key)
+        await asyncio.sleep(0)
+        return data
+
+    monkeypatch.setattr(flow.dp.storage, "get_data", yielding_get)
+
+    first, second = await asyncio.gather(
+        _consume_pending(context, nonce), _consume_pending(context, nonce)
+    )
+    winners = [item for item in (first, second) if item is not None]
+    assert len(winners) == 1
+    assert winners[0]["nonce"] == nonce
+
+
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
 
 
