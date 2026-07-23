@@ -570,7 +570,8 @@ async def test_free_text_multi_reminder_does_not_inline_bind(flow, monkeypatch):
     assert len(flow.bx.tasks) == 1
     assert "UF_CRM_TASK" not in flow.bx.tasks[0]
     # Привязка не заявлялась надёжно: ни привязки, ни жалобы на промах.
-    assert BIND_INLINE_MISS not in flow.session.sent_texts
+    miss_prefix = BIND_INLINE_MISS.split("{ref}")[0]
+    assert all(not t.startswith(miss_prefix) for t in flow.session.sent_texts)
 
 
 def test_parse_binding_answer_stt_punctuation():
@@ -790,7 +791,8 @@ async def test_free_text_ten_digit_phone_ambiguous_warns(flow, monkeypatch):
 
     assert len(flow.bx.tasks) == 1
     assert "UF_CRM_TASK" not in flow.bx.tasks[0]
-    assert BIND_INLINE_MISS in flow.session.sent_texts
+    miss_prefix = BIND_INLINE_MISS.split("{ref}")[0]
+    assert any(t.startswith(miss_prefix) for t in flow.session.sent_texts)
 
 
 async def test_text_answer_with_prefix_finds_deal(flow, monkeypatch):
@@ -1434,7 +1436,8 @@ async def test_unknown_binding_suppresses_inline_miss(flow, monkeypatch):
     assert outcome.created
     assert outcome.deal_label is None
     assert outcome.label_known is False
-    assert BIND_INLINE_MISS not in flow.session.sent_texts
+    miss_prefix = BIND_INLINE_MISS.split("{ref}")[0]
+    assert all(not t.startswith(miss_prefix) for t in flow.session.sent_texts)
 
 
 def test_correction_ignores_hour_words():
@@ -1985,7 +1988,8 @@ async def test_free_text_conflict_gets_dedicated_reply(flow, monkeypatch):
     assert len(flow.bx.tasks) == 1
     assert "UF_CRM_TASK" not in flow.bx.tasks[0]
     assert BIND_INLINE_CONFLICT in flow.session.sent_texts
-    assert BIND_INLINE_MISS not in flow.session.sent_texts
+    miss_prefix = BIND_INLINE_MISS.split("{ref}")[0]
+    assert all(not t.startswith(miss_prefix) for t in flow.session.sent_texts)
 
 
 def test_plus_phone_trailing_count_asks():
@@ -2497,7 +2501,8 @@ async def test_inline_miss_reported_without_deadline_ping(flow, monkeypatch):
 
     assert len(flow.bx.tasks) == 1
     assert "UF_CRM_TASK" not in flow.bx.tasks[0]
-    assert BIND_INLINE_MISS in flow.session.sent_texts
+    miss_prefix = BIND_INLINE_MISS.split("{ref}")[0]
+    assert any(t.startswith(miss_prefix) for t in flow.session.sent_texts)
 
 
 def test_paren_month_after_deal_id():
@@ -2517,6 +2522,79 @@ def test_dotted_international_phone():
     )
     assert ref is not None
     assert (ref.kind, ref.value) == ("phone", "+12125550123")
+
+
+# --- Правки по ревью Fable R1 ---------------------------------------------
+
+
+def test_first_group_as_date_is_not_deal_id():
+    """«к заявке 31 декабря в 10:00» — дата, а не привязка к сделке №31."""
+    from app.services.binding import extract_inline_binding
+
+    for raw, keep in (
+        ("к заявке 31 декабря в 10:00 поздравить клиента", "31 декабря"),
+        ("к заявке, 8 марта в 10:00 поздравить", "8 марта"),
+        ("к заявке 23.07 в 8 позвонить", "23.07"),
+        ("к заявке 15:00 позвонить", "15:00"),
+        ("к заявке 2026 года перенести", "2026 года"),
+    ):
+        clean, ref = extract_inline_binding(raw)
+        assert ref is None, raw
+        assert keep in clean, raw
+    # Настоящий номер с датой после — работает как раньше.
+    clean, ref = extract_inline_binding("к заявке 154 23 июля в 8 позвонить")
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+
+
+def test_enumerated_ids_ask():
+    """«к заявке 154 и 155» / «или 155» — перечисление: вопрос."""
+    from app.services.binding import extract_inline_binding
+
+    for raw in (
+        "к заявке 154 и 155 завтра в 8 позвонить",
+        "к заявке 154 или 155 завтра в 8 позвонить",
+        "к заявкам 154 и 155 завтра в 8 позвонить",
+    ):
+        _, ref = extract_inline_binding(raw)
+        assert ref is not None and ref.kind == "conflict", raw
+
+
+async def test_bound_task_without_ping_is_reported(flow, monkeypatch):
+    """Свежая привязка без срока подтверждается, а не молчит."""
+    from app.handlers.messages import REMIND_BOUND_NO_PING
+
+    text = "напомни к заявке 154 позвонить заказчику"
+    mock_parse(monkeypatch, {text: reminder_order("позвонить заказчику")})
+
+    await send(flow, text)
+
+    assert len(flow.bx.tasks) == 1
+    assert flow.bx.tasks[0]["UF_CRM_TASK"] == ["D_154"]
+    replies = "\n".join(flow.session.sent_texts)
+    prefix = REMIND_BOUND_NO_PING.split("{deal}")[0]
+    assert prefix in replies
+    assert "№154" in replies
+
+
+async def test_inline_miss_names_the_reference(flow, monkeypatch):
+    """Промах привязки называет, ЧТО не нашлось («№999»)."""
+    text = "напомни к заявке 999 завтра в 8 позвонить заказчику"
+    mock_parse(monkeypatch, {text: reminder_order("позвонить заказчику")})
+
+    await send(flow, text)
+
+    assert len(flow.bx.tasks) == 1
+    assert "UF_CRM_TASK" not in flow.bx.tasks[0]
+    replies = "\n".join(flow.session.sent_texts)
+    assert "№999" in replies
+
+
+def test_answer_separate_numbers_not_glued():
+    """Ответ «154 155» не склеивается в ID 154155."""
+    from app.services.binding import parse_binding_answer
+
+    ref = parse_binding_answer("154 155")
+    assert ref.kind != "deal_id"
 
 
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
@@ -2548,4 +2626,5 @@ async def test_free_text_inline_binding_miss_creates_unbound(flow, monkeypatch):
 
     assert len(flow.bx.tasks) == 1
     assert "UF_CRM_TASK" not in flow.bx.tasks[0]
-    assert BIND_INLINE_MISS in flow.session.sent_texts
+    miss_prefix = BIND_INLINE_MISS.split("{ref}")[0]
+    assert any(t.startswith(miss_prefix) for t in flow.session.sent_texts)

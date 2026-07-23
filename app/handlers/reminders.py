@@ -40,6 +40,7 @@ from aiogram.types import (
 
 from app.db import REMINDER_PENDING, Database
 from app.handlers.messages import (
+    REMIND_BOUND_NO_PING,
     REMIND_SCHEDULED_DEAL,
     _create_reminder,
     deal_binding_label,
@@ -460,6 +461,13 @@ async def _finalize_reminder(
             else REMIND_SCHEDULED.format(when=when)
         )
         await message.answer(reply, reply_markup=main_menu_keyboard())
+    elif outcome.created and outcome.deal_label and not outcome.terminal:
+        # Привязка состоялась, но пинга нет (у задачи нет срока): успех
+        # подтверждается явно (ревью Fable).
+        await message.answer(
+            REMIND_BOUND_NO_PING.format(deal=outcome.deal_label),
+            reply_markup=main_menu_keyboard(),
+        )
     # outcome.created без пинга (unknown/gone/done): честный ответ уже
     # отправлен внутри _create_reminder, обещание «Пришлю…» не добавляется.
 

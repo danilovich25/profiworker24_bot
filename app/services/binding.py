@@ -406,6 +406,15 @@ def _extract_one(text: str) -> tuple[str, BindingRef | None]:
     if match:
         digits = match.group(1)
         end = match.end(1)
+        if _tail_group_is_dateish(digits, raw[end:]):
+            # ПЕРВАЯ группа сама согласована со сроком: «к заявке 31
+            # декабря», «к заявке 23.07», «к заявке 15:00», «к заявке 2026
+            # года» — это дата/время напоминания, а не номер сделки
+            # (ревью Fable). Ссылки нет, дата остаётся тексту.
+            return raw, None
+        if re.match(r"^\s*(?:и|или)\s+(?:№\s*)?\d", raw[end:], re.IGNORECASE):
+            # Перечисление «154 и 155», «154 или 155»: выбор не угадывается.
+            return raw, BindingRef("conflict")
         if _ambiguous_digit_tail(raw[end:]):
             # «154 2 договора», «123 456 789…»: отличить разбитый номер от
             # «номер + количество» нельзя — спрашиваем, а не гадаем.
@@ -479,7 +488,10 @@ def parse_binding_answer(text: str) -> BindingRef:
     if _ANSWER_LAST_RE.match(raw):
         return BindingRef("last")
     bare = _strip_service_words(raw).strip()
-    compact = re.sub(r"[\s()\-]", "", bare)
+    # Пробелы НЕ схлопываются: «154 155» — два разных числа (перечисление
+    # или STT-разбиение), склейка в «154155» привязала бы не туда (ревью
+    # Fable) — такой ответ уходит в поиск и честно переспросится.
+    compact = re.sub(r"[()\-—–]", "", bare)
     if compact.isdecimal() and len(compact) <= MAX_DEAL_ID_DIGITS:
         return BindingRef("deal_id", compact)
     # Телефоном считается только ответ, ЦЕЛИКОМ являющийся номером: фраза
