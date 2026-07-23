@@ -10,7 +10,11 @@
 import re
 from dataclasses import dataclass
 
-from app.services.bitrix import extract_bare_phone, normalize_phone
+from app.services.bitrix import (
+    _EXTENSION_RE,
+    extract_bare_phone,
+    normalize_phone,
+)
 
 # Номер сделки Bitrix24; длиннее — уже похоже на телефон, а не на ID.
 MAX_DEAL_ID_DIGITS = 9
@@ -118,10 +122,13 @@ _DEAL_NUM_RE = re.compile(
 # Самоисправление голосом без слова «заявка»: «…, нет, к 155», «нет — к
 # 155», «нет. к 155». Числа, похожие на время («к 15:00», «к 15 вечера»)
 # или дату («к 23 июля»), исправлением ПРИВЯЗКИ не считаются.
+# Слово времени глушит исправление только для чисел, похожих на время
+# (1-2 цифры): «к 155 вечером» — номер заявки, не 155 часов (ревью ULTRA-7).
 _CORRECTION_RE = re.compile(
     r"\bнет\b[\s,.:;!?—–-]*(?:лучше\s+)?(?:к|по|на)\s+"
     r"(?:заявк[а-яё]*[\s.,:;—–-]*)?"
-    r"(?:№\s*)?\d{1,9}(?![:.,]?\d)(?!\s*(?:%s))" % _TIME_STOP_WORDS,
+    r"(?:№\s*)?(?:\d{3,9}(?![:.,]?\d)|\d{1,2}(?![:.,]?\d)(?!\s*(?:%s)))"
+    % _TIME_STOP_WORDS,
     re.IGNORECASE,
 )
 
@@ -195,8 +202,13 @@ def _normalize_ref_phone(raw: str) -> str | None:
     работает штатная российская нормализация.
     """
     text = (raw or "").strip()
-    # Добавочный не входит в E.164 ни в одной форме («+7… доб. 12»).
-    text = re.split(r"\bдоб\b|\bвн\b|\bext\b|#", text, maxsplit=1)[0]
+    # Добавочный не входит в E.164 ни в одной форме («+7… доб. 12», «EXT»,
+    # «extension», «x12») и в любом регистре — маркеры те же, что у ядра
+    # (bitrix._EXTENSION_RE ищется по lower-копии, позиции совпадают;
+    # ревью ULTRA-7).
+    marker = _EXTENSION_RE.search(text.lower())
+    if marker is not None:
+        text = text[: marker.start()]
     if text.lstrip(" 	(").startswith("+"):
         digits = re.sub(r"\D", "", text)
         return "+" + digits if 10 <= len(digits) <= 15 else None
@@ -214,7 +226,9 @@ def _trim_phone_span(group: str, tail: str) -> tuple[str | None, int]:
     """
     end = len(group)
     if _DATE_WORD_RE.match(tail) or _NUMERIC_DATE_RE.match(tail):
-        day = re.search(r"[\s.,;:()—–-]+\d{1,2}\s*$", group)
+        # До 4 цифр: за номером может идти и день («23 июля»), и год
+        # («2026 года») — обе группы принадлежат сроку (ревью ULTRA-7).
+        day = re.search(r"[\s.,;:()—–-]+\d{1,4}\s*$", group)
         if day is not None:
             end = day.start()
             group = group[:end]
@@ -261,7 +275,7 @@ def _extract_one(text: str) -> tuple[str, BindingRef | None]:
         # если номер полон и без неё, а дальше не дата — граница номера
         # недостоверна, уточняем кнопками (ревью ULTRA-6). Для номеров,
         # неполных без хвоста («8 914 123 45 67»), группа — часть номера.
-        trail = re.search(r"\s+\d{1,4}$", group)
+        trail = re.search(r"(?:[\s(]+\d{1,4}\)?|[—–-]\d{1,2})$", group)
         after_group = raw[match.end(1) :]
         if (
             trail is not None

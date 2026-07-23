@@ -560,26 +560,32 @@ async def sync_task_reminder(
         return reminder
     # Текст строится от СВЕЖЕЙ записи, а не от снапшота пачки: подпись
     # заявки могла быть согласована с фактической привязкой между чтением
-    # пачки и этим переносом (ревью ULTRA-3).
-    fresh = await db.get_reminder(int(reminder["id"]))
-    if fresh is None or fresh.get("status") != REMINDER_PENDING:
-        return reminder
-    if abs(due_ts - int(fresh["due_ts"])) < SYNC_TOLERANCE_SECONDS:
-        return {**reminder, "due_ts": int(fresh["due_ts"]), "text": fresh["text"]}
-    text = _text_with_deadline(str(fresh["text"]), due_ts)
-    if not await db.reschedule_reminder(
+    # пачки и этим переносом (ревью ULTRA-3). CAS-промах = параллельная
+    # запись между fresh-read и UPDATE — повтор от нового состояния; после
+    # исчерпания попыток запись возвращается с CRM-сроком, чтобы проход
+    # планировщика НЕ отправил её досрочно (ревью ULTRA-7).
+    for _attempt in range(3):
+        fresh = await db.get_reminder(int(reminder["id"]))
+        if fresh is None or fresh.get("status") != REMINDER_PENDING:
+            return reminder
+        if abs(due_ts - int(fresh["due_ts"])) < SYNC_TOLERANCE_SECONDS:
+            return {**reminder, "due_ts": int(fresh["due_ts"]), "text": fresh["text"]}
+        text = _text_with_deadline(str(fresh["text"]), due_ts)
+        if await db.reschedule_reminder(
+            reminder["id"],
+            due_ts,
+            text,
+            reminder.get("activity_id"),
+            expected_due=int(fresh["due_ts"]),
+            expected_text=str(fresh["text"]),
+        ):
+            log.info("Пинг id=%s перенесён за задачей %s", reminder["id"], task_id)
+            return {**reminder, "due_ts": due_ts, "text": text}
+    log.warning(
+        "Пинг id=%s: перенос трижды промахнулся по CAS, отправка отложена",
         reminder["id"],
-        due_ts,
-        text,
-        reminder.get("activity_id"),
-        expected_due=int(fresh["due_ts"]),
-        expected_text=str(fresh["text"]),
-    ):
-        # Запись не pending либо срок изменился параллельно (reuse успел
-        # согласовать подпись/срок) — свежие данные не перетираются.
-        return reminder
-    log.info("Пинг id=%s перенесён за задачей %s", reminder["id"], task_id)
-    return {**reminder, "due_ts": due_ts, "text": text}
+    )
+    return {**reminder, "due_ts": due_ts}
 
 
 async def reconcile_task_reminders(

@@ -2033,6 +2033,125 @@ def test_daypart_instrumental_forms():
         assert (ref.kind, ref.value) == ("deal_id", "154"), tail
 
 
+# --- Правки по ревью Sol ULTRA-7 ------------------------------------------
+
+
+async def test_sync_real_cas_miss_retries_from_fresh(flow, monkeypatch):
+    """Настоящий CAS-промах: reuse записал C между fresh-read и UPDATE.
+
+    Sync обязан перечитать C и перенести ЕГО на CRM-срок, а не вернуть
+    старый снапшот на отправку прямо сейчас.
+    """
+    from datetime import timedelta
+
+    from app.services import dates
+    from app.services import tasks as tasks_service
+
+    now = int(time.time())
+    crm_due = dates.now_local() + timedelta(hours=3)
+    rid = await flow.db.add_reminder(
+        1, "позвонить (заявка №155 · B). Срок: B", now - 5, "task", 77
+    )
+    flow.bx.tasks.append({"TITLE": "Позвонить", "DEADLINE": crm_due.isoformat()})
+
+    orig_resched = flow.db.reschedule_reminder
+    raced = {"done": False}
+
+    async def racing_resched(*args, **kwargs):
+        if not raced["done"]:
+            raced["done"] = True
+            # Параллельный reuse записал новый текст C при том же сроке —
+            # ПОСЛЕ fresh-read синка, ДО его UPDATE.
+            await orig_resched(
+                rid,
+                now - 5,
+                "позвонить (заявка №155 · C). Срок: C",
+                None,
+            )
+        return await orig_resched(*args, **kwargs)
+
+    monkeypatch.setattr(flow.db, "reschedule_reminder", racing_resched)
+
+    stale = {
+        "id": rid,
+        "chat_id": 1,
+        "text": "позвонить (заявка №154 · A). Срок: A",
+        "due_ts": now - 5,
+        "kind": "task",
+        "entity_id": 77,
+        "activity_id": None,
+        "attempts": 0,
+    }
+
+    async def stale_batch(now_ts, limit=50):
+        return [stale]
+
+    flow.db.due_reminders = stale_batch
+    await tasks_service.send_due_reminders(
+        flow.bot, flow.db, now_ts=now, bitrix=flow.bx
+    )
+
+    assert flow.session.sent_texts == []
+    rows = await flow.db.pending_task_reminders()
+    assert len(rows) == 1
+    assert "· C" in rows[0]["text"]
+    assert abs(rows[0]["due_ts"] - int(crm_due.timestamp())) <= 120
+
+
+def test_extension_forms_any_case():
+    """ДОБ./EXT/extension/x12 в любом регистре не входят в E.164."""
+    from app.services.binding import parse_binding_answer
+
+    for answer in (
+        "+7 914 123-45-67 ДОБ. 12",
+        "+7 914 123-45-67 EXT 12",
+        "+7 914 123-45-67 extension 12",
+        "+7 914 123-45-67 x12",
+    ):
+        ref = parse_binding_answer(answer)
+        assert (ref.kind, ref.value) == ("phone", "+79141234567"), answer
+
+
+def test_paren_and_dash_trailing_groups_ask():
+    """«(2) договора» и «-2 договора» после полного номера — вопрос."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +7 914 123-45-67 (2) договора завтра"
+    )
+    assert ref is not None and ref.kind == "conflict"
+    _, ref = extract_inline_binding(
+        "к заявке по телефону +7 914 123-45-67-2 договора завтра"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
+def test_year_tail_not_swallowed_by_phone():
+    """«+7 … 2026 года» — год остаётся тексту, номер чист."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону +7 914 123-45-67 2026 года запись завтра"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("phone", "+79141234567")
+    assert "2026" in clean
+
+
+def test_large_number_not_suppressed_by_daypart():
+    """«нет, к 155 вечером» — 155 не время: конфликт, не D_154."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 155 вечером позвонить"
+    )
+    assert ref is not None and ref.kind == "conflict"
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 155 утром позвонить"
+    )
+    assert ref is not None and ref.kind == "conflict"
+
+
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------
 
 
