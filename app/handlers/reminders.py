@@ -506,9 +506,23 @@ async def _find_deals(
             found = await search_deals_by_text(bitrix, candidate)
             if found.deals or found.truncated:
                 return found.deals, found.truncated, False
-        stem = stem_search_query(cleaned) if cleaned else None
-        if stem is not None:
-            found = await search_deals_by_text(bitrix, stem)
+        # Мягкие кандидаты: ядро без служебного префикса («к заявке
+        # Ромашка» → «Ромашка») и основа последнего слова. Их совпадения
+        # подтверждаются кнопкой, а не привязываются молча.
+        core = binding.core_text_query(raw_query)
+        soft = [
+            candidate
+            for candidate in dict.fromkeys(
+                [core, clean_search_query(core) if core else ""]
+            )
+            if candidate and candidate not in exact
+        ]
+        stem_source = clean_search_query(core) or cleaned
+        stem = stem_search_query(stem_source) if stem_source else None
+        if stem is not None and stem not in exact and stem not in soft:
+            soft.append(stem)
+        for candidate in soft:
+            found = await search_deals_by_text(bitrix, candidate)
             if found.deals or found.truncated:
                 return found.deals, found.truncated, True
         return [], False, False

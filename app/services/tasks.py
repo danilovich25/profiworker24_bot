@@ -240,8 +240,10 @@ SYNC_CRM_DEADLINE = 25
 REARM_OVERDUE_GRACE_SECONDS = 2 * RECONCILE_INTERVAL + SYNC_TOLERANCE_SECONDS
 
 # Хвост «Срок: …» в тексте напоминания (его пишут _schedule_deal_reminder и
-# _reschedule_reminders); при переносе срока сверкой хвост переписывается.
-_DEADLINE_TAIL_RE = re.compile(r"Срок: .*$", re.S)
+# _reschedule_reminders); при переносе срока сверкой переписывается
+# ПОСЛЕДНЕЕ вхождение — «Срок:» внутри самого текста напоминания
+# («Проверить поле Срок: оплаты») не хвост, а текст (ревью ULTRA-2).
+_DEADLINE_TAIL_RE = re.compile(r"Срок:(?:(?!Срок:).)*$", re.S)
 
 
 def _text_with_deadline(text: str, due_ts: int) -> str:
@@ -739,8 +741,11 @@ async def send_due_reminders(
         ):
             continue
         try:
+            # Текст берётся из свежей записи: подпись заявки могла быть
+            # согласована с фактической привязкой между чтением пачки и
+            # отправкой (ревью ULTRA-2).
             await bot.send_message(
-                reminder["chat_id"], REMINDER_MESSAGE.format(text=reminder["text"])
+                reminder["chat_id"], REMINDER_MESSAGE.format(text=fresh["text"])
             )
         except Exception:
             log.exception("Напоминание id=%s не отправлено", reminder["id"])

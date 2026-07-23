@@ -1085,14 +1085,14 @@ async def deal_binding_label(bitrix: BitrixClient | None, deal: dict) -> str:
 
 async def _actual_task_binding_label(
     bitrix: BitrixClient, task_id: int
-) -> str | None:
-    """Подпись по ФАКТИЧЕСКОЙ привязке существующей задачи (UF_CRM_TASK).
+) -> tuple[bool, str | None]:
+    """(привязка достоверно известна, подпись) существующей задачи.
 
-    Сбой чтения самой задачи → None: честнее промолчать про заявку, чем
-    назвать сделку из свежего разрешения, которое могло разойтись с
-    привязкой задачи. Если же номер сделки уже достоверно прочитан, а упало
-    только обогащение (crm.deal.get/контакт) — подпись деградирует до
-    «№<id>», номер не теряется (ревью ULTRA).
+    Первый элемент отличает «задача прочитана, привязки нет» (known=True,
+    label=None — подпись можно честно убрать) от «портал не ответил»
+    (known=False — правды нет, уже записанный пинг трогать нельзя;
+    ревью ULTRA-2). Если номер сделки прочитан, а упало только обогащение
+    (crm.deal.get/контакт) — подпись деградирует до «№<id>».
     """
     try:
         async with asyncio.timeout(POST_DEAL_DEADLINE):
@@ -1101,18 +1101,18 @@ async def _actual_task_binding_label(
         log.warning(
             "Привязка существующей задачи %s не прочитана", task_id, exc_info=True
         )
-        return None
+        return False, None
     actual_id = task_deal_id(task) if task else None
     if actual_id is None:
-        return None
+        return True, None
     try:
         async with asyncio.timeout(POST_DEAL_DEADLINE):
             deal = await get_deal(bitrix, actual_id)
             if deal is not None:
-                return await deal_binding_label(bitrix, deal)
+                return True, await deal_binding_label(bitrix, deal)
     except Exception:
         log.warning("Заявка %s для подписи не прочитана", actual_id, exc_info=True)
-    return f"№{actual_id}"
+    return True, f"№{actual_id}"
 
 
 async def _create_reminder(
@@ -1258,15 +1258,22 @@ async def _create_reminder(
         # Задача существовала до этого вызова: её могли привязать к другой
         # сделке, чем разрешилось сейчас (например, «последняя» успела
         # смениться к повтору). Правду знает сама задача (ревью R4).
-        deal_label = await _actual_task_binding_label(bitrix, task_id)
-        # Уже стоящий пинг мог быть записан со старой подписью — иначе
-        # подтверждение и пинг называли бы разные заявки (ревью ULTRA).
-        try:
-            await db.update_task_reminder_text(
-                task_id, _task_ping_text(order, deal_label)
-            )
-        except Exception:
-            log.exception("Текст пинга задачи %s не обновлён", task_id)
+        known, deal_label = await _actual_task_binding_label(bitrix, task_id)
+        if known:
+            # Уже стоящий пинг мог быть записан со старой подписью и сроком —
+            # иначе подтверждение и пинг называли бы разное (ревью ULTRA-2).
+            # Пинг с наступившим/пустым сроком не переносится.
+            due_ts = dates.reminder_epoch(order.deadline)
+            if due_ts is not None and due_ts <= int(dates.now_local().timestamp()):
+                due_ts = None
+            try:
+                await db.update_task_reminder(
+                    task_id, _task_ping_text(order, deal_label), due_ts
+                )
+            except Exception:
+                log.exception("Пинг задачи %s не обновлён", task_id)
+        # known=False: правды о привязке нет — записанный пинг не трогаем,
+        # а в подтверждении заявку честно не называем (deal_label=None).
     # Гарантированный канал: бот сам напишет в Telegram в момент срока.
     # Ставится на любом пути существования задачи (в т.ч. найденной сверкой
     # после потерянного ответа add) — вставка идемпотентна по задаче.

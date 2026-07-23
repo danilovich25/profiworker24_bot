@@ -787,9 +787,17 @@ async def test_free_text_ten_digit_phone_ambiguous_warns(flow, monkeypatch):
 
 
 async def test_text_answer_with_prefix_finds_deal(flow, monkeypatch):
-    """«К заявке сантехника» ищет по ядру «сантехника» и привязывает."""
+    """«К заявке сантехника» находит по ядру и подтверждается кнопкой.
+
+    Совпадение по ядру без префикса — мягкое: молча не привязывается
+    (ревью ULTRA-2, кейс «Телефон доверия»), но кнопка сразу предлагается.
+    """
     await start_reminder(flow, monkeypatch)
     await send(flow, "к заявке сантехника")
+
+    assert flow.bx.tasks == []
+    assert await state_of(flow) == ReminderFlow.binding.state
+    await press_bind(flow, "154")
 
     assert len(flow.bx.tasks) == 1
     assert flow.bx.tasks[0]["UF_CRM_TASK"] == ["D_154"]
@@ -1001,6 +1009,231 @@ def test_tail_strip_keeps_inner_srok():
     label = _reminder_label(row)
     assert "Срок: оплаты" in label
     assert "23.07.2026 08:00" not in label.split(" — ", 1)[1]
+
+
+# --- Правки по ревью Sol ULTRA-2 ------------------------------------------
+
+
+def test_conflict_detects_bare_correction_and_third_ref():
+    """«…, нет, к 155» и третья ссылка после дублей — тоже конфликт."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 155 завтра в 8 позвонить"
+    )
+    assert ref is not None and ref.kind == "conflict"
+    _, ref = extract_inline_binding(
+        "к заявке 154, к заявке 154, нет, к заявке 155 завтра в 8"
+    )
+    assert ref is not None and ref.kind == "conflict"
+    # Исправление ВРЕМЕНИ конфликтом привязки не считается.
+    _, ref = extract_inline_binding(
+        "к заявке 154, нет, к 15:00 позвонить завтра"
+    )
+    assert ref is not None and (ref.kind, ref.value) == ("deal_id", "154")
+
+
+def test_deal_id_not_glued_with_date():
+    """«К заявке 154 23 июля …» — это ID 154 и дата, а не D_15423."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding("к заявке 154 23 июля в 8 позвонить")
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+    assert "23 июля" in clean
+
+    clean, ref = extract_inline_binding(
+        "к заявке 123 456 789 23 июля в 8 позвонить"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("deal_id", "123456789")
+    assert "23 июля" in clean
+
+
+def test_phone_day_split_for_any_form():
+    """Городской и международный номер не съедают следующий день."""
+    from app.services.binding import extract_inline_binding
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону 4951234567 23 июля позвонить"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("phone", "+74951234567")
+    assert "23 июля" in clean
+
+    clean, ref = extract_inline_binding(
+        "к заявке по телефону +375291234567 23 июля позвонить"
+    )
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("phone", "+375291234567")
+    assert "23 июля" in clean
+
+
+def test_dash_in_ref_prefix():
+    """Типографское тире в форме «к заявке — 154» не ломает разбор."""
+    from app.services.binding import extract_inline_binding
+
+    _, ref = extract_inline_binding("к заявке — 154 завтра в 8 позвонить")
+    assert ref is not None
+    assert (ref.kind, ref.value) == ("deal_id", "154")
+
+
+async def test_exact_org_beats_bare_substring(flow, monkeypatch):
+    """«Телефон доверия» ищется полным ответом раньше ядра «доверия».
+
+    Точный UF_CRM_ORG обязан победить подстрочное совпадение чужой сделки.
+    """
+    flow.bx.contacts.append(
+        {
+            "ID": "16",
+            "NAME": "Линия",
+            "LAST_NAME": "Помощи",
+            "UF_CRM_ORG": "Телефон доверия",
+            "PHONE": "+79995556677",
+        }
+    )
+    flow.bx.deals.append(
+        {
+            "ID": "156",
+            "TITLE": "проверка линии",
+            "STAGE_ID": "NEW",
+            "DATE_CREATE": "2026-07-19T10:00:00+10:00",
+            "CONTACT_ID": "16",
+            "COMMENTS": "",
+        }
+    )
+    flow.bx.deals.append(
+        {
+            "ID": "157",
+            "TITLE": "кризис доверия",
+            "STAGE_ID": "NEW",
+            "DATE_CREATE": "2026-07-19T11:00:00+10:00",
+            "CONTACT_ID": "15",
+            "COMMENTS": "",
+        }
+    )
+    await start_reminder(flow, monkeypatch)
+    await send(flow, "Телефон доверия")
+
+    assert len(flow.bx.tasks) == 1
+    assert flow.bx.tasks[0]["UF_CRM_TASK"] == ["D_156"]
+
+
+async def test_reuse_updates_ping_due_ts(flow, monkeypatch):
+    """Reuse согласует не только текст, но и срок ожидающего пинга."""
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+    from app.services.tasks import _key_tag
+
+    key = "rem:ultra2-due"
+    flow.bx.tasks.append(
+        {"TITLE": "Позвонить", "UF_CRM_TASK": ["D_155"], "TAGS": [_key_tag(key)]}
+    )
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 77)
+    old_due = int(time.time()) + 3600
+    await flow.db.add_reminder(
+        1, "позвонить (заявка №154 · чужая). Срок: старый", old_due, "task", 77
+    )
+
+    new_deadline = dates.now_local() + timedelta(hours=2)
+    message = make_message_update(flow.bot, "повтор").message
+    created, _ = await _create_reminder(
+        message,
+        flow.db,
+        flow.bx,
+        reminder_order("позвонить", new_deadline.isoformat()),
+        key=key,
+    )
+
+    assert created
+    rows = await flow.db.pending_task_reminders()
+    assert len(rows) == 1
+    assert abs(rows[0]["due_ts"] - int(new_deadline.timestamp())) <= 120
+    assert "№155" in rows[0]["text"]
+
+
+async def test_task_read_failure_keeps_existing_ping_text(flow, monkeypatch):
+    """Сбой tasks.task.get при reuse НЕ затирает подпись в стоящем пинге."""
+    from datetime import timedelta
+
+    from app.handlers.messages import _create_reminder
+    from app.services import dates
+    from app.services.tasks import _key_tag
+
+    key = "rem:ultra2-keep"
+    flow.bx.tasks.append(
+        {"TITLE": "Позвонить", "UF_CRM_TASK": ["D_155"], "TAGS": [_key_tag(key)]}
+    )
+    await flow.db.get_or_create_task_fence(key)
+    await flow.db.mark_task_fence_sent(key)
+    await flow.db.complete_task_fence(key, 77)
+    old_text = "позвонить (заявка №155 · важная). Срок: скоро"
+    await flow.db.add_reminder(1, old_text, int(time.time()) + 3600, "task", 77)
+
+    orig = flow.bx._dispatch
+
+    async def failing(method, params):
+        if method == "tasks.task.get":
+            raise RuntimeError("Bitrix24 недоступен")
+        return await orig(method, params)
+
+    monkeypatch.setattr(flow.bx, "_dispatch", failing)
+
+    deadline = (dates.now_local() + timedelta(hours=2)).isoformat()
+    message = make_message_update(flow.bot, "повтор").message
+    created, label = await _create_reminder(
+        message, flow.db, flow.bx, reminder_order("позвонить", deadline), key=key
+    )
+
+    assert created
+    assert label is None
+    rows = await flow.db.pending_task_reminders()
+    assert rows[0]["text"] == old_text
+
+
+def test_text_with_deadline_keeps_inner_srok():
+    """Перенос срока переписывает ПОСЛЕДНИЙ «Срок:», не первый."""
+    from app.services.tasks import _text_with_deadline
+
+    source = "Проверить поле Срок: оплаты (заявка №154 · X). Срок: 22.07.2026 10:00"
+    updated = _text_with_deadline(source, int(time.time()) + 3600)
+    assert "Срок: оплаты" in updated
+    assert "(заявка №154 · X)" in updated
+    assert "22.07.2026 10:00" not in updated
+
+
+async def test_scheduler_sends_fresh_text(flow):
+    """Планировщик шлёт СВЕЖИЙ текст записи, а не снапшот пачки."""
+    from app.services import tasks as tasks_service
+
+    now = int(time.time())
+    rid = await flow.db.add_reminder(
+        1, "позвонить (заявка №155 · новая). Срок: сейчас", now - 5, "task", 77
+    )
+    stale = dict(
+        id=rid,
+        chat_id=1,
+        text="позвонить (заявка №154 · старая). Срок: сейчас",
+        due_ts=now - 5,
+        kind="task",
+        entity_id=77,
+        activity_id=None,
+        attempts=0,
+    )
+
+    async def stale_batch(now_ts, limit=50):
+        return [stale]
+
+    flow.db.due_reminders = stale_batch
+    await tasks_service.send_due_reminders(flow.bot, flow.db, now_ts=now)
+
+    sent = "\n".join(flow.session.sent_texts)
+    assert "№155" in sent
+    assert "№154" not in sent
 
 
 # --- Свободный текст intent=reminder (Sol R1, M1) -------------------------

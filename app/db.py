@@ -1308,20 +1308,32 @@ class Database:
             await conn.commit()
             return cur.rowcount == 1
 
-    async def update_task_reminder_text(self, task_id: int, text: str) -> bool:
-        """Обновляет текст ОЖИДАЮЩЕГО пинга задачи (kind=task, pending).
+    async def update_task_reminder(
+        self, task_id: int, text: str, due_ts: int | None = None
+    ) -> bool:
+        """Обновляет ОЖИДАЮЩИЙ пинг задачи (kind=task, pending).
 
         Нужен идемпотентному повтору создания: существующая задача могла
         быть привязана к другой сделке, чем разрешилось сейчас, и подпись
-        заявки в очереди обязана совпадать с фактической (и с ответом
-        пользователю). Отправленные/отменённые записи не трогаются.
+        с сроком в очереди обязаны совпадать с фактическими (и с ответом
+        пользователю). due_ts=None обновляет только текст (новый срок пуст
+        или уже наступил). Отправленные/отменённые записи не трогаются;
+        CAS отправки по due_ts (mark_reminder_sent) переносу не мешает —
+        он работает как у штатного переноса срока.
         """
         async with aiosqlite.connect(self.path) as conn:
-            cur = await conn.execute(
-                "UPDATE reminders SET text = ? "
-                "WHERE kind = 'task' AND entity_id = ? AND status = ?",
-                (text, task_id, REMINDER_PENDING),
-            )
+            if due_ts is None:
+                cur = await conn.execute(
+                    "UPDATE reminders SET text = ? "
+                    "WHERE kind = 'task' AND entity_id = ? AND status = ?",
+                    (text, task_id, REMINDER_PENDING),
+                )
+            else:
+                cur = await conn.execute(
+                    "UPDATE reminders SET text = ?, due_ts = ? "
+                    "WHERE kind = 'task' AND entity_id = ? AND status = ?",
+                    (text, due_ts, task_id, REMINDER_PENDING),
+                )
             await conn.commit()
             return cur.rowcount > 0
 
